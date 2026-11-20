@@ -1,378 +1,267 @@
 
 """
 VROTEX BOT V1
-SMC RANGE AND DEALING-RANGE ENGINE
+SMC Range Engine
 
-Responsibilities:
-- Identify the active dealing range.
-- Calculate equilibrium (50%).
-- Identify premium and discount zones.
-- Track range highs and lows.
-- Confirm range breaks using candle-body closes.
-- Distinguish wick sweeps from confirmed breaks.
+Purpose:
+- Identify the current dealing range.
+- Calculate range high, low and equilibrium.
+- Calculate Fibonacci retracement levels.
+- Classify premium, discount and equilibrium.
+- Provide range evidence to the SMC master engine.
 
-No broker execution is performed by this module.
+Strategy:
+- Bullish: strong low to weak high.
+- Bearish: strong high to weak low.
+- Equilibrium: 50%.
+
+This module does not authorize order execution.
 """
 
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class DealingRange:
-    high: float
-    low: float
-    midpoint: float
-    range_size: float
-    premium_start: float
-    discount_end: float
-    source: str
-    valid: bool
-
-
 class SMCRangeEngine:
+    VERSION = "2.0"
 
-    def __init__(
-        self,
-        minimum_candles: int = 20,
-        equilibrium: float = 0.50,
-        premium_threshold: float = 0.50,
-        discount_threshold: float = 0.50,
-    ):
-        self.minimum_candles = max(5, int(minimum_candles))
-        self.equilibrium = float(equilibrium)
-        self.premium_threshold = float(premium_threshold)
-        self.discount_threshold = float(discount_threshold)
+    FIBONACCI_LEVELS = (
+        0.0,
+        0.236,
+        0.382,
+        0.5,
+        0.618,
+        0.705,
+        0.786,
+        1.0,
+    )
 
-        self.last_result: Dict[str, Any] = {}
+    def __init__(self):
+        pass
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
         try:
             result = float(value)
-            if result != result or result in (float("inf"), float("-inf")):
+            if result != result:
+                return None
+            if result in (float("inf"), float("-inf")):
                 return None
             return result
         except (TypeError, ValueError):
             return None
 
-    def _normalise_candles(
-        self,
-        candles: List[Dict[str, Any]]
-    ) -> List[Dict[str, float]]:
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        value = str(value or "").upper()
 
-        result = []
+        if value in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
+
+        if value in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    @staticmethod
+    def _candle_price(
+        candle: Dict[str, Any],
+        field: str,
+    ) -> Optional[float]:
+        try:
+            value = candle.get(field)
+            if value is None:
+                value = candle.get(field.upper())
+            result = float(value)
+            if result != result:
+                return None
+            if result in (float("inf"), float("-inf")):
+                return None
+            return result
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_candles(
+        self,
+        candles: Any,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(candles, list):
+            return []
+
+        valid = []
 
         for candle in candles:
             if not isinstance(candle, dict):
                 continue
 
-            high = self._number(candle.get("high"))
-            low = self._number(candle.get("low"))
-            close = self._number(candle.get("close"))
-            open_price = self._number(candle.get("open"))
+            high = self._candle_price(candle, "high")
+            low = self._candle_price(candle, "low")
 
-            if None in (high, low, close, open_price):
+            if high is None or low is None:
                 continue
 
             if high < low:
                 continue
 
-            if high < max(open_price, close):
-                continue
+            valid.append(candle)
 
-            if low > min(open_price, close):
-                continue
+        return valid
 
-            result.append({
-                "open": open_price,
-                "high": high,
-                "low": low,
-                "close": close,
-            })
-
-        return result
-
-    def calculate_range(
+    def _calculate_fibonacci(
         self,
-        candles: List[Dict[str, Any]],
-        lookback: Optional[int] = None,
-        source: str = "H1"
-    ) -> Dict[str, Any]:
+        low: float,
+        high: float,
+        direction: str,
+    ) -> Dict[str, float]:
+        distance = high - low
+        levels = {}
 
-        normalised = self._normalise_candles(candles)
+        for ratio in self.FIBONACCI_LEVELS:
+            if direction == "BULLISH":
+                price = high - (distance * ratio)
+            else:
+                price = low + (distance * ratio)
 
-        period = max(
-            self.minimum_candles,
-            int(lookback or self.minimum_candles)
-        )
+            levels[f"{ratio:.3f}"] = round(price, 10)
 
-        if len(normalised) < period:
-            return self._failure(
-                "INSUFFICIENT_CANDLES",
-                len(normalised),
-                period
-            )
+        return levels
 
-        selected = normalised[-period:]
-
-        range_high = max(c["high"] for c in selected)
-        range_low = min(c["low"] for c in selected)
-
-        size = range_high - range_low
-
-        if size <= 0:
-            return self._failure(
-                "INVALID_RANGE",
-                len(normalised),
-                period
-            )
-
-        midpoint = range_low + size * self.equilibrium
-
-        premium_start = (
-            range_low + size * self.premium_threshold
-        )
-
-        discount_end = (
-            range_low + size * self.discount_threshold
-        )
-
-        dealing_range = DealingRange(
-            high=range_high,
-            low=range_low,
-            midpoint=midpoint,
-            range_size=size,
-            premium_start=premium_start,
-            discount_end=discount_end,
-            source=str(source).upper(),
-            valid=True,
-        )
-
-        result = {
-            "valid": True,
-            "status": "RANGE_IDENTIFIED",
-            "source": dealing_range.source,
-            "candles_used": period,
-            "range": asdict(dealing_range),
-            "equilibrium": midpoint,
-            "premium": {
-                "from": premium_start,
-                "to": range_high,
-            },
-            "discount": {
-                "from": range_low,
-                "to": discount_end,
-            },
-            "price_position": None,
-        }
-
-        self.last_result = result
-        return result
-
-    def classify_price(
+    def _classify_price(
         self,
         price: float,
-        range_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        low: float,
+        high: float,
+    ) -> str:
+        midpoint = (high + low) / 2
 
-        price = self._number(price)
+        if price < low or price > high:
+            return "OUTSIDE_RANGE"
 
-        if price is None:
-            return {
-                "valid": False,
-                "error": "INVALID_PRICE",
-            }
+        if price < midpoint:
+            return "DISCOUNT"
 
-        if not range_data.get("valid"):
-            return {
-                "valid": False,
-                "error": "INVALID_DEALING_RANGE",
-            }
+        if price > midpoint:
+            return "PREMIUM"
 
-        data = range_data["range"]
+        return "EQUILIBRIUM"
 
-        high = data["high"]
-        low = data["low"]
-        midpoint = data["midpoint"]
-
-        if price > high:
-            zone = "ABOVE_RANGE"
-        elif price < low:
-            zone = "BELOW_RANGE"
-        elif price > midpoint:
-            zone = "PREMIUM"
-        elif price < midpoint:
-            zone = "DISCOUNT"
-        else:
-            zone = "EQUILIBRIUM"
-
-        position = (
-            (price - low) / (high - low)
-            if high > low else None
-        )
-
-        return {
-            "valid": True,
-            "price": price,
-            "zone": zone,
-            "position_percent": round(position * 100, 2)
-            if position is not None else None,
-            "equilibrium": midpoint,
-            "bullish_location": zone == "DISCOUNT",
-            "bearish_location": zone == "PREMIUM",
-        }
-
-    def detect_range_break(
+    def analyze(
         self,
         candles: List[Dict[str, Any]],
-        range_data: Dict[str, Any]
+        current_price: float,
+        direction: str,
+        range_high: Optional[float] = None,
+        range_low: Optional[float] = None,
+        range_source: str = "ROLLING_CANDLES",
     ) -> Dict[str, Any]:
 
-        normalised = self._normalise_candles(candles)
+        direction = self._direction(direction)
+        price = self._number(current_price)
 
-        if not normalised:
+        if direction is None:
             return {
+                "status": "REJECTED",
                 "valid": False,
-                "status": "NO_CANDLE_DATA",
+                "reason": "INVALID_DIRECTION",
             }
 
-        if not range_data.get("valid"):
+        if price is None or price <= 0:
             return {
+                "status": "REJECTED",
                 "valid": False,
-                "status": "INVALID_RANGE",
+                "reason": "INVALID_CURRENT_PRICE",
             }
 
-        candle = normalised[-1]
-        high = range_data["range"]["high"]
-        low = range_data["range"]["low"]
+        valid_candles = self._validate_candles(candles)
 
-        if candle["close"] > high:
-            direction = "BULLISH"
-            confirmed = True
-            sweep = False
+        if range_high is None or range_low is None:
+            if len(valid_candles) < 2:
+                return {
+                    "status": "REJECTED",
+                    "valid": False,
+                    "reason": "INSUFFICIENT_CANDLES",
+                }
 
-        elif candle["close"] < low:
-            direction = "BEARISH"
-            confirmed = True
-            sweep = False
+            highs = [
+                self._candle_price(candle, "high")
+                for candle in valid_candles
+            ]
 
-        elif candle["high"] > high and candle["close"] <= high:
-            direction = "BULLISH"
-            confirmed = False
-            sweep = True
+            lows = [
+                self._candle_price(candle, "low")
+                for candle in valid_candles
+            ]
 
-        elif candle["low"] < low and candle["close"] >= low:
-            direction = "BEARISH"
-            confirmed = False
-            sweep = True
+            high = max(value for value in highs if value is not None)
+            low = min(value for value in lows if value is not None)
+
+            range_source = "ROLLING_CANDLES"
 
         else:
-            direction = "NONE"
-            confirmed = False
-            sweep = False
+            high = self._number(range_high)
+            low = self._number(range_low)
 
-        if confirmed:
-            status = "BODY_CLOSE_BREAK_CONFIRMED"
-        elif sweep:
-            status = "WICK_SWEEP_ONLY"
-        else:
-            status = "INSIDE_RANGE"
+            if high is None or low is None:
+                return {
+                    "status": "REJECTED",
+                    "valid": False,
+                    "reason": "INVALID_RANGE_ANCHORS",
+                }
 
-        return {
-            "valid": True,
-            "status": status,
-            "direction": direction,
-            "confirmed": confirmed,
-            "wick_sweep": sweep,
-            "close": candle["close"],
-            "range_high": high,
-            "range_low": low,
-        }
+            range_source = "STRUCTURAL_ANCHORS"
 
-    def analyse(
-        self,
-        candles: List[Dict[str, Any]],
-        current_price: Optional[float] = None,
-        lookback: Optional[int] = None,
-        source: str = "H1"
-    ) -> Dict[str, Any]:
+        if high <= low:
+            return {
+                "status": "REJECTED",
+                "valid": False,
+                "reason": "INVALID_RANGE_WIDTH",
+            }
 
-        range_result = self.calculate_range(
-            candles=candles,
-            lookback=lookback,
-            source=source,
-        )
+        if price < low or price > high:
+            return {
+                "status": "REJECTED",
+                "valid": False,
+                "reason": "PRICE_OUTSIDE_RANGE",
+                "range_high": high,
+                "range_low": low,
+                "current_price": price,
+            }
 
-        if not range_result.get("valid"):
-            return range_result
+        midpoint = (high + low) / 2
+        range_width = high - low
 
-        normalised = self._normalise_candles(candles)
-
-        price = (
-            self._number(current_price)
-            if current_price is not None
-            else normalised[-1]["close"]
-        )
-
-        if price is None:
-            return self._failure(
-                "INVALID_CURRENT_PRICE",
-                len(normalised),
-                lookback or self.minimum_candles
-            )
-
-        position = self.classify_price(
+        location = self._classify_price(
             price,
-            range_result
+            low,
+            high,
         )
 
-        breakout = self.detect_range_break(
-            candles,
-            range_result
+        fibonacci = self._calculate_fibonacci(
+            low,
+            high,
+            direction,
         )
 
-        result = {
-            "valid": True,
-            "status": "ANALYSIS_COMPLETE",
-            "source": str(source).upper(),
-            "range": range_result["range"],
-            "price_position": position,
-            "breakout": breakout,
-            "rules": {
-                "equilibrium": self.equilibrium,
-                "premium_threshold": self.premium_threshold,
-                "discount_threshold": self.discount_threshold,
-                "wick_only_is_not_confirmed_break": True,
-                "body_close_required": True,
-            },
-        }
+        directional_valid = (
+            location == "DISCOUNT"
+            if direction == "BULLISH"
+            else location == "PREMIUM"
+        )
 
-        self.last_result = result
-        return result
-
-    def _failure(
-        self,
-        reason: str,
-        received: int,
-        required: int
-    ) -> Dict[str, Any]:
-
-        result = {
-            "valid": False,
-            "status": reason,
-            "candles_received": received,
-            "candles_required": required,
-        }
-
-        self.last_result = result
-        return result
-
-    def get_status(self) -> Dict[str, Any]:
         return {
-            "module": "SMCRangeEngine",
-            "ready": True,
-            "last_analysis": self.last_result,
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "valid": True,
+            "direction": direction,
+            "range_source": range_source,
+            "range_high": round(high, 10),
+            "range_low": round(low, 10),
+            "range_width": round(range_width, 10),
+            "equilibrium": round(midpoint, 10),
+            "current_price": round(price, 10),
+            "location": location,
+            "fibonacci_levels": fibonacci,
+            "directional_location_valid": directional_valid,
+            "execution_authorized": False,
         }
 
 
