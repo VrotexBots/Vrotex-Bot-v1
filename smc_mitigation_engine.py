@@ -1,122 +1,134 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Mitigation Engine
 
-Tracks mitigation and invalidation of:
-- Bullish and bearish Order Blocks
-- Bullish and bearish Fair Value Gaps
+Purpose:
+- Track mitigation of bullish and bearish SMC zones.
+- Detect first touch, partial mitigation, midpoint mitigation
+  and full mitigation.
+- Distinguish mitigation from zone invalidation.
+- Preserve the original zone boundaries.
+- Return structured evidence for the master SMC engine.
 
-States:
-- UNMITIGATED
-- PARTIALLY_MITIGATED
-- FULLY_MITIGATED
-- INVALIDATED
+Important:
+- Mitigation is not automatically invalidation.
+- A wick entering a zone is a mitigation event.
+- A full candle-body close beyond the invalidation boundary
+  invalidates the zone.
+- This module does not authorize or execute trades.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 
-VALID_TYPES = {"ORDER_BLOCK", "FVG"}
-VALID_DIRECTIONS = {"BULLISH", "BEARISH"}
-
-
-@dataclass
-class MitigationResult:
-    zone_id: str
-    zone_type: str
-    direction: str
-    status: str
-    mitigation_percent: float
-    first_touch_index: Optional[int]
-    last_touch_index: Optional[int]
-    invalidation_index: Optional[int]
-    reason: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
 class SMCMitigationEngine:
+    VERSION = "2.0"
 
-    def __init__(self):
-        self.zones: Dict[str, Dict[str, Any]] = {}
+    VALID_DIRECTIONS = {"BULLISH", "BEARISH"}
+
+    def __init__(
+        self,
+        midpoint_mitigation: bool = True,
+    ):
+        self.midpoint_mitigation = bool(midpoint_mitigation)
 
     @staticmethod
-    def _price(value: Any, field: str) -> float:
+    def _number(value: Any) -> Optional[float]:
         try:
-            number = float(value)
+            result = float(value)
+
+            if result != result or abs(result) == float("inf"):
+                return None
+
+            return result
+
         except (TypeError, ValueError):
-            raise ValueError(f"Invalid {field}")
+            return None
 
-        if number != number or number in (
-            float("inf"),
-            float("-inf"),
-        ):
-            raise ValueError(f"Non-finite {field}")
+    @staticmethod
+    def _normalise_direction(value: Any) -> Optional[str]:
+        direction = str(value or "").upper()
 
-        return number
+        if direction in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
 
-    def register_zone(
+        if direction in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    def _normalise_zone(
         self,
-        zone_id: str,
-        zone_type: str,
-        direction: str,
-        lower: float,
-        upper: float,
-        formation_index: int,
-    ) -> Dict[str, Any]:
+        zone: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(zone, dict):
+            return None
 
-        if not zone_id or not isinstance(zone_id, str):
-            raise ValueError("zone_id must be a non-empty string")
+        lower = self._number(
+            zone.get("lower", zone.get("low"))
+        )
 
-        zone_type = zone_type.upper()
-        direction = direction.upper()
+        upper = self._number(
+            zone.get("upper", zone.get("high"))
+        )
 
-        if zone_type not in VALID_TYPES:
-            raise ValueError("zone_type must be ORDER_BLOCK or FVG")
+        direction = self._normalise_direction(
+            zone.get("direction")
+        )
 
-        if direction not in VALID_DIRECTIONS:
-            raise ValueError("direction must be BULLISH or BEARISH")
+        if lower is None or upper is None:
+            return None
 
-        lower = self._price(lower, "lower")
-        upper = self._price(upper, "upper")
+        if lower >= upper or direction is None:
+            return None
 
-        if lower >= upper:
-            raise ValueError("lower must be below upper")
-
-        if not isinstance(formation_index, int) or formation_index < 0:
-            raise ValueError("formation_index must be a non-negative integer")
-
-        if zone_id in self.zones:
-            raise ValueError(f"Zone already registered: {zone_id}")
-
-        self.zones[zone_id] = {
-            "zone_id": zone_id,
-            "zone_type": zone_type,
+        return {
+            "zone_id": zone.get("zone_id", zone.get("id")),
+            "zone_type": str(
+                zone.get("zone_type", zone.get("type", "UNKNOWN"))
+            ).upper(),
             "direction": direction,
             "lower": lower,
             "upper": upper,
-            "formation_index": formation_index,
-            "status": "UNMITIGATED",
-            "mitigation_percent": 0.0,
-            "first_touch_index": None,
-            "last_touch_index": None,
-            "invalidation_index": None,
+            "midpoint": (lower + upper) / 2,
+            "original": zone,
         }
 
-        return self.get_zone(zone_id)
+    def _normalise_candles(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, float]]:
+        result = []
 
-    def get_zone(self, zone_id: str) -> Dict[str, Any]:
-        if zone_id not in self.zones:
-            raise KeyError(f"Unknown zone: {zone_id}")
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
 
-        return dict(self.zones[zone_id])
+            open_price = self._number(candle.get("open"))
+            high = self._number(candle.get("high"))
+            low = self._number(candle.get("low"))
+            close = self._number(candle.get("close"))
 
-    def remove_zone(self, zone_id: str) -> bool:
-        return self.zones.pop(zone_id, None) is not None
+            if None in (open_price, high, low, close):
+                continue
+
+            if high < low:
+                continue
+
+            if high < max(open_price, close):
+                continue
+
+            if low > min(open_price, close):
+                continue
+
+            result.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+            })
+
+        return result
 
     @staticmethod
     def _overlaps_zone(
@@ -128,194 +140,270 @@ class SMCMitigationEngine:
             and candle["low"] <= zone["upper"]
         )
 
-    def _calculate_penetration(
-        self,
-        candle: Dict[str, float],
-        zone: Dict[str, Any],
-    ) -> float:
-
-        lower = zone["lower"]
-        upper = zone["upper"]
-        size = upper - lower
-
-        if size <= 0:
-            return 0.0
-
-        if zone["direction"] == "BULLISH":
-            penetration = upper - max(candle["low"], lower)
-        else:
-            penetration = min(candle["high"], upper) - lower
-
-        return max(0.0, min(100.0, (penetration / size) * 100.0))
-
-    def _is_invalidated(
+    def _invalidation_check(
         self,
         candle: Dict[str, float],
         zone: Dict[str, Any],
     ) -> bool:
-
         if zone["direction"] == "BULLISH":
             return candle["close"] < zone["lower"]
 
         return candle["close"] > zone["upper"]
 
-    def update_zone(
-        self,
-        zone_id: str,
-        candles: List[Dict[str, Any]],
-        start_index: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    @staticmethod
+    def _penetration(
+        candle: Dict[str, float],
+        zone: Dict[str, Any],
+    ) -> float:
+        zone_size = zone["upper"] - zone["lower"]
 
-        if zone_id not in self.zones:
-            raise KeyError(f"Unknown zone: {zone_id}")
+        if zone_size <= 0:
+            return 0.0
 
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
+        if zone["direction"] == "BULLISH":
+            penetration = zone["upper"] - candle["low"]
+        else:
+            penetration = candle["high"] - zone["lower"]
 
-        zone = self.zones[zone_id]
+        penetration = max(0.0, min(zone_size, penetration))
 
-        if start_index is None:
-            start_index = zone["formation_index"] + 1
+        return penetration / zone_size
 
-        if not isinstance(start_index, int) or start_index < 0:
-            raise ValueError("start_index must be non-negative")
-
-        if start_index <= zone["formation_index"]:
-            raise ValueError(
-                "Mitigation checks must start after zone formation"
-            )
-
-        if zone["status"] == "INVALIDATED":
-            return self._result(zone, "ZONE_ALREADY_INVALIDATED")
-
-        if zone["status"] == "FULLY_MITIGATED":
-            return self._result(zone, "ZONE_ALREADY_FULLY_MITIGATED")
-
-        for index in range(start_index, len(candles)):
-
-            raw = candles[index]
-
-            if not isinstance(raw, dict):
-                raise ValueError("Invalid candle")
-
-            candle = {
-                field: self._price(raw.get(field), field)
-                for field in ("open", "high", "low", "close")
-            }
-
-            if candle["high"] < candle["low"]:
-                raise ValueError("Candle high cannot be below low")
-
-            if not (
-                candle["low"] <= candle["open"] <= candle["high"]
-                and candle["low"] <= candle["close"] <= candle["high"]
-            ):
-                raise ValueError("Invalid candle price range")
-
-            if self._is_invalidated(candle, zone):
-                zone["status"] = "INVALIDATED"
-                zone["invalidation_index"] = index
-                return self._result(
-                    zone,
-                    "CANDLE_CLOSED_BEYOND_ZONE_BOUNDARY",
-                )
-
-            if self._overlaps_zone(candle, zone):
-
-                penetration = self._calculate_penetration(
-                    candle,
-                    zone,
-                )
-
-                zone["mitigation_percent"] = max(
-                    zone["mitigation_percent"],
-                    penetration,
-                )
-
-                if zone["first_touch_index"] is None:
-                    zone["first_touch_index"] = index
-
-                zone["last_touch_index"] = index
-
-                if zone["mitigation_percent"] >= 100.0:
-                    zone["status"] = "FULLY_MITIGATED"
-                    return self._result(
-                        zone,
-                        "ZONE_FULLY_FILLED",
-                    )
-
-                zone["status"] = "PARTIALLY_MITIGATED"
-
-        return self._result(zone, "UPDATE_COMPLETE")
-
-    def _result(
+    def analyse_zone(
         self,
         zone: Dict[str, Any],
-        reason: str,
-    ) -> Dict[str, Any]:
-
-        return MitigationResult(
-            zone_id=zone["zone_id"],
-            zone_type=zone["zone_type"],
-            direction=zone["direction"],
-            status=zone["status"],
-            mitigation_percent=round(
-                zone["mitigation_percent"],
-                2,
-            ),
-            first_touch_index=zone["first_touch_index"],
-            last_touch_index=zone["last_touch_index"],
-            invalidation_index=zone["invalidation_index"],
-            reason=reason,
-        ).to_dict()
-
-    def update_all(
-        self,
         candles: List[Dict[str, Any]],
-    ) -> Dict[str, Dict[str, Any]]:
+        formation_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        normalised_zone = self._normalise_zone(zone)
 
-        results = {}
+        if normalised_zone is None:
+            return {
+                "status": "ERROR",
+                "valid": False,
+                "reason": "INVALID_ZONE",
+            }
 
-        for zone_id, zone in list(self.zones.items()):
-            if zone["status"] in (
-                "INVALIDATED",
-                "FULLY_MITIGATED",
-            ):
+        if not isinstance(candles, list):
+            return {
+                "status": "ERROR",
+                "valid": False,
+                "reason": "INVALID_CANDLE_INPUT",
+            }
+
+        normalised_candles = self._normalise_candles(candles)
+
+        if not normalised_candles:
+            return {
+                "status": "ERROR",
+                "valid": False,
+                "reason": "NO_VALID_CANDLES",
+            }
+
+        if formation_index is None:
+            start_index = 0
+        else:
+            try:
+                formation_index = int(formation_index)
+            except (TypeError, ValueError):
+                return {
+                    "status": "ERROR",
+                    "valid": False,
+                    "reason": "INVALID_FORMATION_INDEX",
+                }
+
+            if formation_index < -1 or formation_index >= len(normalised_candles):
+                return {
+                    "status": "ERROR",
+                    "valid": False,
+                    "reason": "FORMATION_INDEX_OUT_OF_RANGE",
+                }
+
+            start_index = formation_index + 1
+
+        events = []
+        first_touch_index = None
+        maximum_penetration = 0.0
+        invalidated = False
+        invalidation_index = None
+
+        for index in range(start_index, len(normalised_candles)):
+            candle = normalised_candles[index]
+
+            if self._invalidation_check(candle, normalised_zone):
+                invalidated = True
+                invalidation_index = index
+
+                events.append({
+                    "index": index,
+                    "event": "ZONE_INVALIDATED",
+                    "close": candle["close"],
+                })
+
+                break
+
+            if not self._overlaps_zone(candle, normalised_zone):
                 continue
 
-            results[zone_id] = self.update_zone(
-                zone_id,
-                candles,
+            penetration = self._penetration(
+                candle,
+                normalised_zone,
             )
 
-        return results
-
-    def get_active_zones(self) -> List[Dict[str, Any]]:
-        return [
-            dict(zone)
-            for zone in self.zones.values()
-            if zone["status"] in (
-                "UNMITIGATED",
-                "PARTIALLY_MITIGATED",
+            maximum_penetration = max(
+                maximum_penetration,
+                penetration,
             )
-        ]
 
-    def get_status(self) -> Dict[str, Any]:
-        counts = {
-            "UNMITIGATED": 0,
-            "PARTIALLY_MITIGATED": 0,
-            "FULLY_MITIGATED": 0,
-            "INVALIDATED": 0,
-        }
+            if first_touch_index is None:
+                first_touch_index = index
 
-        for zone in self.zones.values():
-            counts[zone["status"]] += 1
+                events.append({
+                    "index": index,
+                    "event": "FIRST_TOUCH",
+                    "penetration": round(penetration, 4),
+                })
+
+            if penetration >= 1.0:
+                stage = "FULL_MITIGATION"
+
+            elif penetration >= 0.5:
+                stage = "MIDPOINT_MITIGATION"
+
+            else:
+                stage = "PARTIAL_MITIGATION"
+
+            events.append({
+                "index": index,
+                "event": stage,
+                "penetration": round(penetration, 4),
+            })
+
+        if invalidated:
+            status = "INVALIDATED"
+            mitigation_state = "INVALIDATED"
+
+        elif first_touch_index is None:
+            status = "UNMITIGATED"
+            mitigation_state = "UNMITIGATED"
+
+        elif maximum_penetration >= 1.0:
+            status = "FULLY_MITIGATED"
+            mitigation_state = "FULL"
+
+        elif maximum_penetration >= 0.5:
+            status = "MIDPOINT_MITIGATED"
+            mitigation_state = "MIDPOINT"
+
+        else:
+            status = "PARTIALLY_MITIGATED"
+            mitigation_state = "PARTIAL"
+
+        clean = (
+            first_touch_index is None
+            and not invalidated
+        )
 
         return {
-            "total_zones": len(self.zones),
-            "states": counts,
+            "status": status,
+            "version": self.VERSION,
+            "valid": True,
+            "zone_id": normalised_zone["zone_id"],
+            "zone_type": normalised_zone["zone_type"],
+            "direction": normalised_zone["direction"],
+            "lower": normalised_zone["lower"],
+            "upper": normalised_zone["upper"],
+            "midpoint": normalised_zone["midpoint"],
+            "first_touch_index": first_touch_index,
+            "invalidation_index": invalidation_index,
+            "maximum_penetration": round(
+                maximum_penetration,
+                4,
+            ),
+            "mitigation_state": mitigation_state,
+            "mitigated": first_touch_index is not None,
+            "unmitigated": clean,
+            "clean": clean,
+            "invalidated": invalidated,
+            "events": events,
+            "confirmation": status,
         }
 
+    def analyse(
+        self,
+        zones: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+        formation_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(zones, list):
+            return {
+                "status": "ERROR",
+                "reason": "INVALID_ZONES_INPUT",
+                "zones": [],
+            }
 
-# Shared engine instance
+        if not isinstance(candles, list):
+            return {
+                "status": "ERROR",
+                "reason": "INVALID_CANDLE_INPUT",
+                "zones": [],
+            }
+
+        results = []
+
+        for index, zone in enumerate(zones):
+            formation_index = None
+
+            if formation_indices is not None:
+                if index < len(formation_indices):
+                    formation_index = formation_indices[index]
+
+            result = self.analyse_zone(
+                zone=zone,
+                candles=candles,
+                formation_index=formation_index,
+            )
+
+            results.append(result)
+
+        return {
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "zone_count": len(results),
+            "unmitigated_zones": [
+                item for item in results
+                if item.get("unmitigated")
+            ],
+            "partially_mitigated_zones": [
+                item for item in results
+                if item.get("mitigation_state") == "PARTIAL"
+            ],
+            "midpoint_mitigated_zones": [
+                item for item in results
+                if item.get("mitigation_state") == "MIDPOINT"
+            ],
+            "fully_mitigated_zones": [
+                item for item in results
+                if item.get("mitigation_state") == "FULL"
+            ],
+            "invalidated_zones": [
+                item for item in results
+                if item.get("invalidated")
+            ],
+            "zones": results,
+        }
+
+    def analyze(
+        self,
+        zones: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+        formation_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        return self.analyse(
+            zones,
+            candles,
+            formation_indices,
+        )
+
+
 smc_mitigation_engine = SMCMitigationEngine()
