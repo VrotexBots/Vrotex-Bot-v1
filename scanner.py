@@ -1,4 +1,3 @@
-
 """
 VROTEX BOT V1
 Market Scanner
@@ -9,9 +8,10 @@ Purpose:
 - Continuously scan the approved pilot instruments.
 - Retrieve H1, M5 and M1 market candles.
 - Run technical analysis on each timeframe.
+- Obtain validated live Bid/Ask prices.
 - Submit collected market data to the master SMC engine.
-- Reject incomplete setups.
-- Keep execution disabled.
+- Reject incomplete market data.
+- Keep order execution outside this module.
 
 Pilot:
 EURUSD, GBPUSD, BTCUSD
@@ -20,8 +20,6 @@ Strategy:
 H1 = External narrative
 M5 = Confirmation
 M1 = Entry
-
-This module does not place orders.
 """
 
 import asyncio
@@ -57,7 +55,7 @@ class MarketScanner:
         "M1",
     )
 
-    CANDLE_COUNT = 500
+    CANDLE_COUNT = 1000
 
     def __init__(self):
 
@@ -65,7 +63,6 @@ class MarketScanner:
         self.technical_analysis = technical_analysis_engine
         self.smc = smc_engine
 
-        # Pilot restriction
         self.instruments = list(
             self.PILOT_INSTRUMENTS
         )
@@ -147,9 +144,7 @@ class MarketScanner:
                 ):
                     return False
 
-                open_price, high, low, close = (
-                    values
-                )
+                open_price, high, low, close = values
 
                 if low <= 0 or high <= 0:
                     return False
@@ -191,9 +186,7 @@ class MarketScanner:
             )
         )
 
-        if not self._valid_candles(
-            candles
-        ):
+        if not self._valid_candles(candles):
 
             return {
                 "valid": False,
@@ -212,10 +205,7 @@ class MarketScanner:
             )
         )
 
-        if not isinstance(
-            analysis,
-            dict,
-        ):
+        if not isinstance(analysis, dict):
 
             return {
                 "valid": False,
@@ -237,6 +227,83 @@ class MarketScanner:
         }
 
     # --------------------------------------------------
+    # LIVE PRICE VALIDATION
+    # --------------------------------------------------
+
+    def _get_validated_live_tick(
+        self,
+        symbol: str,
+    ):
+
+        tick = self.market_data.get_live_tick(
+            symbol
+        )
+
+        if not isinstance(tick, dict):
+            return None
+
+        try:
+
+            bid = float(tick["bid"])
+            ask = float(tick["ask"])
+            mid = float(
+                tick.get(
+                    "mid",
+                    (bid + ask) / 2,
+                )
+            )
+            age = float(tick["age"])
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                bid,
+                ask,
+                mid,
+                age,
+            )
+        ):
+            return None
+
+        if bid <= 0 or ask < bid:
+            return None
+
+        if age < 0:
+            return None
+
+        max_age = float(
+            getattr(
+                settings,
+                "LIVE_TICK_MAX_AGE_SECONDS",
+                10,
+            )
+        )
+
+        if age > max_age:
+            return None
+
+        if tick.get("fresh") is not True:
+            return None
+
+        return {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread": ask - bid,
+            "timestamp": tick.get("timestamp"),
+            "age": age,
+            "fresh": True,
+        }
+
+    # --------------------------------------------------
     # SCAN ONE INSTRUMENT
     # --------------------------------------------------
 
@@ -245,7 +312,7 @@ class MarketScanner:
         symbol: str,
     ) -> Dict[str, Any]:
 
-        symbol = str(symbol).upper()
+        symbol = str(symbol).upper().strip()
 
         result = {
             "symbol": symbol,
@@ -261,22 +328,33 @@ class MarketScanner:
             ).isoformat(),
         }
 
+        if symbol not in self.instruments:
+
+            result.update({
+                "status": "REJECTED",
+                "reason": "INSTRUMENT_NOT_APPROVED",
+            })
+
+            return self._store_result(
+                symbol,
+                result,
+            )
+
         try:
 
-            # H1, M5 and M1
-            timeframe_results = (
-                await asyncio.gather(
-                    *[
-                        self._collect_timeframe(
-                            symbol,
-                            timeframe,
-                        )
-                        for timeframe in (
-                            self.STRATEGY_TIMEFRAMES
-                        )
-                    ],
-                    return_exceptions=True,
-                )
+            # ------------------------------------------
+            # COLLECT H1, M5 AND M1
+            # ------------------------------------------
+
+            timeframe_results = await asyncio.gather(
+                *[
+                    self._collect_timeframe(
+                        symbol,
+                        timeframe,
+                    )
+                    for timeframe in self.STRATEGY_TIMEFRAMES
+                ],
+                return_exceptions=True,
             )
 
             market_data = {}
@@ -287,10 +365,7 @@ class MarketScanner:
                 timeframe_results,
             ):
 
-                if isinstance(
-                    item,
-                    Exception,
-                ):
+                if isinstance(item, Exception):
 
                     data_errors.append({
                         "timeframe": timeframe,
@@ -299,17 +374,13 @@ class MarketScanner:
 
                     continue
 
-                result["timeframes"][
-                    timeframe
-                ] = item
+                result["timeframes"][timeframe] = item
 
                 if item.get("valid") is not True:
 
                     data_errors.append({
                         "timeframe": timeframe,
-                        "error": item.get(
-                            "reason"
-                        ),
+                        "error": item.get("reason"),
                     })
 
                     continue
@@ -319,10 +390,15 @@ class MarketScanner:
                     "technical": item["technical"],
                 }
 
-            # Required timeframes must all be valid.
+            # ------------------------------------------
+            # REQUIRED TIMEFRAME VALIDATION
+            # ------------------------------------------
+
             if (
                 data_errors
-                or len(market_data) != 3
+                or len(market_data) != len(
+                    self.STRATEGY_TIMEFRAMES
+                )
             ):
 
                 result.update({
@@ -338,20 +414,44 @@ class MarketScanner:
                     result,
                 )
 
-            # Current price from latest M1 candle.
-            current_price = float(
-                market_data["M1"][
-                    "candles"
-                ][-1]["close"]
+            # ------------------------------------------
+            # GET FRESH LIVE BID/ASK
+            # ------------------------------------------
+
+            live_tick = self._get_validated_live_tick(
+                symbol
             )
 
-            if current_price <= 0:
+            if live_tick is None:
+
+                result.update({
+                    "status": "LIVE_TICK_UNAVAILABLE",
+                    "reason": (
+                        "NO_VALID_FRESH_LIVE_BID_ASK"
+                    ),
+                    "execution_authorized": False,
+                })
+
+                logger.warning(
+                    "Live tick unavailable or stale | %s",
+                    symbol,
+                )
+
+                return self._store_result(
+                    symbol,
+                    result,
+                )
+
+            current_price = live_tick["mid"]
+
+            if (
+                not math.isfinite(current_price)
+                or current_price <= 0
+            ):
 
                 result.update({
                     "status": "INVALID_PRICE",
-                    "reason": (
-                        "CURRENT_PRICE_INVALID"
-                    ),
+                    "reason": "CURRENT_PRICE_INVALID",
                 })
 
                 return self._store_result(
@@ -359,15 +459,25 @@ class MarketScanner:
                     result,
                 )
 
-            result["current_price"] = (
-                current_price
+            # Make validated live market prices
+            # accessible to the SMC analysis input.
+            market_data["live_tick"] = dict(
+                live_tick
             )
 
+            result.update({
+                "current_price": current_price,
+                "bid": live_tick["bid"],
+                "ask": live_tick["ask"],
+                "spread": live_tick["spread"],
+                "tick_timestamp": live_tick["timestamp"],
+                "tick_age_seconds": live_tick["age"],
+                "live_tick_fresh": True,
+            })
+
+            # ------------------------------------------
             # MASTER SMC ENGINE
-            #
-            # Evidence modules are not yet integrated.
-            # Missing evidence remains None.
-            # Execution is always disabled.
+            # ------------------------------------------
 
             decision = await self._resolve(
                 self.smc.analyse(
@@ -383,10 +493,7 @@ class MarketScanner:
                 )
             )
 
-            if not isinstance(
-                decision,
-                dict,
-            ):
+            if not isinstance(decision, dict):
 
                 result.update({
                     "status": "ANALYSIS_ERROR",
@@ -400,15 +507,11 @@ class MarketScanner:
                     result,
                 )
 
-            result["analysis"] = (
-                decision
-            )
+            result["analysis"] = decision
 
             setup_found = (
-                decision.get("status")
-                == "A_PLUS_SETUP"
-                and decision.get("a_plus")
-                is True
+                decision.get("status") == "A_PLUS_SETUP"
+                and decision.get("a_plus") is True
                 and decision.get(
                     "execution_authorized"
                 ) is True
@@ -421,21 +524,21 @@ class MarketScanner:
                     else "NO_CONFIRMED_SETUP"
                 ),
                 "setup_found": setup_found,
-                "direction": decision.get(
-                    "direction"
-                ),
-                "reason": decision.get(
-                    "reason"
-                ),
+                "direction": decision.get("direction"),
+                "reason": decision.get("reason"),
                 "execution_authorized": False,
             })
 
             logger.info(
                 "Analysis complete | %s | "
-                "Price: %s | Status: %s | "
+                "Bid: %s | Ask: %s | Mid: %s | "
+                "Tick age: %.2fs | Status: %s | "
                 "Direction: %s",
                 symbol,
+                live_tick["bid"],
+                live_tick["ask"],
                 current_price,
+                live_tick["age"],
                 result["status"],
                 result["direction"],
             )
@@ -474,7 +577,10 @@ class MarketScanner:
 
         self.results[symbol] = result
 
-        if result["status"] == "ERROR":
+        if result["status"] in (
+            "ERROR",
+            "ANALYSIS_ERROR",
+        ):
 
             self.failed_scans += 1
 
@@ -501,21 +607,15 @@ class MarketScanner:
             )
 
             logger.info(
-                "Starting pilot market scan: "
+                "Starting V1 market scan | "
                 "%s instruments | %s",
                 len(self.instruments),
-                ", ".join(
-                    self.instruments
-                ),
+                ", ".join(self.instruments),
             )
 
             tasks = [
-                self.scan_instrument(
-                    symbol
-                )
-                for symbol in (
-                    self.instruments
-                )
+                self.scan_instrument(symbol)
+                for symbol in self.instruments
             ]
 
             results = await asyncio.gather(
@@ -525,27 +625,24 @@ class MarketScanner:
 
             completed = {}
 
-            for symbol, result in zip(
+            for symbol, scan_result in zip(
                 self.instruments,
                 results,
             ):
 
-                if isinstance(
-                    result,
-                    Exception,
-                ):
+                if isinstance(scan_result, Exception):
 
                     logger.error(
                         "Scan task failed | %s | %s",
                         symbol,
-                        result,
+                        scan_result,
                     )
 
                     completed[symbol] = {
                         "symbol": symbol,
                         "status": "ERROR",
                         "setup_found": False,
-                        "reason": str(result),
+                        "reason": str(scan_result),
                         "execution_authorized": False,
                     }
 
@@ -553,24 +650,18 @@ class MarketScanner:
 
                 else:
 
-                    completed[symbol] = (
-                        result
-                    )
+                    completed[symbol] = scan_result
 
             self.status = "RUNNING"
 
             setup_count = sum(
                 1
-                for item in (
-                    completed.values()
-                )
-                if item.get(
-                    "setup_found"
-                ) is True
+                for item in completed.values()
+                if item.get("setup_found") is True
             )
 
             logger.info(
-                "Pilot scan complete | "
+                "V1 scan complete | "
                 "%s instruments | "
                 "%s setup candidates",
                 len(completed),
@@ -579,15 +670,9 @@ class MarketScanner:
 
             return {
                 "status": "COMPLETED",
-                "timestamp": (
-                    self.last_scan_time
-                ),
-                "total_instruments": (
-                    len(completed)
-                ),
-                "setup_candidates": (
-                    setup_count
-                ),
+                "timestamp": self.last_scan_time,
+                "total_instruments": len(completed),
+                "setup_candidates": setup_count,
                 "results": completed,
                 "execution_authorized": False,
             }
@@ -611,18 +696,21 @@ class MarketScanner:
         self.status = "RUNNING"
 
         logger.info(
-            "Vrotex V1 pilot scanner started"
+            "Vrotex V1 market scanner started"
         )
 
         logger.info(
             "Pilot instruments: %s",
-            ", ".join(
-                self.instruments
-            ),
+            ", ".join(self.instruments),
         )
 
         logger.info(
             "Strategy timeframes: H1 -> M5 -> M1"
+        )
+
+        logger.info(
+            "Candles per strategy timeframe: %s",
+            self.CANDLE_COUNT,
         )
 
         try:
@@ -630,22 +718,19 @@ class MarketScanner:
             while self.running:
 
                 started = (
-                    asyncio.get_running_loop()
-                    .time()
+                    asyncio.get_running_loop().time()
                 )
 
                 await self.scan_all()
 
                 elapsed = (
-                    asyncio.get_running_loop()
-                    .time()
+                    asyncio.get_running_loop().time()
                     - started
                 )
 
                 delay = max(
                     1,
-                    self.scan_interval
-                    - elapsed,
+                    self.scan_interval - elapsed,
                 )
 
                 try:
@@ -685,7 +770,7 @@ class MarketScanner:
                 self.status = "STOPPED"
 
             logger.info(
-                "Vrotex V1 pilot scanner stopped"
+                "Vrotex V1 market scanner stopped"
             )
 
     # --------------------------------------------------
@@ -707,31 +792,26 @@ class MarketScanner:
 
     def get_status(self):
 
+        live_ticks = self.market_data.get_live_ticks()
+
         return {
             "module": "MarketScanner",
             "version": self.VERSION,
             "status": self.status,
             "running": self.running,
-            "instruments": list(
-                self.instruments
-            ),
+            "instruments": list(self.instruments),
             "strategy_timeframes": list(
                 self.STRATEGY_TIMEFRAMES
             ),
-            "scan_interval_seconds": (
-                self.scan_interval
-            ),
-            "total_scans": (
-                self.total_scans
-            ),
-            "successful_scans": (
-                self.successful_scans
-            ),
-            "failed_scans": (
-                self.failed_scans
-            ),
-            "last_scan_time": (
-                self.last_scan_time
+            "candles_per_timeframe": self.CANDLE_COUNT,
+            "scan_interval_seconds": self.scan_interval,
+            "total_scans": self.total_scans,
+            "successful_scans": self.successful_scans,
+            "failed_scans": self.failed_scans,
+            "last_scan_time": self.last_scan_time,
+            "live_tick_count": len(live_ticks),
+            "live_tick_instruments": list(
+                live_ticks.keys()
             ),
             "execution_authorized": False,
         }
