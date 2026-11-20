@@ -1,333 +1,366 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Evidence Aggregator
 
 Purpose:
-- Standardize evidence from individual SMC engines.
-- Collect H1, M5 and M1 directional information.
-- Aggregate structure, POI, liquidity and entry evidence.
-- Calculate category scores using approved weights.
-- Prepare evidence for smc_setup_validator.py.
+- Collect evidence from individual SMC modules.
+- Organise evidence by timeframe and category.
+- Preserve original evidence for auditing.
+- Detect missing and contradictory evidence.
+- Produce a unified evidence package for the master SMC engine.
 
-Missing evidence is never treated as confirmation.
-This module does not execute trades.
+Approved strategy:
+H1 = External narrative
+M5 = Confirmation
+M1 = Entry
+
+This module does not calculate A+ scores or execute trades.
 """
 
-from __future__ import annotations
-
-from typing import Any, Dict, Optional
-
-
-CATEGORY_WEIGHTS = {
-    "structure": 20,
-    "poi": 15,
-    "liquidity": 15,
-    "entry_model": 20,
-    "timeframe_alignment": 15,
-    "fundamentals": 5,
-    "trade_quality_risk": 10,
-}
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
 
 class SMCEvidenceAggregator:
+    VERSION = "2.0"
+
+    REQUIRED_TIMEFRAMES = ("H1", "M5", "M1")
 
     def __init__(self):
-        self.last_evidence: Optional[Dict[str, Any]] = None
+        pass
 
     @staticmethod
-    def _direction(value: Any) -> str:
-        if not isinstance(value, str):
-            return "UNKNOWN"
+    def _direction(value: Any) -> Optional[str]:
+        value = str(value or "").upper()
 
-        value = value.strip().upper()
+        if value in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
 
-        if value in ("BULLISH", "BEARISH", "NEUTRAL"):
+        if value in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        if isinstance(value, list):
             return value
 
-        return "UNKNOWN"
+        if isinstance(value, dict):
+            return [value]
 
-    @staticmethod
-    def _confirmed(data: Dict[str, Any]) -> bool:
-        """
-        Accept only explicit positive confirmation.
-        """
-        if not isinstance(data, dict):
-            return False
+        return []
 
-        return (
-            data.get("detected") is True
-            or data.get("confirmed") is True
-            or data.get("valid") is True
-            or data.get("approved") is True
+    def _extract_direction(
+        self,
+        evidence: Dict[str, Any],
+    ) -> Optional[str]:
+        direction = self._direction(
+            evidence.get("direction")
         )
 
-    @staticmethod
-    def _score(value: Any) -> float:
-        try:
-            score = float(value)
-        except (TypeError, ValueError):
-            return 0.0
+        if direction:
+            return direction
 
-        if score != score or score in (
-            float("inf"),
-            float("-inf"),
-        ):
-            return 0.0
-
-        return max(0.0, min(100.0, score))
-
-    @staticmethod
-    def _weighted_category(
-        checks: Dict[str, bool],
-    ) -> float:
-        if not checks:
-            return 0.0
-
-        passed = sum(
-            1 for value in checks.values()
-            if value is True
+        structure = self._as_dict(
+            evidence.get("structure")
         )
 
-        return round(
-            passed / len(checks) * 100.0,
-            2,
+        return self._direction(
+            structure.get("bias")
+            or structure.get("direction")
         )
+
+    def _normalise_timeframes(
+        self,
+        timeframe_evidence: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        result = {}
+
+        for timeframe in self.REQUIRED_TIMEFRAMES:
+            raw = self._as_dict(
+                timeframe_evidence.get(timeframe)
+            )
+
+            result[timeframe] = {
+                "timeframe": timeframe,
+                "direction": self._extract_direction(raw),
+                "structure": self._as_dict(
+                    raw.get("structure")
+                ),
+                "breaks": self._as_list(
+                    raw.get("breaks")
+                ),
+                "liquidity_sweeps": self._as_list(
+                    raw.get("liquidity_sweeps")
+                ),
+                "confirmed": raw.get("confirmed"),
+                "source_evidence": raw,
+                "available": bool(raw),
+            }
+
+        return result
+
+    def _collect_liquidity(
+        self,
+        liquidity_evidence: Any,
+    ) -> Dict[str, Any]:
+        source = self._as_dict(liquidity_evidence)
+
+        sweeps = source.get(
+            "liquidity_sweeps",
+            source.get("sweeps", []),
+        )
+
+        targets = source.get(
+            "liquidity_targets",
+            source.get("targets", []),
+        )
+
+        if isinstance(sweeps, dict):
+            sweeps = [sweeps]
+
+        if isinstance(targets, dict):
+            targets = [targets]
+
+        return {
+            "sweeps": self._as_list(sweeps),
+            "targets": self._as_list(targets),
+            "inducements": self._as_list(
+                source.get("inducements", [])
+            ),
+            "source_evidence": source,
+        }
+
+    def _collect_zones(
+        self,
+        poi_evidence: Any,
+        fvg_evidence: Any,
+    ) -> Dict[str, Any]:
+        poi = self._as_dict(poi_evidence)
+        fvg = self._as_dict(fvg_evidence)
+
+        poi_zones = poi.get(
+            "order_blocks",
+            poi.get("zones", []),
+        )
+
+        if not poi_zones and poi:
+            poi_zones = [poi]
+
+        fvgs = fvg.get(
+            "fvgs",
+            fvg.get("clean_fvgs", []),
+        )
+
+        if not fvgs and fvg:
+            fvgs = [fvg]
+
+        return {
+            "poi": self._as_list(poi_zones),
+            "fvg": self._as_list(fvgs),
+            "poi_source": poi,
+            "fvg_source": fvg,
+        }
+
+    def _collect_displacement(
+        self,
+        displacement_evidence: Any,
+    ) -> Dict[str, Any]:
+        source = self._as_dict(displacement_evidence)
+
+        latest = source.get("latest_displacement")
+
+        return {
+            "detected": source.get("detected") is True,
+            "confirmed": source.get("confirmed") is True,
+            "direction": self._direction(
+                source.get("direction")
+                or (
+                    latest.get("direction")
+                    if isinstance(latest, dict)
+                    else None
+                )
+            ),
+            "latest_displacement": (
+                latest if isinstance(latest, dict) else None
+            ),
+            "displacements": self._as_list(
+                source.get("displacements", [])
+            ),
+            "source_evidence": source,
+        }
+
+    def _collect_entry_models(
+        self,
+        entry_evidence: Any,
+    ) -> Dict[str, Any]:
+        source = self._as_dict(entry_evidence)
+
+        models = source.get(
+            "confirmed_models",
+            source.get("entry_models", []),
+        )
+
+        return {
+            "confirmed_models": self._as_list(models),
+            "confirmed": source.get("confirmed") is True,
+            "direction": self._direction(
+                source.get("direction")
+            ),
+            "source_evidence": source,
+        }
+
+    def _collect_risk(
+        self,
+        risk_evidence: Any,
+    ) -> Dict[str, Any]:
+        source = self._as_dict(risk_evidence)
+
+        return {
+            "valid": source.get("valid") is True,
+            "checks": self._as_dict(
+                source.get("checks")
+            ),
+            "risk_reward": source.get("risk_reward"),
+            "stop_loss": source.get("stop_loss"),
+            "take_profit": source.get("take_profit"),
+            "source_evidence": source,
+        }
+
+    def _detect_conflicts(
+        self,
+        timeframes: Dict[str, Dict[str, Any]],
+        expected_direction: Optional[str],
+    ) -> List[str]:
+        conflicts = []
+
+        for timeframe, evidence in timeframes.items():
+            direction = evidence.get("direction")
+
+            if (
+                direction is not None
+                and expected_direction is not None
+                and direction != expected_direction
+            ):
+                conflicts.append(
+                    f"{timeframe}_DIRECTION_CONFLICT"
+                )
+
+        return conflicts
 
     def aggregate(
         self,
-        h1: Dict[str, Any],
-        m5: Dict[str, Any],
-        m1: Dict[str, Any],
-        poi: Dict[str, Any],
-        liquidity: Dict[str, Any],
-        displacement: Dict[str, Any],
-        fvg: Dict[str, Any],
-        entry_model: Dict[str, Any],
-        risk: Dict[str, Any],
-        fundamentals: Optional[Dict[str, Any]] = None,
-        spread: Optional[Dict[str, Any]] = None,
+        timeframe_evidence: Dict[str, Any],
+        liquidity_evidence: Optional[Dict[str, Any]] = None,
+        poi_evidence: Optional[Dict[str, Any]] = None,
+        fvg_evidence: Optional[Dict[str, Any]] = None,
+        displacement_evidence: Optional[Dict[str, Any]] = None,
+        entry_evidence: Optional[Dict[str, Any]] = None,
+        risk_evidence: Optional[Dict[str, Any]] = None,
+        expected_direction: Optional[str] = None,
+        instrument: Optional[str] = None,
     ) -> Dict[str, Any]:
 
-        inputs = {
-            "h1": h1,
-            "m5": m5,
-            "m1": m1,
-            "poi": poi,
+        if not isinstance(timeframe_evidence, dict):
+            return {
+                "status": "ERROR",
+                "reason": "INVALID_TIMEFRAME_EVIDENCE",
+                "valid": False,
+            }
+
+        direction = self._direction(expected_direction)
+
+        if direction is None:
+            direction = self._extract_direction(
+                self._as_dict(timeframe_evidence.get("H1"))
+            )
+
+        timeframes = self._normalise_timeframes(
+            timeframe_evidence
+        )
+
+        liquidity = self._collect_liquidity(
+            liquidity_evidence
+        )
+
+        zones = self._collect_zones(
+            poi_evidence,
+            fvg_evidence,
+        )
+
+        displacement = self._collect_displacement(
+            displacement_evidence
+        )
+
+        entry = self._collect_entry_models(
+            entry_evidence
+        )
+
+        risk = self._collect_risk(
+            risk_evidence
+        )
+
+        missing_timeframes = [
+            timeframe
+            for timeframe, evidence in timeframes.items()
+            if not evidence["available"]
+        ]
+
+        conflicts = self._detect_conflicts(
+            timeframes,
+            direction,
+        )
+
+        valid = (
+            direction is not None
+            and not missing_timeframes
+            and not conflicts
+        )
+
+        return {
+            "status": (
+                "AGGREGATED"
+                if valid
+                else "INCOMPLETE_OR_CONFLICTING"
+            ),
+            "version": self.VERSION,
+            "valid": valid,
+            "confirmed": False,
+            "instrument": instrument,
+            "direction": direction,
+            "timestamp": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "timeframes": timeframes,
             "liquidity": liquidity,
+            "zones": zones,
             "displacement": displacement,
-            "fvg": fvg,
-            "entry_model": entry_model,
+            "entry": entry,
             "risk": risk,
-        }
-
-        for name, value in inputs.items():
-            if not isinstance(value, dict):
-                raise ValueError(
-                    f"{name} evidence must be a dictionary"
+            "missing_timeframes": missing_timeframes,
+            "conflicts": conflicts,
+            "evidence_count": (
+                sum(
+                    len(item["breaks"])
+                    + len(item["liquidity_sweeps"])
+                    for item in timeframes.values()
                 )
-
-        fundamentals = fundamentals or {}
-        spread = spread or {}
-
-        if not isinstance(fundamentals, dict):
-            raise ValueError("fundamentals must be a dictionary")
-
-        if not isinstance(spread, dict):
-            raise ValueError("spread must be a dictionary")
-
-        h1_direction = self._direction(
-            h1.get("direction", h1.get("bias"))
-        )
-
-        m5_direction = self._direction(
-            m5.get("direction", m5.get("bias"))
-        )
-
-        m1_direction = self._direction(
-            m1.get("direction", m1.get("bias"))
-        )
-
-        directions_aligned = (
-            h1_direction == m5_direction == m1_direction
-            and h1_direction in ("BULLISH", "BEARISH")
-        )
-
-        structure_checks = {
-            "h1_structure": self._confirmed(
-                h1.get("structure", {})
+                + len(liquidity["sweeps"])
+                + len(zones["poi"])
+                + len(zones["fvg"])
+                + len(displacement["displacements"])
+                + len(entry["confirmed_models"])
             ),
-            "h1_body_close": (
-                h1.get("body_close_confirmed") is True
-            ),
-            "m5_structure": self._confirmed(
-                m5.get("structure", {})
-            ),
-            "m5_body_close": (
-                m5.get("body_close_confirmed") is True
-            ),
-        }
-
-        poi_checks = {
-            "poi_detected": self._confirmed(poi),
-            "poi_clean": poi.get("clean") is True,
-            "poi_unmitigated": poi.get("unmitigated") is True,
-        }
-
-        liquidity_checks = {
-            "liquidity_detected": self._confirmed(liquidity),
-            "liquidity_sweep": (
-                liquidity.get("swept") is True
-                or liquidity.get("sweep_detected") is True
-            ),
-        }
-
-        entry_checks = {
-            "displacement": self._confirmed(displacement),
-            "fvg": self._confirmed(fvg),
-            "entry_model": self._confirmed(entry_model),
-        }
-
-        timeframe_checks = {
-            "h1_m5_aligned": (
-                h1_direction == m5_direction
-                and h1_direction in ("BULLISH", "BEARISH")
-            ),
-            "m5_m1_aligned": (
-                m5_direction == m1_direction
-                and m5_direction in ("BULLISH", "BEARISH")
-            ),
-            "all_aligned": directions_aligned,
-        }
-
-        fundamental_score = self._score(
-            fundamentals.get("score", 0)
-        )
-
-        fundamental_checked = (
-            fundamentals.get("checked") is True
-        )
-
-        risk_checks = {
-            "risk_acceptable": (
-                risk.get("acceptable") is True
-                or risk.get("approved") is True
-            ),
-            "spread_acceptable": (
-                spread.get("acceptable") is True
-            ),
-        }
-
-        category_scores = {
-            "structure": self._weighted_category(
-                structure_checks
-            ),
-            "poi": self._weighted_category(
-                poi_checks
-            ),
-            "liquidity": self._weighted_category(
-                liquidity_checks
-            ),
-            "entry_model": self._weighted_category(
-                entry_checks
-            ),
-            "timeframe_alignment": self._weighted_category(
-                timeframe_checks
-            ),
-            "fundamentals": (
-                fundamental_score if fundamental_checked else 0.0
-            ),
-            "trade_quality_risk": self._weighted_category(
-                risk_checks
-            ),
-        }
-
-        weighted_total = round(
-            sum(
-                category_scores[name] * weight / 100.0
-                for name, weight in CATEGORY_WEIGHTS.items()
-            ),
-            2,
-        )
-
-        evidence = {
-            "h1_direction": h1_direction,
-            "m5_direction": m5_direction,
-            "m1_direction": m1_direction,
-
-            "structure_confirmed": all(
-                structure_checks.values()
-            ),
-
-            "body_close_confirmed": (
-                structure_checks["h1_body_close"]
-                and structure_checks["m5_body_close"]
-            ),
-
-            "clean_unmitigated_poi": all(
-                poi_checks.values()
-            ),
-
-            "liquidity_confirmed": all(
-                liquidity_checks.values()
-            ),
-
-            "displacement_confirmed": (
-                entry_checks["displacement"]
-            ),
-
-            "fvg_confirmed": entry_checks["fvg"],
-
-            "entry_model_confirmed": (
-                entry_checks["entry_model"]
-            ),
-
-            "spread_acceptable": (
-                risk_checks["spread_acceptable"]
-            ),
-
-            "risk_acceptable": (
-                risk_checks["risk_acceptable"]
-            ),
-
-            "fundamentals_checked": fundamental_checked,
-
-            "category_scores": category_scores,
-
-            "calculated_score": weighted_total,
-
-            "evidence_details": {
-                "structure": structure_checks,
-                "poi": poi_checks,
-                "liquidity": liquidity_checks,
-                "entry_model": entry_checks,
-                "timeframe_alignment": timeframe_checks,
-                "trade_quality_risk": risk_checks,
-            },
-
-            "strategy_timeframes": ["H1", "M5", "M1"],
-
             "execution_authorized": False,
         }
 
-        self.last_evidence = evidence
-
-        return evidence
-
-    def get_last_evidence(self) -> Optional[Dict[str, Any]]:
-        if self.last_evidence is None:
-            return None
-
-        return dict(self.last_evidence)
-
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "engine": "SMC_EVIDENCE_AGGREGATOR",
-            "initialized": True,
-            "has_evidence": self.last_evidence is not None,
-            "minimum_a_plus_score": 85,
-            "category_weights": dict(CATEGORY_WEIGHTS),
-        }
+    def analyze(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.aggregate(*args, **kwargs)
 
 
-# Shared instance
 smc_evidence_aggregator = SMCEvidenceAggregator()
