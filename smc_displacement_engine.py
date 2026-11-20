@@ -1,365 +1,349 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Displacement Engine
 
 Purpose:
 - Detect bullish and bearish displacement candles.
-- Measure candle body strength against recent candles.
-- Check directional candle closes.
-- Identify potential displacement sequences.
-- Provide evidence for the M5 confirmation and M1 entry engines.
+- Measure candle-body strength and range expansion.
+- Compare displacement against preceding ATR.
+- Identify consecutive directional displacement.
+- Return structured evidence for the master SMC engine.
 
-This module does not execute trades or change approved strategy rules.
+Strategy:
+- Displacement must be supported by a strong candle body.
+- Candle direction must agree with the detected displacement.
+- Wick-only movement is not displacement confirmation.
+- This module does not authorize trade execution.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class DisplacementResult:
-    detected: bool
-    direction: Optional[str]
-    candle_index: Optional[int]
-    open_price: Optional[float]
-    close_price: Optional[float]
-    body_size: float
-    average_body_size: float
-    body_strength: float
-    candle_range: float
-    body_ratio: float
-    close_position: float
-    reasons: List[str]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
 class SMCDisplacementEngine:
-    """
-    Detects displacement using candle body strength and closing position.
+    VERSION = "2.0"
 
-    Default thresholds are configurable technical parameters, not
-    additional entry rules.
-    """
+    DEFAULT_ATR_PERIOD = 14
+    DEFAULT_MIN_BODY_RATIO = 0.60
+    DEFAULT_MIN_RANGE_ATR = 1.20
+    DEFAULT_MIN_BODY_ATR = 0.70
 
     def __init__(
         self,
-        lookback: int = 5,
-        minimum_body_multiple: float = 1.5,
-        minimum_body_ratio: float = 0.60,
-        minimum_close_position: float = 0.75,
+        atr_period: int = DEFAULT_ATR_PERIOD,
+        min_body_ratio: float = DEFAULT_MIN_BODY_RATIO,
+        min_range_atr: float = DEFAULT_MIN_RANGE_ATR,
+        min_body_atr: float = DEFAULT_MIN_BODY_ATR,
     ):
-        if lookback < 2:
-            raise ValueError("lookback must be at least 2")
-
-        if minimum_body_multiple <= 0:
-            raise ValueError("minimum_body_multiple must be positive")
-
-        if not 0 < minimum_body_ratio <= 1:
-            raise ValueError("minimum_body_ratio must be between 0 and 1")
-
-        if not 0.5 <= minimum_close_position <= 1:
-            raise ValueError("minimum_close_position must be between 0.5 and 1")
-
-        self.lookback = lookback
-        self.minimum_body_multiple = minimum_body_multiple
-        self.minimum_body_ratio = minimum_body_ratio
-        self.minimum_close_position = minimum_close_position
+        self.atr_period = max(2, int(atr_period))
+        self.min_body_ratio = float(min_body_ratio)
+        self.min_range_atr = float(min_range_atr)
+        self.min_body_atr = float(min_body_atr)
 
     @staticmethod
-    def _number(value: Any, field: str) -> float:
+    def _number(value: Any) -> Optional[float]:
         try:
             result = float(value)
+            if result != result or abs(result) == float("inf"):
+                return None
+            return result
         except (TypeError, ValueError):
-            raise ValueError(f"Invalid candle field: {field}")
+            return None
 
-        if result != result or result in (float("inf"), float("-inf")):
-            raise ValueError(f"Non-finite candle field: {field}")
+    def _normalise_candles(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, float]]:
+        normalised = []
 
-        return result
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
 
-    def _validate_candle(self, candle: Dict[str, Any]) -> Dict[str, float]:
-        if not isinstance(candle, dict):
-            raise ValueError("Each candle must be a dictionary")
+            open_price = self._number(candle.get("open"))
+            high = self._number(candle.get("high"))
+            low = self._number(candle.get("low"))
+            close = self._number(candle.get("close"))
 
-        required = ("open", "high", "low", "close")
-        values = {
-            field: self._number(candle.get(field), field)
-            for field in required
-        }
+            if None in (open_price, high, low, close):
+                continue
 
-        if values["high"] < values["low"]:
-            raise ValueError("Candle high cannot be below candle low")
+            if high < low:
+                continue
 
-        if not (
-            values["low"] <= values["open"] <= values["high"]
-            and values["low"] <= values["close"] <= values["high"]
-        ):
-            raise ValueError("Candle prices must be inside its high-low range")
+            if high < max(open_price, close):
+                continue
 
-        return values
+            if low > min(open_price, close):
+                continue
+
+            normalised.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+            })
+
+        return normalised
 
     @staticmethod
-    def _body(candle: Dict[str, float]) -> float:
-        return abs(candle["close"] - candle["open"])
-
-    def _direction(self, candle: Dict[str, float]) -> Optional[str]:
-        if candle["close"] > candle["open"]:
-            return "BULLISH"
-
-        if candle["close"] < candle["open"]:
-            return "BEARISH"
-
-        return None
-
-    def _close_position(
-        self,
-        candle: Dict[str, float],
+    def _true_range(
+        current: Dict[str, float],
+        previous_close: Optional[float],
     ) -> float:
-        candle_range = candle["high"] - candle["low"]
+        high = current["high"]
+        low = current["low"]
 
-        if candle_range == 0:
-            return 0.5
+        if previous_close is None:
+            return high - low
 
-        return (
-            (candle["close"] - candle["low"])
-            / candle_range
+        return max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
         )
 
-    def detect_displacement(
+    def _calculate_atr(
         self,
-        candles: List[Dict[str, Any]],
-        index: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        candles: List[Dict[str, float]],
+        end_index: int,
+    ) -> Optional[float]:
+        """
+        Calculate ATR using candles BEFORE the candidate candle.
 
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
+        Excluding the candidate prevents its own expansion from
+        inflating the baseline used to validate displacement.
+        """
+        start_index = max(0, end_index - self.atr_period)
 
-        if len(candles) < self.lookback + 1:
-            return DisplacementResult(
-                detected=False,
-                direction=None,
-                candle_index=None,
-                open_price=None,
-                close_price=None,
-                body_size=0.0,
-                average_body_size=0.0,
-                body_strength=0.0,
-                candle_range=0.0,
-                body_ratio=0.0,
-                close_position=0.0,
-                reasons=["INSUFFICIENT_CANDLE_HISTORY"],
-            ).to_dict()
+        if end_index - start_index < self.atr_period:
+            return None
 
-        if index is None:
-            index = len(candles) - 1
+        true_ranges = []
 
-        if index < self.lookback or index >= len(candles):
-            raise IndexError("Invalid displacement candle index")
+        for index in range(start_index, end_index):
+            previous_close = (
+                candles[index - 1]["close"]
+                if index > 0
+                else None
+            )
 
-        validated = [
-            self._validate_candle(candle)
-            for candle in candles
-        ]
-
-        target = validated[index]
-        direction = self._direction(target)
-
-        body_size = self._body(target)
-        candle_range = target["high"] - target["low"]
-
-        previous = validated[index - self.lookback:index]
-
-        previous_bodies = [
-            self._body(candle)
-            for candle in previous
-        ]
-
-        average_body = (
-            sum(previous_bodies) / len(previous_bodies)
-            if previous_bodies else 0.0
-        )
-
-        body_strength = (
-            body_size / average_body
-            if average_body > 0 else 0.0
-        )
-
-        body_ratio = (
-            body_size / candle_range
-            if candle_range > 0 else 0.0
-        )
-
-        close_position = self._close_position(target)
-
-        reasons = []
-
-        if direction is None:
-            reasons.append("NO_DIRECTIONAL_CANDLE")
-
-        if body_strength < self.minimum_body_multiple:
-            reasons.append("BODY_STRENGTH_TOO_WEAK")
-
-        if body_ratio < self.minimum_body_ratio:
-            reasons.append("BODY_RATIO_TOO_LOW")
-
-        if direction == "BULLISH":
-            if close_position < self.minimum_close_position:
-                reasons.append("BULLISH_CLOSE_NOT_STRONG")
-
-        elif direction == "BEARISH":
-            if close_position > (1.0 - self.minimum_close_position):
-                reasons.append("BEARISH_CLOSE_NOT_STRONG")
-
-        detected = (
-            direction is not None
-            and body_strength >= self.minimum_body_multiple
-            and body_ratio >= self.minimum_body_ratio
-            and (
-                (
-                    direction == "BULLISH"
-                    and close_position >= self.minimum_close_position
-                )
-                or (
-                    direction == "BEARISH"
-                    and close_position <= (
-                        1.0 - self.minimum_close_position
-                    )
+            true_ranges.append(
+                self._true_range(
+                    candles[index],
+                    previous_close,
                 )
             )
-        )
 
-        if detected:
-            reasons.append("DISPLACEMENT_CONFIRMED")
+        if not true_ranges:
+            return None
 
-        return DisplacementResult(
-            detected=detected,
-            direction=direction,
-            candle_index=index,
-            open_price=target["open"],
-            close_price=target["close"],
-            body_size=body_size,
-            average_body_size=average_body,
-            body_strength=body_strength,
-            candle_range=candle_range,
-            body_ratio=body_ratio,
-            close_position=close_position,
-            reasons=reasons,
-        ).to_dict()
+        return sum(true_ranges) / len(true_ranges)
 
-    def detect_sequence(
+    def _evaluate_candle(
         self,
-        candles: List[Dict[str, Any]],
-        start_index: Optional[int] = None,
-        end_index: Optional[int] = None,
+        candles: List[Dict[str, float]],
+        index: int,
     ) -> Dict[str, Any]:
+        candle = candles[index]
 
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
+        open_price = candle["open"]
+        high = candle["high"]
+        low = candle["low"]
+        close = candle["close"]
 
-        if not candles:
+        candle_range = high - low
+        body = abs(close - open_price)
+
+        if candle_range <= 0:
             return {
                 "detected": False,
-                "direction": None,
-                "results": [],
-                "reason": "NO_CANDLES",
+                "reason": "ZERO_CANDLE_RANGE",
+                "index": index,
             }
 
-        if start_index is None:
-            start_index = self.lookback
+        body_ratio = body / candle_range
 
-        if end_index is None:
-            end_index = len(candles) - 1
+        if close > open_price:
+            direction = "BULLISH"
+        elif close < open_price:
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
 
-        if start_index < self.lookback:
-            raise ValueError("start_index does not contain enough history")
+        atr = self._calculate_atr(candles, index)
 
-        if end_index >= len(candles) or start_index > end_index:
-            raise ValueError("Invalid sequence index range")
+        if atr is None or atr <= 0:
+            return {
+                "detected": False,
+                "reason": "INSUFFICIENT_ATR_HISTORY",
+                "index": index,
+                "direction": direction,
+                "body_ratio": round(body_ratio, 4),
+                "range": candle_range,
+                "body": body,
+            }
 
-        results = []
+        range_atr = candle_range / atr
+        body_atr = body / atr
 
-        for candle_index in range(start_index, end_index + 1):
-            result = self.detect_displacement(
-                candles,
-                candle_index,
-            )
-
-            if result["detected"]:
-                results.append(result)
-
-        directions = {
-            result["direction"]
-            for result in results
+        checks = {
+            "directional_candle": direction != "NEUTRAL",
+            "strong_body": body_ratio >= self.min_body_ratio,
+            "range_expansion": range_atr >= self.min_range_atr,
+            "body_expansion": body_atr >= self.min_body_atr,
         }
 
-        direction = (
-            next(iter(directions))
-            if len(directions) == 1
+        detected = all(checks.values())
+
+        return {
+            "detected": detected,
+            "confirmed": detected,
+            "direction": direction,
+            "index": index,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "range": round(candle_range, 8),
+            "body": round(body, 8),
+            "body_ratio": round(body_ratio, 4),
+            "atr": round(atr, 8),
+            "range_atr": round(range_atr, 4),
+            "body_atr": round(body_atr, 4),
+            "checks": checks,
+            "confirmation": (
+                "BODY_DISPLACEMENT"
+                if detected
+                else "DISPLACEMENT_NOT_CONFIRMED"
+            ),
+        }
+
+    def analyse(
+        self,
+        candles: List[Dict[str, Any]],
+        lookback: int = 10,
+    ) -> Dict[str, Any]:
+        if not isinstance(candles, list):
+            return self._error("INVALID_CANDLE_INPUT")
+
+        normalised = self._normalise_candles(candles)
+
+        minimum_required = self.atr_period + 1
+
+        if len(normalised) < minimum_required:
+            return self._error(
+                "INSUFFICIENT_CANDLES",
+                candle_count=len(normalised),
+                minimum_required=minimum_required,
+            )
+
+        lookback = max(1, int(lookback))
+        start_index = max(0, len(normalised) - lookback)
+
+        events = []
+
+        for index in range(start_index, len(normalised)):
+            result = self._evaluate_candle(normalised, index)
+
+            if result.get("detected"):
+                events.append(result)
+
+        bullish = [
+            event for event in events
+            if event["direction"] == "BULLISH"
+        ]
+
+        bearish = [
+            event for event in events
+            if event["direction"] == "BEARISH"
+        ]
+
+        latest = (
+            events[-1]
+            if events
             else None
         )
 
         return {
-            "detected": bool(results),
-            "direction": direction,
-            "mixed_directions": len(directions) > 1,
-            "displacement_count": len(results),
-            "results": results,
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "candle_count": len(normalised),
+            "lookback": lookback,
+            "detected": bool(events),
+            "confirmed": bool(latest),
+            "direction": (
+                latest["direction"]
+                if latest
+                else "NEUTRAL"
+            ),
+            "latest_displacement": latest,
+            "displacements": events,
+            "bullish_displacements": bullish,
+            "bearish_displacements": bearish,
+            "count": len(events),
+            "confirmation": (
+                "BODY_DISPLACEMENT"
+                if latest
+                else "NO_CONFIRMED_DISPLACEMENT"
+            ),
         }
 
-    def validate_direction(
+    def analyze(
         self,
         candles: List[Dict[str, Any]],
-        expected_direction: str,
-        index: Optional[int] = None,
+        lookback: int = 10,
     ) -> Dict[str, Any]:
+        return self.analyse(candles, lookback)
 
-        expected_direction = expected_direction.upper()
+    def validate_displacement(
+        self,
+        candles: List[Dict[str, Any]],
+        direction: str,
+        lookback: int = 10,
+    ) -> Dict[str, Any]:
+        result = self.analyse(candles, lookback)
 
-        if expected_direction not in ("BULLISH", "BEARISH"):
-            raise ValueError(
-                "expected_direction must be BULLISH or BEARISH"
-            )
+        expected = str(direction).upper()
 
-        result = self.detect_displacement(candles, index)
+        if expected not in ("BULLISH", "BEARISH"):
+            return {
+                "valid": False,
+                "reason": "INVALID_DIRECTION",
+                "expected_direction": expected,
+            }
 
-        direction_matches = (
-            result["direction"] == expected_direction
-        )
+        matching = [
+            event for event in result.get("displacements", [])
+            if event["direction"] == expected
+        ]
 
         return {
-            "valid": result["detected"] and direction_matches,
-            "expected_direction": expected_direction,
-            "detected_direction": result["direction"],
-            "direction_matches": direction_matches,
-            "displacement": result,
+            "valid": bool(matching),
+            "detected": bool(matching),
+            "direction": expected,
+            "matching_displacements": matching,
+            "latest": matching[-1] if matching else None,
+            "reason": (
+                "DIRECTIONAL_DISPLACEMENT_CONFIRMED"
+                if matching
+                else "NO_MATCHING_DISPLACEMENT"
+            ),
+        }
+
+    @staticmethod
+    def _error(
+        reason: str,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        return {
+            "status": "ERROR",
+            "detected": False,
+            "confirmed": False,
+            "direction": "NEUTRAL",
+            "displacements": [],
+            "confirmation": reason,
+            **extra,
         }
 
 
-# Shared engine instance
 smc_displacement_engine = SMCDisplacementEngine()
-
-
-def detect_displacement(
-    candles: List[Dict[str, Any]],
-    index: Optional[int] = None,
-) -> Dict[str, Any]:
-    return smc_displacement_engine.detect_displacement(
-        candles,
-        index,
-    )
-
-
-def detect_displacement_sequence(
-    candles: List[Dict[str, Any]],
-    start_index: Optional[int] = None,
-    end_index: Optional[int] = None,
-) -> Dict[str, Any]:
-    return smc_displacement_engine.detect_sequence(
-        candles,
-        start_index,
-        end_index,
-    )
