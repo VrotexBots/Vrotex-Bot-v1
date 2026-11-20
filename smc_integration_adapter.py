@@ -2,668 +2,785 @@
 """
 VROTEX BOT V1
 SMC Integration Adapter
-Version 2.0
 
-Connects the individual SMC engines to the master SMC engine.
+Purpose:
+- Normalize evidence from individual SMC modules.
+- Reconcile different module output formats.
+- Enforce H1 -> M5 -> M1 strategy requirements.
+- Reject unverified external CHoCH evidence.
+- Preserve original evidence for auditing.
+- Keep risk validation separate from execution.
 
 Approved strategy:
-H1 = external directional narrative
-M5 = confirmation
-M1 = entry trigger
+H1 = External narrative
+M5 = External CHoCH confirmation
+M1 = Approved entry model
 
-BOS and CHoCH require full candle-body close confirmation.
-Wick-only movement is never a confirmed structure break.
-
-Execution authorization is always disabled here.
+This module does not calculate A+ scores.
+This module does not execute trades.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+import math
 
 
 class SMCIntegrationAdapter:
 
-    VERSION = "2.0"
+    VERSION = "3.0"
 
-    BUY = "BUY"
-    SELL = "SELL"
+    VALID_DIRECTIONS = ("BULLISH", "BEARISH")
+
+    REQUIRED_RISK_CHECKS = (
+        "spread_valid",
+        "stop_loss_valid",
+        "risk_within_limit",
+        "daily_limit_valid",
+        "consecutive_loss_limit_valid",
+        "reward_risk_valid",
+    )
 
     def __init__(self):
         self.last_result: Dict[str, Any] = {}
 
-    # ---------------------------------------------------------
-    # GENERAL HELPERS
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # BASIC NORMALIZATION
+    # --------------------------------------------------
 
     @staticmethod
-    def _dict(value: Any) -> Dict[str, Any]:
+    def _as_dict(value: Any) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
 
     @staticmethod
-    def _list(value: Any) -> list:
-        return value if isinstance(value, list) else []
+    def _as_list(value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return [value]
+        return []
 
     @staticmethod
-    def _bool(value: Any) -> bool:
-        return value is True
+    def _number(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
 
-    @staticmethod
-    def _first(data: Dict[str, Any], *keys, default=None):
-        for key in keys:
-            if key in data and data[key] is not None:
-                return data[key]
-        return default
+            if not math.isfinite(result):
+                return None
+
+            return result
+
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def direction(value: Any) -> Optional[str]:
-        if value is None:
-            return None
 
-        value = str(value).strip().upper()
+        value = str(value or "").strip().upper()
 
-        if value in {
-            "BUY", "LONG", "BULL", "BULLISH",
-            "BUY_SIDE_SETUP"
-        }:
-            return "BUY"
+        if value in (
+            "BUY",
+            "LONG",
+            "BULL",
+            "BULLISH",
+        ):
+            return "BULLISH"
 
-        if value in {
-            "SELL", "SHORT", "BEAR", "BEARISH",
-            "SELL_SIDE_SETUP"
-        }:
-            return "SELL"
+        if value in (
+            "SELL",
+            "SHORT",
+            "BEAR",
+            "BEARISH",
+        ):
+            return "BEARISH"
 
         return None
 
     @staticmethod
-    def _valid_zone(data: Dict[str, Any]) -> bool:
-        lower = SMCIntegrationAdapter._first(
-            data, "lower", "bottom", "low"
-        )
-        upper = SMCIntegrationAdapter._first(
-            data, "upper", "top", "high"
+    def _body_close(event: Dict[str, Any]) -> bool:
+
+        confirmation = str(
+            event.get("confirmation", "")
+        ).upper()
+
+        return (
+            event.get("body_close_confirmed") is True
+            or event.get("full_body_close") is True
+            or confirmation == "BODY_CLOSE"
         )
 
-        try:
-            return (
-                lower is not None
-                and upper is not None
-                and float(lower) < float(upper)
+    @staticmethod
+    def _external_event(event: Dict[str, Any]) -> bool:
+
+        scope = str(
+            event.get(
+                "structure_scope",
+                event.get("scope", ""),
             )
-        except (TypeError, ValueError):
-            return False
+        ).upper()
 
-    # ---------------------------------------------------------
+        return (
+            event.get("external") is True
+            or event.get("is_external") is True
+            or scope in (
+                "EXTERNAL",
+                "EXTERNAL_STRUCTURE",
+                "EXTERNAL_MARKET_STRUCTURE",
+            )
+        )
+
+    # --------------------------------------------------
     # STRUCTURE NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def normalize_structure(
         self,
         raw: Any,
         timeframe: str,
-        expected_direction: Optional[str] = None
+        expected_direction: Optional[str] = None,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        structure = self._dict(data.get("structure"))
+        source = self._as_dict(raw)
 
-        expected_direction = self.direction(expected_direction)
+        timeframe = str(timeframe).upper()
 
-        raw_direction = self._first(
-            data,
-            "direction",
-            "bias",
-            default=self._first(
-                structure,
-                "direction",
-                "bias"
-            )
+        expected = self.direction(expected_direction)
+
+        structure = self._as_dict(
+            source.get("structure")
         )
 
-        if raw_direction is None:
-            raw_direction = structure.get("bias")
+        actual_direction = self.direction(
+            source.get("direction")
+            or source.get("bias")
+            or structure.get("bias")
+            or structure.get("direction")
+        )
 
-        actual_direction = self.direction(raw_direction)
+        breaks = self._as_list(
+            source.get("breaks")
+        )
 
-        # The original structure engine stores events in "breaks".
-        raw_breaks = self._list(data.get("breaks"))
+        normalized_breaks = []
 
-        # Also support direct event fields from other SMC modules.
-        direct_event = str(
-            self._first(
-                data,
-                "event",
-                "structure_event",
-                default=""
-            )
-        ).upper()
+        for item in breaks:
 
-        if direct_event in {"BOS", "CHOCH"}:
-            raw_breaks.append({
-                "type": direct_event,
-                "direction": data.get("direction"),
-                "confirmation": self._first(
-                    data,
-                    "confirmation",
-                    "body_close_confirmation"
-                )
-            })
-
-        confirmed_breaks = []
-
-        for event in raw_breaks:
-            event_data = self._dict(event)
+            event = self._as_dict(item)
 
             event_type = str(
-                event_data.get("type", "")
+                event.get("type", "")
             ).upper()
 
             event_direction = self.direction(
-                event_data.get("direction")
+                event.get("direction")
             )
 
-            confirmation = str(
-                event_data.get("confirmation", "")
-            ).upper()
+            if event_type not in ("BOS", "CHOCH"):
+                continue
 
-            body_close = (
-                confirmation in {
-                    "BODY_CLOSE",
-                    "FULL_BODY_CLOSE",
-                    "BODY_CLOSE_CONFIRMED"
-                }
-                or event_data.get(
-                    "body_close_confirmed"
-                ) is True
+            normalized_breaks.append({
+                **event,
+                "type": event_type,
+                "direction": event_direction,
+                "body_close_confirmed": self._body_close(
+                    event
+                ),
+                "external": self._external_event(
+                    event
+                ),
+            })
+
+        aligned = (
+            actual_direction is not None
+            and (
+                expected is None
+                or actual_direction == expected
             )
+        )
 
-            valid_event = (
-                event_type in {"BOS", "CHOCH"}
-                and event_direction is not None
-                and body_close
-            )
-
-            if valid_event:
-                confirmed_breaks.append({
-                    "type": event_type,
-                    "direction": event_direction,
-                    "body_close_confirmed": True,
-                    "level": event_data.get("level"),
-                    "candle_index": event_data.get(
-                        "candle_index"
-                    )
-                })
-
-        matching_breaks = [
-            event for event in confirmed_breaks
-            if (
-                expected_direction is None
-                or event["direction"] == expected_direction
-            )
-        ]
-
-        # H1 directional narrative may be established by HH/HL
-        # or LH/LL structure without a new break on the last candle.
         if timeframe == "H1":
-            bullish_structure = (
-                actual_direction == "BUY"
-                or (
-                    actual_direction is None
-                    and structure.get("bias") == "BULLISH"
-                )
-            )
 
-            bearish_structure = (
-                actual_direction == "SELL"
-                or (
-                    actual_direction is None
-                    and structure.get("bias") == "BEARISH"
-                )
-            )
-
-            if expected_direction == "BUY":
-                confirmed = bullish_structure
-
-            elif expected_direction == "SELL":
-                confirmed = bearish_structure
-
-            else:
-                confirmed = (
-                    bullish_structure or bearish_structure
-                )
-
-        # M5 needs a confirmed directional structure event.
-        elif timeframe == "M5":
-            confirmed = bool(matching_breaks)
-
-        # M1 is an entry timeframe. Its structure event is useful
-        # evidence but is not required here when a separately
-        # validated M1 entry model supplies the trigger.
-        elif timeframe == "M1":
             confirmed = (
-                actual_direction == expected_direction
-                if actual_direction and expected_direction
-                else bool(matching_breaks)
+                aligned
+                and source.get("confirmed") is not False
+                and source.get("valid") is not False
             )
 
-        else:
-            confirmed = bool(matching_breaks)
+            return {
+                "timeframe": "H1",
+                "direction": actual_direction,
+                "confirmed": confirmed,
+                "valid": confirmed,
+                "structure": structure,
+                "breaks": normalized_breaks,
+                "reason": (
+                    "H1_DIRECTION_CONFIRMED"
+                    if confirmed
+                    else "H1_DIRECTION_MISSING_OR_CONFLICTING"
+                ),
+                "source_evidence": source,
+            }
+
+        if timeframe == "M5":
+
+            matching_choch = [
+                event
+                for event in normalized_breaks
+                if (
+                    event["type"] == "CHOCH"
+                    and event["direction"] == expected
+                    and event["body_close_confirmed"]
+                    and event["external"]
+                )
+            ]
+
+            confirmed = (
+                bool(matching_choch)
+                and aligned
+            )
+
+            return {
+                "timeframe": "M5",
+                "direction": actual_direction,
+                "confirmed": confirmed,
+                "valid": confirmed,
+                "breaks": normalized_breaks,
+                "external_choch": (
+                    matching_choch[-1]
+                    if matching_choch
+                    else None
+                ),
+                "reason": (
+                    "M5_EXTERNAL_CHOCH_CONFIRMED"
+                    if confirmed
+                    else "M5_EXTERNAL_CHOCH_NOT_VERIFIED"
+                ),
+                "source_evidence": source,
+            }
+
+        if timeframe == "M1":
+
+            # M1 direction is contextual.
+            # Entry confirmation is validated separately.
+            confirmed = (
+                actual_direction is None
+                or expected is None
+                or actual_direction == expected
+            )
+
+            return {
+                "timeframe": "M1",
+                "direction": actual_direction,
+                "confirmed": confirmed,
+                "valid": confirmed,
+                "breaks": normalized_breaks,
+                "context_only": True,
+                "reason": (
+                    "M1_CONTEXT_ACCEPTED"
+                    if confirmed
+                    else "M1_DIRECTION_CONFLICT"
+                ),
+                "source_evidence": source,
+            }
 
         return {
             "timeframe": timeframe,
             "direction": actual_direction,
-            "expected_direction": expected_direction,
-            "bias": structure.get("bias"),
-            "confirmed_breaks": confirmed_breaks,
-            "matching_breaks": matching_breaks,
-            "confirmed": bool(confirmed),
-            "valid": bool(confirmed),
-            "raw": data
+            "confirmed": False,
+            "valid": False,
+            "reason": "UNSUPPORTED_TIMEFRAME",
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # LIQUIDITY NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def normalize_liquidity(
         self,
         raw: Any,
-        trade_direction: Optional[str] = None
+        trade_direction: str,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        trade_direction = self.direction(trade_direction)
+        source = self._as_dict(raw)
 
-        raw_sweeps = self._list(
-            data.get("liquidity_sweeps")
+        expected = self.direction(trade_direction)
+
+        required_type = (
+            "SELL_SIDE_SWEEP"
+            if expected == "BULLISH"
+            else "BUY_SIDE_SWEEP"
         )
 
-        if not raw_sweeps and data:
-            raw_sweeps = [data]
-
-        expected_sweep = (
-            "SELL" if trade_direction == "BUY"
-            else "BUY" if trade_direction == "SELL"
-            else None
+        sweeps = source.get(
+            "liquidity_sweeps",
+            source.get("sweeps", []),
         )
 
-        valid_sweeps = []
+        matching = []
 
-        for item in raw_sweeps:
-            sweep = self._dict(item)
+        for item in self._as_list(sweeps):
+
+            sweep = self._as_dict(item)
 
             sweep_type = str(
                 sweep.get("type", "")
             ).upper()
 
-            if sweep_type == "SELL_SIDE_SWEEP":
-                sweep_direction = "SELL"
-
-            elif sweep_type == "BUY_SIDE_SWEEP":
-                sweep_direction = "BUY"
-
-            else:
-                sweep_direction = self.direction(
-                    self._first(
-                        sweep,
-                        "sweep_direction",
-                        "direction"
-                    )
-                )
-
             confirmation = str(
                 sweep.get("confirmation", "")
             ).upper()
 
-            close_back_inside = (
-                confirmation in {
-                    "WICK_THROUGH_CLOSE_BACK_INSIDE",
-                    "CLOSE_BACK_INSIDE"
-                }
-                or sweep.get("close_back_inside") is True
+            # Technical-analysis sweep labels.
+            if sweep_type == "LOW_SWEEP":
+                sweep_type = "SELL_SIDE_SWEEP"
+
+            elif sweep_type == "HIGH_SWEEP":
+                sweep_type = "BUY_SIDE_SWEEP"
+
+            valid = (
+                sweep_type == required_type
+                and confirmation
+                == "WICK_THROUGH_CLOSE_BACK_INSIDE"
+                and sweep.get("invalidated") is not True
             )
 
-            if (
-                sweep_direction == expected_sweep
-                and close_back_inside
-            ):
-                valid_sweeps.append({
+            if valid:
+                matching.append({
+                    **sweep,
                     "type": sweep_type,
-                    "sweep_direction": sweep_direction,
-                    "level": sweep.get("level"),
-                    "candle_index": sweep.get("candle_index"),
-                    "close_back_inside": True
+                    "direction": expected,
+                    "confirmed": True,
                 })
 
-        confirmed = bool(valid_sweeps)
-
         return {
-            "trade_direction": trade_direction,
-            "expected_sweep_direction": expected_sweep,
-            "detected": bool(raw_sweeps),
-            "confirmed": confirmed,
-            "valid": confirmed,
-            "sweeps": valid_sweeps,
-            "raw": data
+            "detected": bool(matching),
+            "confirmed": bool(matching),
+            "valid": bool(matching),
+            "direction": expected,
+            "required_sweep": required_type,
+            "matching_sweeps": matching,
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
-    # FAIR VALUE GAP NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # FVG NORMALIZATION
+    # --------------------------------------------------
 
     def normalize_fvg(
         self,
         raw: Any,
-        expected_direction: Optional[str] = None
+        expected_direction: str,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        expected_direction = self.direction(expected_direction)
+        source = self._as_dict(raw)
 
-        fvg_direction = self.direction(
-            self._first(data, "direction", "bias")
+        expected = self.direction(expected_direction)
+
+        candidates = source.get(
+            "fvgs",
+            source.get("clean_fvgs", []),
         )
 
-        detected = self._bool(
-            self._first(
-                data,
-                "detected",
-                "fvg_detected",
-                default=False
+        if not candidates and (
+            "lower" in source or "upper" in source
+        ):
+            candidates = [source]
+
+        matching = []
+
+        for item in self._as_list(candidates):
+
+            zone = self._as_dict(item)
+
+            zone_direction = self.direction(
+                zone.get("direction")
             )
-        )
 
-        valid = self._bool(
-            self._first(
-                data,
-                "valid",
-                "confirmed",
-                default=False
+            lower = self._number(
+                zone.get("lower", zone.get("low"))
             )
-        )
 
-        mitigated = self._bool(
-            data.get("mitigated", False)
-        )
-
-        clean = self._bool(
-            self._first(
-                data,
-                "clean",
-                "unmitigated",
-                default=not mitigated
+            upper = self._number(
+                zone.get("upper", zone.get("high"))
             )
-        )
 
-        zone_valid = self._valid_zone(data)
+            clean = zone.get("clean") is True
 
-        direction_aligned = (
-            fvg_direction == expected_direction
-            and expected_direction is not None
-        )
+            unmitigated = (
+                zone.get("unmitigated") is True
+                and zone.get("mitigated") is not True
+                and zone.get("fully_mitigated") is not True
+            )
 
-        confirmed = bool(
-            detected
-            and valid
-            and clean
-            and not mitigated
-            and zone_valid
-            and direction_aligned
+            valid_bounds = (
+                lower is not None
+                and upper is not None
+                and lower < upper
+            )
+
+            valid = (
+                zone_direction == expected
+                and clean
+                and unmitigated
+                and valid_bounds
+                and zone.get("invalidated") is not True
+            )
+
+            if valid:
+                matching.append({
+                    **zone,
+                    "direction": zone_direction,
+                    "lower": lower,
+                    "upper": upper,
+                    "clean": True,
+                    "unmitigated": True,
+                    "valid": True,
+                })
+
+        selected = (
+            matching[-1]
+            if matching
+            else None
         )
 
         return {
-            "direction": fvg_direction,
-            "expected_direction": expected_direction,
-            "detected": detected,
-            "valid": valid,
-            "clean": clean,
-            "mitigated": mitigated,
-            "zone_valid": zone_valid,
-            "direction_aligned": direction_aligned,
-            "lower": self._first(
-                data, "lower", "bottom", "low"
-            ),
-            "upper": self._first(
-                data, "upper", "top", "high"
-            ),
-            "confirmed": confirmed,
-            "valid_for_setup": confirmed,
-            "raw": data
+            "detected": bool(selected),
+            "confirmed": bool(selected),
+            "valid": bool(selected),
+            "direction": expected,
+            "zone": selected,
+            "matching_zones": matching,
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
-    # POINT OF INTEREST NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # POI NORMALIZATION
+    # --------------------------------------------------
 
     def normalize_poi(
         self,
         raw: Any,
-        expected_direction: Optional[str] = None
+        expected_direction: str,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        expected_direction = self.direction(expected_direction)
+        source = self._as_dict(raw)
 
-        poi_direction = self.direction(
-            self._first(data, "direction", "bias")
-        )
+        expected = self.direction(expected_direction)
 
-        detected = self._bool(
-            self._first(
-                data,
-                "detected",
-                "valid",
-                default=False
+        # Supports the OB engine's get_poi_evidence output.
+        if (
+            "order_blocks" not in source
+            and "zones" not in source
+            and (
+                "lower" in source
+                or "upper" in source
             )
-        )
+        ):
+            candidates = [source]
 
-        clean = self._bool(
-            self._first(
-                data,
-                "clean",
-                "valid_zone",
-                default=False
+        else:
+            candidates = source.get(
+                "clean_order_blocks",
+                source.get(
+                    "order_blocks",
+                    source.get("zones", []),
+                ),
             )
-        )
 
-        unmitigated = self._bool(
-            self._first(
-                data,
-                "unmitigated",
-                "not_mitigated",
-                default=False
+        matching = []
+
+        for item in self._as_list(candidates):
+
+            zone = self._as_dict(item)
+
+            zone_direction = self.direction(
+                zone.get("direction")
             )
-        )
 
-        zone_valid = self._valid_zone(data)
+            lower = self._number(
+                zone.get("lower", zone.get("low"))
+            )
 
-        direction_aligned = (
-            poi_direction == expected_direction
-            and expected_direction is not None
-        )
+            upper = self._number(
+                zone.get("upper", zone.get("high"))
+            )
 
-        confirmed = bool(
-            detected
-            and clean
-            and unmitigated
-            and zone_valid
-            and direction_aligned
+            clean = zone.get("clean") is True
+
+            unmitigated = (
+                zone.get("unmitigated") is True
+                and zone.get("mitigated") is not True
+                and zone.get("invalidated") is not True
+            )
+
+            valid_bounds = (
+                lower is not None
+                and upper is not None
+                and lower < upper
+            )
+
+            valid = (
+                zone_direction == expected
+                and clean
+                and unmitigated
+                and valid_bounds
+            )
+
+            if valid:
+                matching.append({
+                    **zone,
+                    "direction": zone_direction,
+                    "lower": lower,
+                    "upper": upper,
+                    "clean": True,
+                    "unmitigated": True,
+                    "valid": True,
+                })
+
+        selected = (
+            matching[-1]
+            if matching
+            else None
         )
 
         return {
-            "direction": poi_direction,
-            "expected_direction": expected_direction,
-            "detected": detected,
-            "clean": clean,
-            "unmitigated": unmitigated,
-            "zone_valid": zone_valid,
-            "direction_aligned": direction_aligned,
-            "lower": self._first(
-                data, "lower", "bottom", "low"
-            ),
-            "upper": self._first(
-                data, "upper", "top", "high"
-            ),
-            "confirmed": confirmed,
-            "valid_for_setup": confirmed,
-            "raw": data
+            "detected": bool(selected),
+            "confirmed": bool(selected),
+            "valid": bool(selected),
+            "direction": expected,
+            "zone": selected,
+            "matching_zones": matching,
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # DISPLACEMENT NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def normalize_displacement(
         self,
         raw: Any,
-        expected_direction: Optional[str] = None
+        expected_direction: str,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        expected_direction = self.direction(expected_direction)
+        source = self._as_dict(raw)
 
-        displacement_direction = self.direction(
-            self._first(data, "direction", "bias")
+        expected = self.direction(expected_direction)
+
+        latest = self._as_dict(
+            source.get("latest_displacement")
         )
 
-        detected = self._bool(
-            self._first(
-                data,
-                "detected",
-                "displacement_detected",
-                default=False
+        if not latest:
+            events = self._as_list(
+                source.get("displacements")
+            )
+
+            aligned_events = [
+                self._as_dict(item)
+                for item in events
+                if (
+                    self.direction(
+                        self._as_dict(item).get("direction")
+                    ) == expected
+                    and self._as_dict(item).get("confirmed") is True
+                )
+            ]
+
+            if aligned_events:
+                latest = aligned_events[-1]
+
+        direction = self.direction(
+            latest.get("direction")
+            or source.get("direction")
+        )
+
+        confirmed = (
+            latest.get("confirmed") is True
+            or (
+                not latest
+                and source.get("confirmed") is True
             )
         )
 
-        body_close = self._bool(
-            self._first(
-                data,
-                "body_close_confirmed",
-                "full_body_close",
-                default=False
-            )
+        # Freshness must be explicitly supplied by the caller
+        # or verified against the current candle index.
+        freshness_verified = (
+            latest.get("fresh") is True
+            or latest.get("is_fresh") is True
         )
 
-        aligned = (
-            displacement_direction == expected_direction
-            and expected_direction is not None
+        event_index = latest.get(
+            "candle_index",
+            latest.get("index"),
         )
 
-        confirmed = bool(
-            detected and body_close and aligned
+        latest_index = source.get(
+            "latest_candle_index"
+        )
+
+        if (
+            event_index is not None
+            and latest_index is not None
+        ):
+            try:
+                freshness_verified = (
+                    int(event_index) == int(latest_index)
+                )
+            except (TypeError, ValueError):
+                freshness_verified = False
+
+        valid = (
+            confirmed
+            and direction == expected
+            and freshness_verified
+            and latest.get("invalidated") is not True
         )
 
         return {
-            "direction": displacement_direction,
-            "expected_direction": expected_direction,
-            "detected": detected,
-            "body_close_confirmed": body_close,
-            "direction_aligned": aligned,
+            "detected": bool(latest),
             "confirmed": confirmed,
-            "raw": data
+            "valid": valid,
+            "direction": direction,
+            "fresh": freshness_verified,
+            "latest_displacement": latest or None,
+            "reason": (
+                "FRESH_DISPLACEMENT_CONFIRMED"
+                if valid
+                else "DISPLACEMENT_MISSING_STALE_OR_UNCONFIRMED"
+            ),
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # ENTRY MODEL NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def normalize_entry_models(
         self,
         raw: Any,
-        expected_direction: Optional[str] = None
+        expected_direction: str,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
-        expected_direction = self.direction(expected_direction)
+        source = self._as_dict(raw)
 
-        models = self._first(
-            data,
+        expected = self.direction(expected_direction)
+
+        models = source.get(
             "confirmed_models",
-            "models",
-            "entry_models",
-            default=[]
+            source.get(
+                "models",
+                source.get("entry_models", []),
+            ),
         )
 
-        models = self._list(models)
-        confirmed_models = []
+        matching = []
 
-        for model in models:
-            if isinstance(model, str):
-                # A string alone is not proof of confirmation.
-                continue
+        for item in self._as_list(models):
 
-            item = self._dict(model)
+            model = self._as_dict(item)
 
-            model_direction = self.direction(
-                self._first(item, "direction", "bias")
+            direction = self.direction(
+                model.get("direction")
             )
 
-            model_confirmed = self._bool(
-                item.get("confirmed", False)
+            confirmed = (
+                model.get("confirmed") is True
+                or model.get("valid") is True
+            )
+
+            freshness_verified = (
+                model.get("fresh") is True
+                or model.get("is_fresh") is True
+            )
+
+            event_index = model.get(
+                "candle_index",
+                model.get("index"),
+            )
+
+            latest_index = source.get(
+                "latest_candle_index"
             )
 
             if (
-                model_confirmed
-                and model_direction == expected_direction
+                event_index is not None
+                and latest_index is not None
             ):
-                confirmed_models.append({
-                    "name": self._first(
-                        item, "name", "model", "type"
-                    ),
-                    "direction": model_direction,
-                    "confirmed": True
+                try:
+                    freshness_verified = (
+                        int(event_index) == int(latest_index)
+                    )
+                except (TypeError, ValueError):
+                    freshness_verified = False
+
+            if (
+                confirmed
+                and direction == expected
+                and freshness_verified
+                and model.get("invalidated") is not True
+            ):
+                matching.append({
+                    **model,
+                    "direction": direction,
+                    "confirmed": True,
+                    "fresh": True,
                 })
 
-        confirmed = bool(confirmed_models)
-
         return {
-            "direction": expected_direction,
-            "confirmed": confirmed,
-            "confirmed_models": confirmed_models,
-            "count": len(confirmed_models),
-            "raw": data
+            "detected": bool(matching),
+            "confirmed": bool(matching),
+            "valid": bool(matching),
+            "direction": expected,
+            "confirmed_models": matching,
+            "confirmed_model_count": len(matching),
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
-    # RISK CHECK NORMALIZATION
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # RISK NORMALIZATION
+    # --------------------------------------------------
 
     def normalize_risk_checks(
         self,
-        raw: Any
+        raw: Any,
     ) -> Dict[str, Any]:
 
-        data = self._dict(raw)
+        source = self._as_dict(raw)
 
-        checks = {
-            "spread_valid": self._bool(
-                data.get("spread_valid")
-            ),
-            "stop_loss_valid": self._bool(
-                data.get("stop_loss_valid")
-            ),
-            "risk_within_limit": self._bool(
-                data.get("risk_within_limit")
-            ),
-            "daily_limit_valid": self._bool(
-                data.get("daily_limit_valid")
-            ),
-            "consecutive_loss_limit_valid": self._bool(
-                data.get("consecutive_loss_limit_valid")
-            ),
-            "reward_risk_valid": self._bool(
-                data.get("reward_risk_valid")
+        checks_source = self._as_dict(
+            source.get("checks")
+        )
+
+        checks = {}
+
+        for name in self.REQUIRED_RISK_CHECKS:
+            checks[name] = (
+                checks_source.get(name) is True
+                or (
+                    not checks_source
+                    and source.get(name) is True
+                )
             )
-        }
+
+        failed = [
+            name
+            for name, passed in checks.items()
+            if not passed
+        ]
 
         return {
+            "valid": not failed,
             "checks": checks,
-            "all_passed": all(checks.values()),
-            "raw": data
+            "failed_checks": failed,
+            "risk_reward": source.get("risk_reward"),
+            "stop_loss": source.get("stop_loss"),
+            "take_profit": source.get("take_profit"),
+            "source_evidence": source,
         }
 
-    # ---------------------------------------------------------
-    # MASTER EVIDENCE CONTRACT
-    # ---------------------------------------------------------
+    # --------------------------------------------------
+    # UNIFIED EVIDENCE PACKAGE
+    # --------------------------------------------------
 
     def build_evidence(
         self,
@@ -676,121 +793,135 @@ class SMCIntegrationAdapter:
         poi: Any,
         displacement: Any,
         entry_models: Any,
-        risk_checks: Any
+        risk_checks: Any,
     ) -> Dict[str, Any]:
 
         direction = self.direction(trade_direction)
 
         if direction is None:
-            result = {
+            return {
+                "status": "REJECTED",
                 "valid": False,
+                "reason": "INVALID_TRADE_DIRECTION",
                 "execution_authorized": False,
-                "reason": "INVALID_TRADE_DIRECTION"
             }
 
-            self.last_result = result
-            return result
-
         h1 = self.normalize_structure(
-            h1_structure, "H1", direction
+            h1_structure,
+            "H1",
+            direction,
         )
 
         m5 = self.normalize_structure(
-            m5_structure, "M5", direction
+            m5_structure,
+            "M5",
+            direction,
         )
 
         m1 = self.normalize_structure(
-            m1_structure, "M1", direction
+            m1_structure,
+            "M1",
+            direction,
         )
 
-        liquidity_result = self.normalize_liquidity(
-            liquidity, direction
+        normalized_liquidity = self.normalize_liquidity(
+            liquidity,
+            direction,
         )
 
-        fvg_result = self.normalize_fvg(
-            fvg, direction
+        normalized_fvg = self.normalize_fvg(
+            fvg,
+            direction,
         )
 
-        poi_result = self.normalize_poi(
-            poi, direction
+        normalized_poi = self.normalize_poi(
+            poi,
+            direction,
         )
 
-        displacement_result = self.normalize_displacement(
-            displacement, direction
+        normalized_displacement = (
+            self.normalize_displacement(
+                displacement,
+                direction,
+            )
         )
 
-        entry_result = self.normalize_entry_models(
-            entry_models, direction
+        normalized_entry = self.normalize_entry_models(
+            entry_models,
+            direction,
         )
 
-        risk_result = self.normalize_risk_checks(
+        normalized_risk = self.normalize_risk_checks(
             risk_checks
         )
 
-        structure_aligned = bool(
-            h1["confirmed"]
-            and h1["direction"] == direction
-            and m5["confirmed"]
-            and m5["matching_breaks"]
-            and m1["confirmed"]
-            and m1["direction"] in {None, direction}
-        )
-
-        required_checks = {
-            "h1_directional_narrative": h1["confirmed"],
-            "m5_confirmed_structure": m5["confirmed"],
-            "m1_entry_structure": m1["confirmed"],
-            "timeframe_alignment": structure_aligned,
-            "correct_liquidity_sweep": liquidity_result["confirmed"],
-            "clean_directional_fvg": fvg_result["confirmed"],
-            "clean_unmitigated_poi": poi_result["confirmed"],
-            "directional_displacement": displacement_result["confirmed"],
-            "confirmed_entry_model": entry_result["confirmed"],
-            "risk_checks": risk_result["all_passed"]
+        checks = {
+            "h1_external_narrative": h1["valid"],
+            "m5_external_choch": m5["valid"],
+            "m1_context": m1["valid"],
+            "directional_liquidity": (
+                normalized_liquidity["valid"]
+            ),
+            "clean_poi": normalized_poi["valid"],
+            "clean_fvg": normalized_fvg["valid"],
+            "fresh_displacement": (
+                normalized_displacement["valid"]
+            ),
+            "fresh_entry_model": normalized_entry["valid"],
+            "risk_checks": normalized_risk["valid"],
         }
 
-        valid = all(required_checks.values())
+        failed = [
+            name
+            for name, passed in checks.items()
+            if not passed
+        ]
+
+        valid = not failed
 
         result = {
+            "status": (
+                "EVIDENCE_CONFIRMED"
+                if valid
+                else "EVIDENCE_REJECTED"
+            ),
+            "version": self.VERSION,
             "valid": valid,
-            "trade_direction": direction,
+            "confirmed": valid,
+            "direction": direction,
+            "checks": checks,
+            "failed_checks": failed,
+            "passed_count": sum(checks.values()),
+            "total_checks": len(checks),
+            "H1": h1,
+            "M5": m5,
+            "M1": m1,
+            "liquidity": normalized_liquidity,
+            "fvg": normalized_fvg,
+            "poi": normalized_poi,
+            "displacement": normalized_displacement,
+            "entry": normalized_entry,
+            "risk": normalized_risk,
             "execution_authorized": False,
-            "required_checks": required_checks,
-            "structure": {
-                "H1": h1,
-                "M5": m5,
-                "M1": m1,
-                "aligned": structure_aligned
-            },
-            "liquidity": liquidity_result,
-            "fvg": fvg_result,
-            "poi": poi_result,
-            "displacement": displacement_result,
-            "entry_models": entry_result,
-            "risk": risk_result,
-            "failed_checks": [
-                name
-                for name, passed in required_checks.items()
-                if not passed
-            ]
         }
 
         self.last_result = result
+
         return result
 
-    # ---------------------------------------------------------
+    # --------------------------------------------------
     # STATUS
-    # ---------------------------------------------------------
+    # --------------------------------------------------
 
     def get_last_result(self) -> Dict[str, Any]:
         return dict(self.last_result)
 
     def get_status(self) -> Dict[str, Any]:
         return {
-            "component": "SMC_INTEGRATION_ADAPTER",
+            "module": "SMCIntegrationAdapter",
             "version": self.VERSION,
-            "status": "ACTIVE",
-            "execution_authorized": False
+            "status": "READY",
+            "execution_authorized": False,
         }
 
 
