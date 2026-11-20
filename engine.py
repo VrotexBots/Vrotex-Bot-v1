@@ -6,35 +6,33 @@ from logging_config import get_logger
 from state_manager import state_manager
 from health import health_monitor
 from scanner import scanner
-from decision_engine import decision_engine
+from market_data_engine import market_data_engine
+
 
 logger = get_logger("engine")
 
 
 class TradingEngine:
 
-    VERSION = "2.0"
-
     def __init__(self):
 
         self.running = False
         self.tasks = []
         self.heartbeat_interval = 30
-        self.last_decision = None
-        self.scanner_connected = False
-        self.runtime_errors = []
+        self.market_data_verified = False
+        self.market_data_result = None
+
+        self._stop_lock = asyncio.Lock()
 
     async def initialize(self):
 
-        logger.info("Initializing Vrotex Bot V1.")
+        logger.info("Initializing Vrotex Trading Engine.")
 
         state_manager.initialize(
             mode=settings.BOT_MODE,
-            instruments=settings.INSTRUMENTS
+            instruments=settings.INSTRUMENTS,
         )
 
-        # Real-money execution must never be enabled
-        # automatically by the engine.
         state_manager.set_execution_enabled(
             settings.ORDER_EXECUTION_ENABLED
         )
@@ -42,100 +40,45 @@ class TradingEngine:
         state_manager.set_status("INITIALIZING")
 
         logger.info(
-            "Decision engine loaded: %s",
-            decision_engine.VERSION
+            "Verifying strategy market data."
+        )
+
+        self.market_data_result = (
+            await market_data_engine.verify_required_market_data(
+                count=500
+            )
+        )
+
+        self.market_data_verified = (
+            self.market_data_result.get("ready", False)
+        )
+
+        if not self.market_data_verified:
+
+            state_manager.set_status(
+                "MARKET_DATA_UNAVAILABLE"
+            )
+
+            logger.critical(
+                "Startup blocked. Market data verification "
+                "failed: %s/%s pairs.",
+                self.market_data_result.get("verified", 0),
+                self.market_data_result.get("expected", 18),
+            )
+
+            return False
+
+        logger.info(
+            "Market data verified: %s/%s pairs.",
+            self.market_data_result["verified"],
+            self.market_data_result["expected"],
         )
 
         logger.info(
-            "Decision threshold: %.2f",
-            decision_engine.minimum_score
+            "Engine initialization complete."
         )
 
-        logger.info(
-            "Configured instruments: %s",
-            settings.INSTRUMENTS
-        )
-
-        # Register the decision callback if the scanner
-        # implements the callback interface.
-        callback_register = getattr(
-            scanner,
-            "set_decision_callback",
-            None
-        )
-
-        if callable(callback_register):
-
-            callback_register(self.process_setup)
-
-            self.scanner_connected = True
-
-            logger.info(
-                "Scanner decision callback connected."
-            )
-
-        else:
-
-            self.scanner_connected = False
-
-            logger.warning(
-                "Scanner does not yet expose "
-                "set_decision_callback(). "
-                "Decision integration is not complete."
-            )
-
-        state_manager.set_status("INITIALIZED")
-
-        logger.info("Engine initialization complete.")
-
-    def process_setup(self, setup):
-
-        """
-        Receives a completed setup from the scanner
-        and evaluates it through the decision engine.
-        """
-
-        if not isinstance(setup, dict):
-
-            logger.error(
-                "Scanner supplied invalid setup data."
-            )
-
-            return None
-
-        try:
-
-            result = decision_engine.evaluate(setup)
-
-            self.last_decision = result
-
-            if result.get("approved") is True:
-
-                logger.info(
-                    "DECISION APPROVED | %s | %s | %.2f",
-                    result.get("symbol"),
-                    result.get("direction"),
-                    result.get("score", 0)
-                )
-
-            else:
-
-                logger.info(
-                    "DECISION REJECTED | %s",
-                    result.get("reason")
-                )
-
-            # This engine does not place broker orders.
-            # Execution remains a separate controlled stage.
-            return result
-
-        except Exception:
-
-            logger.exception(
-                "Decision evaluation failed."
-            )
-
-            return None
+        return True
 
     async def heartbeat_loop(self):
 
@@ -149,13 +92,13 @@ class TradingEngine:
 
                 logger.debug(
                     "Health status: %s",
-                    health.get("status", "UNKNOWN")
+                    health.get("status", "UNKNOWN"),
                 )
 
             except Exception:
 
                 logger.exception(
-                    "Heartbeat monitoring failure."
+                    "Heartbeat monitoring error."
                 )
 
             await asyncio.sleep(
@@ -164,65 +107,50 @@ class TradingEngine:
 
     async def scanner_loop(self):
 
-        logger.info("Starting scanner loop.")
-
-        try:
-
-            await scanner.run()
-
-            if self.running:
-
-                raise RuntimeError(
-                    "Scanner stopped unexpectedly."
-                )
-
-        except asyncio.CancelledError:
-
-            raise
-
-        except Exception:
-
-            logger.exception("Scanner failure.")
-
-            self.runtime_errors.append(
-                "Scanner runtime failure"
+        if not self.market_data_verified:
+            raise RuntimeError(
+                "Scanner cannot start without verified market data."
             )
 
-            state_manager.add_error(
-                "Scanner runtime failure"
-            )
+        logger.info(
+            "Starting Vrotex market scanner."
+        )
 
-            raise
+        await scanner.run()
 
     async def start(self):
 
         if self.running:
-
             logger.warning(
                 "Trading engine already running."
             )
-
             return
 
-        await self.initialize()
+        initialized = await self.initialize()
+
+        if not initialized:
+
+            logger.error(
+                "Trading engine startup blocked."
+            )
+            return
 
         self.running = True
 
         state_manager.set_status("RUNNING")
 
         logger.info(
-            "Vrotex Bot V1 started in %s mode.",
-            settings.BOT_MODE
+            "Vrotex Trading Engine is running."
         )
 
         self.tasks = [
             asyncio.create_task(
                 self.heartbeat_loop(),
-                name="vrotex-heartbeat"
+                name="vrotex-heartbeat",
             ),
             asyncio.create_task(
                 self.scanner_loop(),
-                name="vrotex-scanner"
+                name="vrotex-scanner",
             ),
         ]
 
@@ -245,7 +173,7 @@ class TradingEngine:
             )
 
             state_manager.add_error(
-                "Trading engine runtime failure"
+                "Trading engine encountered a runtime failure."
             )
 
         finally:
@@ -254,63 +182,64 @@ class TradingEngine:
 
     async def stop(self):
 
-        if not self.running:
-            return
+        async with self._stop_lock:
 
-        logger.info("Stopping Vrotex Bot V1.")
+            if not self.running:
+                return
 
-        self.running = False
-
-        state_manager.request_shutdown()
-
-        try:
-
-            scanner.stop()
-
-        except Exception:
-
-            logger.exception(
-                "Scanner shutdown error."
+            logger.info(
+                "Stopping Vrotex Trading Engine."
             )
 
-        current_task = asyncio.current_task()
+            self.running = False
 
-        for task in self.tasks:
+            state_manager.request_shutdown()
 
-            if task is not current_task and not task.done():
+            try:
 
+                await scanner.stop()
+
+            except Exception:
+
+                logger.exception(
+                    "Scanner shutdown error."
+                )
+
+            current_task = asyncio.current_task()
+
+            tasks_to_stop = [
+                task
+                for task in self.tasks
+                if task is not current_task and not task.done()
+            ]
+
+            for task in tasks_to_stop:
                 task.cancel()
 
-        remaining_tasks = [
-            task for task in self.tasks
-            if task is not current_task
-        ]
+            if tasks_to_stop:
 
-        if remaining_tasks:
+                await asyncio.gather(
+                    *tasks_to_stop,
+                    return_exceptions=True,
+                )
 
-            await asyncio.gather(
-                *remaining_tasks,
-                return_exceptions=True
+            self.tasks.clear()
+
+            state_manager.set_status("STOPPED")
+
+            logger.info(
+                "Vrotex Trading Engine stopped."
             )
-
-        self.tasks.clear()
-
-        state_manager.set_status("STOPPED")
-
-        logger.info("Vrotex Bot V1 stopped.")
 
     def get_status(self):
 
         return {
-            "version": self.VERSION,
             "running": self.running,
-            "scanner_connected": self.scanner_connected,
-            "decision_engine": decision_engine.get_status(),
-            "last_decision": self.last_decision,
+            "market_data_verified": self.market_data_verified,
+            "market_data": self.market_data_result,
             "health": health_monitor.get_health(),
             "state": state_manager.get_state(),
             "scanner": scanner.get_status(),
-            "runtime_errors": list(self.runtime_errors),
         }
 
 
