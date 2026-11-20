@@ -1,98 +1,109 @@
 
 """
-Vrotex Bot V1 - SMC Fair Value Gap Engine
+VROTEX BOT V1
+SMC Fair Value Gap Engine
+Version 2.0
 
 Detects:
-- Bullish FVG
-- Bearish FVG
-- FVG size
-- Partial mitigation
-- Full mitigation
-- Unmitigated FVG zones
-- FVG midpoint
+- Bullish Fair Value Gaps
+- Bearish Fair Value Gaps
+- FVG boundaries and midpoint
+- Mitigation status
+- Full and partial mitigation
+- Directional FVG validation
 
-Candles must be chronological OHLC dictionaries.
+Three-candle FVG:
+Bullish: candle 3 low > candle 1 high
+Bearish: candle 3 high < candle 1 low
 
-Bullish FVG:
-First candle high < third candle low.
-
-Bearish FVG:
-First candle low > third candle high.
-
-This module identifies zones only.
-It does not authorize trades.
+This module does not execute trades.
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class SMCFVGEngine:
 
-    VERSION = "1.0"
+    VERSION = "2.0"
 
-    def __init__(self, minimum_gap_size=0.0):
-        self.minimum_gap_size = float(minimum_gap_size)
+    def __init__(
+        self,
+        minimum_gap: float = 0.0,
+        mitigation_tolerance: float = 0.0
+    ):
+        self.minimum_gap = max(0.0, float(minimum_gap))
+        self.mitigation_tolerance = max(
+            0.0, float(mitigation_tolerance)
+        )
 
-        if self.minimum_gap_size < 0:
-            raise ValueError(
-                "minimum_gap_size cannot be negative"
-            )
+        self.last_result: Dict[str, Any] = {}
 
-        self.total_analyses = 0
-        self.last_result = None
+    # ---------------------------------------------------------
+    # HELPERS
+    # ---------------------------------------------------------
 
     @staticmethod
-    def _validate_candles(candles):
+    def _number(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+            if result != result:
+                return None
+            return result
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_candles(
+        self,
+        candles: Any
+    ) -> List[Dict[str, float]]:
+
         if not isinstance(candles, list):
-            raise TypeError("Candles must be a list")
+            return []
 
         validated = []
 
-        for index, candle in enumerate(candles):
+        for candle in candles:
             if not isinstance(candle, dict):
-                raise ValueError(
-                    f"Candle {index} must be a dictionary"
-                )
+                continue
 
-            item = {}
+            open_price = self._number(candle.get("open"))
+            high = self._number(candle.get("high"))
+            low = self._number(candle.get("low"))
+            close = self._number(candle.get("close"))
 
-            for field in ("open", "high", "low", "close"):
-                try:
-                    item[field] = float(candle[field])
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        f"Candle {index} has invalid {field}"
-                    )
-
-            if item["high"] < max(
-                item["open"],
-                item["close"],
-                item["low"],
+            if None in (
+                open_price, high, low, close
             ):
-                raise ValueError(
-                    f"Candle {index} has invalid high"
-                )
+                continue
 
-            if item["low"] > min(
-                item["open"],
-                item["close"],
-                item["high"],
+            if high < low:
+                continue
+
+            if not (
+                low <= open_price <= high
+                and low <= close <= high
             ):
-                raise ValueError(
-                    f"Candle {index} has invalid low"
-                )
+                continue
 
-            validated.append(item)
+            validated.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close
+            })
 
         return validated
 
-    def detect_fvgs(self, candles):
-        candles = self._validate_candles(candles)
+    # ---------------------------------------------------------
+    # FVG DETECTION
+    # ---------------------------------------------------------
+
+    def _detect_fvgs(
+        self,
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
 
         fvgs = []
-
-        if len(candles) < 3:
-            return fvgs
 
         for index in range(2, len(candles)):
 
@@ -100,197 +111,358 @@ class SMCFVGEngine:
             middle = candles[index - 1]
             third = candles[index]
 
-            bullish_gap = (
-                third["low"] - first["high"]
-            )
+            # Bullish FVG:
+            # The third candle's low is above the first
+            # candle's high.
+            bullish_lower = first["high"]
+            bullish_upper = third["low"]
 
-            bearish_gap = (
-                first["low"] - third["high"]
-            )
+            bullish_gap = bullish_upper - bullish_lower
 
-            if bullish_gap > self.minimum_gap_size:
+            if bullish_gap > self.minimum_gap:
+
                 fvgs.append({
+                    "id": f"BULLISH_FVG_{index}",
                     "type": "BULLISH_FVG",
-                    "lower": first["high"],
-                    "upper": third["low"],
+                    "direction": "BUY",
+                    "lower": bullish_lower,
+                    "upper": bullish_upper,
                     "midpoint": (
-                        first["high"] + third["low"]
-                    ) / 2,
+                        bullish_lower + bullish_upper
+                    ) / 2.0,
                     "gap_size": bullish_gap,
                     "formation_index": index,
-                    "displacement_candle_index": index - 1,
-                    "mitigation": "UNMITIGATED",
-                    "filled_percentage": 0.0,
+                    "first_candle_index": index - 2,
+                    "middle_candle_index": index - 1,
+                    "third_candle_index": index,
+                    "formation_confirmed": True
                 })
 
-            elif bearish_gap > self.minimum_gap_size:
+            # Bearish FVG:
+            # The third candle's high is below the first
+            # candle's low.
+            bearish_lower = third["high"]
+            bearish_upper = first["low"]
+
+            bearish_gap = bearish_upper - bearish_lower
+
+            if bearish_gap > self.minimum_gap:
+
                 fvgs.append({
+                    "id": f"BEARISH_FVG_{index}",
                     "type": "BEARISH_FVG",
-                    "lower": third["high"],
-                    "upper": first["low"],
+                    "direction": "SELL",
+                    "lower": bearish_lower,
+                    "upper": bearish_upper,
                     "midpoint": (
-                        third["high"] + first["low"]
-                    ) / 2,
+                        bearish_lower + bearish_upper
+                    ) / 2.0,
                     "gap_size": bearish_gap,
                     "formation_index": index,
-                    "displacement_candle_index": index - 1,
-                    "mitigation": "UNMITIGATED",
-                    "filled_percentage": 0.0,
+                    "first_candle_index": index - 2,
+                    "middle_candle_index": index - 1,
+                    "third_candle_index": index,
+                    "formation_confirmed": True
                 })
 
         return fvgs
 
-    def update_mitigation(self, fvgs, candles):
-        candles = self._validate_candles(candles)
+    # ---------------------------------------------------------
+    # MITIGATION ANALYSIS
+    # ---------------------------------------------------------
 
-        updated = []
+    def _check_mitigation(
+        self,
+        fvg: Dict[str, Any],
+        candles: List[Dict[str, float]]
+    ) -> Dict[str, Any]:
 
-        for fvg in fvgs:
-            zone = dict(fvg)
+        formation_index = fvg["formation_index"]
 
-            formation_index = zone["formation_index"]
+        lower = fvg["lower"]
+        upper = fvg["upper"]
+        midpoint = fvg["midpoint"]
 
-            lower = float(zone["lower"])
-            upper = float(zone["upper"])
-            total_size = upper - lower
+        direction = fvg["direction"]
 
-            if total_size <= 0:
-                zone["mitigation"] = "INVALID_ZONE"
-                updated.append(zone)
-                continue
+        touched = False
+        midpoint_reached = False
+        fully_mitigated = False
 
-            touched_depth = 0.0
-            fully_filled = False
+        mitigation_index = None
+        deepest_price = None
 
-            for candle in candles[formation_index + 1:]:
+        for index in range(
+            formation_index + 1,
+            len(candles)
+        ):
 
-                if zone["type"] == "BULLISH_FVG":
+            candle = candles[index]
 
-                    if candle["low"] <= lower:
-                        fully_filled = True
-                        touched_depth = total_size
+            if direction == "BUY":
+
+                # Bullish FVG mitigation occurs when price
+                # retraces down into the gap.
+                if candle["low"] < upper:
+                    touched = True
+                    mitigation_index = index
+
+                    deepest_price = candle["low"]
+
+                    if candle["low"] <= midpoint:
+                        midpoint_reached = True
+
+                    if (
+                        candle["low"]
+                        <= lower + self.mitigation_tolerance
+                    ):
+                        fully_mitigated = True
                         break
 
-                    if candle["low"] < upper:
-                        touched_depth = max(
-                            touched_depth,
-                            upper - candle["low"],
-                        )
-
-                elif zone["type"] == "BEARISH_FVG":
-
-                    if candle["high"] >= upper:
-                        fully_filled = True
-                        touched_depth = total_size
-                        break
-
-                    if candle["high"] > lower:
-                        touched_depth = max(
-                            touched_depth,
-                            candle["high"] - lower,
-                        )
-
-            percentage = min(
-                100.0,
-                max(
-                    0.0,
-                    (touched_depth / total_size) * 100,
-                ),
-            )
-
-            if fully_filled:
-                status = "FULLY_MITIGATED"
-            elif percentage > 0:
-                status = "PARTIALLY_MITIGATED"
             else:
-                status = "UNMITIGATED"
 
-            zone["mitigation"] = status
-            zone["filled_percentage"] = round(
-                percentage,
-                2,
+                # Bearish FVG mitigation occurs when price
+                # retraces up into the gap.
+                if candle["high"] > lower:
+                    touched = True
+                    mitigation_index = index
+
+                    deepest_price = candle["high"]
+
+                    if candle["high"] >= midpoint:
+                        midpoint_reached = True
+
+                    if (
+                        candle["high"]
+                        >= upper - self.mitigation_tolerance
+                    ):
+                        fully_mitigated = True
+                        break
+
+        if fully_mitigated:
+            status = "FULLY_MITIGATED"
+
+        elif midpoint_reached:
+            status = "MIDPOINT_MITIGATED"
+
+        elif touched:
+            status = "PARTIALLY_MITIGATED"
+
+        else:
+            status = "UNMITIGATED"
+
+        return {
+            "mitigated": touched,
+            "partially_mitigated": (
+                touched and not fully_mitigated
+            ),
+            "midpoint_reached": midpoint_reached,
+            "fully_mitigated": fully_mitigated,
+            "status": status,
+            "mitigation_index": mitigation_index,
+            "deepest_price": deepest_price
+        }
+
+    # ---------------------------------------------------------
+    # APPLY MITIGATION STATUS
+    # ---------------------------------------------------------
+
+    def _enrich_fvgs(
+        self,
+        fvgs: List[Dict[str, Any]],
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
+
+        enriched = []
+
+        for original in fvgs:
+
+            fvg = dict(original)
+
+            mitigation = self._check_mitigation(
+                fvg, candles
             )
 
-            updated.append(zone)
+            fvg.update(mitigation)
 
-        return updated
+            fvg["clean"] = (
+                not fvg["mitigated"]
+                and not fvg["fully_mitigated"]
+            )
 
-    def get_active_fvgs(self, fvgs):
-        return [
-            dict(fvg)
-            for fvg in fvgs
-            if fvg.get("mitigation") != "FULLY_MITIGATED"
-        ]
+            fvg["unmitigated"] = (
+                not fvg["mitigated"]
+            )
 
-    def get_unmitigated_fvgs(self, fvgs):
-        return [
-            dict(fvg)
-            for fvg in fvgs
-            if fvg.get("mitigation") == "UNMITIGATED"
-        ]
+            enriched.append(fvg)
 
-    def find_price_inside_fvg(self, price, fvgs):
-        price = float(price)
+        return enriched
 
-        matches = []
+    # ---------------------------------------------------------
+    # MAIN ANALYSIS
+    # ---------------------------------------------------------
 
-        for fvg in fvgs:
-            if (
-                fvg["lower"] <= price <= fvg["upper"]
-                and fvg.get("mitigation") != "FULLY_MITIGATED"
-            ):
-                matches.append(dict(fvg))
+    def analyze(
+        self,
+        candles: Any,
+        current_price: Optional[float] = None
+    ) -> Dict[str, Any]:
 
-        return matches
+        validated = self._validate_candles(candles)
 
-    def analyze(self, candles):
-        candles = self._validate_candles(candles)
+        if len(validated) < 3:
+            result = {
+                "status": "INSUFFICIENT_DATA",
+                "version": self.VERSION,
+                "fvg_count": 0,
+                "fvgs": [],
+                "clean_fvgs": [],
+                "bullish_fvgs": [],
+                "bearish_fvgs": []
+            }
 
-        detected = self.detect_fvgs(candles)
+            self.last_result = result
+            return result
 
-        updated = self.update_mitigation(
+        if current_price is None:
+            current_price = validated[-1]["close"]
+
+        current_price = self._number(current_price)
+
+        if current_price is None or current_price <= 0:
+            result = {
+                "status": "INVALID_CURRENT_PRICE",
+                "version": self.VERSION,
+                "fvg_count": 0,
+                "fvgs": []
+            }
+
+            self.last_result = result
+            return result
+
+        detected = self._detect_fvgs(validated)
+
+        enriched = self._enrich_fvgs(
             detected,
-            candles,
+            validated
         )
 
-        self.total_analyses += 1
+        clean_fvgs = [
+            fvg for fvg in enriched
+            if fvg["clean"]
+        ]
+
+        bullish = [
+            fvg for fvg in enriched
+            if fvg["direction"] == "BUY"
+        ]
+
+        bearish = [
+            fvg for fvg in enriched
+            if fvg["direction"] == "SELL"
+        ]
+
+        clean_bullish = [
+            fvg for fvg in clean_fvgs
+            if fvg["direction"] == "BUY"
+        ]
+
+        clean_bearish = [
+            fvg for fvg in clean_fvgs
+            if fvg["direction"] == "SELL"
+        ]
 
         result = {
-            "status": (
-                "ANALYZED"
-                if len(candles) >= 3
-                else "INSUFFICIENT_DATA"
-            ),
+            "status": "ANALYZED",
             "version": self.VERSION,
-            "total_fvgs": len(updated),
-            "bullish_fvgs": [
-                fvg for fvg in updated
-                if fvg["type"] == "BULLISH_FVG"
-            ],
-            "bearish_fvgs": [
-                fvg for fvg in updated
-                if fvg["type"] == "BEARISH_FVG"
-            ],
-            "unmitigated_fvgs": (
-                self.get_unmitigated_fvgs(updated)
-            ),
-            "active_fvgs": (
-                self.get_active_fvgs(updated)
-            ),
-            "trade_authorized": False,
+            "candle_count": len(validated),
+            "current_price": current_price,
+
+            "fvg_count": len(enriched),
+            "clean_fvg_count": len(clean_fvgs),
+
+            "fvgs": enriched,
+            "clean_fvgs": clean_fvgs,
+
+            "bullish_fvgs": bullish,
+            "bearish_fvgs": bearish,
+
+            "clean_bullish_fvgs": clean_bullish,
+            "clean_bearish_fvgs": clean_bearish
         }
 
         self.last_result = result
-
         return result
 
-    def get_status(self):
+    # British spelling compatibility
+    def analyse(
+        self,
+        candles: Any,
+        current_price: Optional[float] = None
+    ) -> Dict[str, Any]:
+
+        return self.analyze(candles, current_price)
+
+    # ---------------------------------------------------------
+    # DIRECTIONAL FVG VALIDATION
+    # ---------------------------------------------------------
+
+    def validate_directional_fvg(
+        self,
+        analysis: Dict[str, Any],
+        trade_direction: str
+    ) -> Dict[str, Any]:
+
+        direction = str(
+            trade_direction
+        ).strip().upper()
+
+        if direction in {"BUY", "BULLISH", "LONG"}:
+            expected = "BUY"
+
+        elif direction in {"SELL", "BEARISH", "SHORT"}:
+            expected = "SELL"
+
+        else:
+            return {
+                "valid": False,
+                "reason": "INVALID_TRADE_DIRECTION",
+                "matching_fvgs": []
+            }
+
+        clean_fvgs = analysis.get(
+            "clean_fvgs", []
+        )
+
+        matching = [
+            fvg for fvg in clean_fvgs
+            if (
+                isinstance(fvg, dict)
+                and fvg.get("direction") == expected
+                and fvg.get("clean") is True
+                and fvg.get("unmitigated") is True
+            )
+        ]
+
+        return {
+            "valid": bool(matching),
+            "trade_direction": direction,
+            "matching_fvgs": matching,
+            "count": len(matching)
+        }
+
+    # ---------------------------------------------------------
+    # STATUS
+    # ---------------------------------------------------------
+
+    def get_last_result(self) -> Dict[str, Any]:
+        return dict(self.last_result)
+
+    def get_status(self) -> Dict[str, Any]:
         return {
             "component": "SMC_FVG_ENGINE",
-            "status": "ACTIVE",
             "version": self.VERSION,
-            "total_analyses": self.total_analyses,
-            "minimum_gap_size": self.minimum_gap_size,
+            "status": "ACTIVE"
         }
 
 
