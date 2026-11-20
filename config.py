@@ -1,7 +1,7 @@
-
 import os
 import math
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,7 +37,6 @@ class Settings:
         "BOT_MODE", "DEMO"
     ).strip().upper()
 
-    # Automatic execution enabled in DEMO and REAL.
     ORDER_EXECUTION_ENABLED: bool = True
 
     # ==================================================
@@ -46,7 +45,6 @@ class Settings:
 
     AUTO_TRADING_ENABLED: bool = True
 
-    # A+ setup threshold
     MIN_SETUP_SCORE: int = int(
         os.getenv("MIN_SETUP_SCORE", "85")
     )
@@ -103,6 +101,32 @@ class Settings:
         "M5",
         "M1",
     )
+
+    # ==================================================
+    # CANDLE HISTORY TARGETS
+    # ==================================================
+
+    CANDLE_TARGETS: dict = field(
+        default_factory=lambda: {
+            "D1": 500,
+            "H4": 500,
+            "H1": 1000,
+            "M30": 500,
+            "M15": 500,
+            "M5": 1000,
+            "M1": 1000,
+        }
+    )
+
+    MAX_CANDLES_PER_REQUEST: int = 1000
+
+    # ==================================================
+    # LIVE TICK SETTINGS
+    # ==================================================
+
+    LIVE_TICK_MAX_AGE_SECONDS: int = 10
+
+    LIVE_TICK_STARTUP_TIMEOUT_SECONDS: int = 45
 
     # ==================================================
     # RISK MANAGEMENT
@@ -165,7 +189,10 @@ def validate_settings():
             "Automatic trading must be enabled."
         )
 
-    # Exactly three approved instruments, without duplicates.
+    # ==================================================
+    # APPROVED INSTRUMENTS
+    # ==================================================
+
     approved_instruments = (
         "EURUSD",
         "GBPUSD",
@@ -179,7 +206,10 @@ def validate_settings():
             "Check the INSTRUMENTS environment variable."
         )
 
-    # Strategy timeframe validation.
+    # ==================================================
+    # STRATEGY TIMEFRAMES
+    # ==================================================
+
     if settings.ANALYSIS_TIMEFRAMES != (
         "H1",
         "M5",
@@ -189,7 +219,10 @@ def validate_settings():
             "Strategy timeframes must be H1, M5 and M1."
         )
 
-    # Market data timeframe validation.
+    # ==================================================
+    # MARKET DATA TIMEFRAMES
+    # ==================================================
+
     approved_data_timeframes = (
         "D1",
         "H4",
@@ -205,7 +238,48 @@ def validate_settings():
             "Market data timeframes do not match V1."
         )
 
-    # Exact approved risk settings.
+    # ==================================================
+    # CANDLE TARGET VALIDATION
+    # ==================================================
+
+    approved_candle_targets = {
+        "D1": 500,
+        "H4": 500,
+        "H1": 1000,
+        "M30": 500,
+        "M15": 500,
+        "M5": 1000,
+        "M1": 1000,
+    }
+
+    if settings.CANDLE_TARGETS != approved_candle_targets:
+        raise ValueError(
+            "Candle targets do not match approved V1 settings."
+        )
+
+    if settings.MAX_CANDLES_PER_REQUEST != 1000:
+        raise ValueError(
+            "Maximum candles per request must be 1000."
+        )
+
+    # ==================================================
+    # LIVE TICK VALIDATION
+    # ==================================================
+
+    if settings.LIVE_TICK_MAX_AGE_SECONDS < 1:
+        raise ValueError(
+            "Live tick maximum age must be at least 1 second."
+        )
+
+    if settings.LIVE_TICK_STARTUP_TIMEOUT_SECONDS < 1:
+        raise ValueError(
+            "Live tick startup timeout must be at least 1 second."
+        )
+
+    # ==================================================
+    # RISK MANAGEMENT VALIDATION
+    # ==================================================
+
     if not math.isclose(settings.RISK_PERCENT, 1.0):
         raise ValueError(
             "Risk per trade must be exactly 1%."
@@ -233,12 +307,19 @@ def validate_settings():
             "Maximum daily loss must be exactly 2%."
         )
 
+    # ==================================================
+    # SCANNER VALIDATION
+    # ==================================================
+
     if settings.SCAN_INTERVAL_SECONDS < 1:
         raise ValueError(
             "Scanner interval must be at least 1 second."
         )
 
-    # REAL mode credential validation.
+    # ==================================================
+    # REAL MODE CREDENTIAL VALIDATION
+    # ==================================================
+
     if settings.BOT_MODE == "REAL":
 
         credentials = (
@@ -253,16 +334,30 @@ def validate_settings():
                 "REAL mode requires all four Exness credentials."
             )
 
-    # Configuration report.
-    print("=" * 50)
+    # ==================================================
+    # CONFIGURATION REPORT
+    # ==================================================
+
+    print("=" * 55)
     print("VROTEX BOT V1 CONFIGURATION")
-    print("=" * 50)
+    print("=" * 55)
 
     print(f"Mode: {settings.BOT_MODE}")
-    print(f"Execution enabled: {settings.ORDER_EXECUTION_ENABLED}")
-    print(f"Automatic trading: {settings.AUTO_TRADING_ENABLED}")
 
-    print(f"Instruments: {', '.join(settings.INSTRUMENTS)}")
+    print(
+        f"Execution enabled: "
+        f"{settings.ORDER_EXECUTION_ENABLED}"
+    )
+
+    print(
+        f"Automatic trading: "
+        f"{settings.AUTO_TRADING_ENABLED}"
+    )
+
+    print(
+        f"Instruments: "
+        f"{', '.join(settings.INSTRUMENTS)}"
+    )
 
     print(
         f"Strategy: "
@@ -274,21 +369,68 @@ def validate_settings():
         f"{', '.join(settings.DATA_TIMEFRAMES)}"
     )
 
-    print(f"Minimum A+ score: {settings.MIN_SETUP_SCORE}")
-    print(f"Risk per trade: {settings.RISK_PERCENT}%")
-    print(f"Maximum daily trades: {settings.MAX_DAILY_TRADES}")
+    print("-" * 55)
+    print("CANDLE TARGETS")
+
+    for timeframe in settings.DATA_TIMEFRAMES:
+
+        print(
+            f"{timeframe}: "
+            f"{settings.CANDLE_TARGETS[timeframe]} candles"
+        )
+
+    print("-" * 55)
+
+    print(
+        f"Maximum candles per request: "
+        f"{settings.MAX_CANDLES_PER_REQUEST}"
+    )
+
+    print(
+        f"Live tick maximum age: "
+        f"{settings.LIVE_TICK_MAX_AGE_SECONDS}s"
+    )
+
+    print(
+        f"Live tick startup timeout: "
+        f"{settings.LIVE_TICK_STARTUP_TIMEOUT_SECONDS}s"
+    )
+
+    print("-" * 55)
+
+    print(
+        f"Minimum A+ score: "
+        f"{settings.MIN_SETUP_SCORE}"
+    )
+
+    print(
+        f"Risk per trade: "
+        f"{settings.RISK_PERCENT}%"
+    )
+
+    print(
+        f"Maximum daily trades: "
+        f"{settings.MAX_DAILY_TRADES}"
+    )
+
     print(
         f"Maximum consecutive losses: "
         f"{settings.MAX_CONSECUTIVE_LOSSES}"
     )
+
     print(
         f"Maximum daily loss: "
         f"{settings.MAX_DAILY_LOSS_PERCENT}%"
     )
 
-    print("=" * 50)
+    print(
+        f"Scanner interval: "
+        f"{settings.SCAN_INTERVAL_SECONDS}s"
+    )
+
+    print("=" * 55)
     print("CONFIGURATION VALIDATION SUCCESSFUL")
-    print("=" * 50)
+    print("=" * 55)
 
 
 if __name__ == "__main__":
