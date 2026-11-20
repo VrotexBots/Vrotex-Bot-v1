@@ -1,320 +1,327 @@
 
 """
 VROTEX BOT V1
-SMC PROTECTED RANGE ENGINE
+SMC Protected Range Engine
 
-Responsibilities:
+Purpose:
+- Identify confirmed swing highs and lows.
 - Track protected highs and lows.
-- Identify bullish and bearish protected levels.
-- Detect wick sweeps without treating them as breaks.
-- Confirm breaks using candle-body closes.
-- Track invalidated and active protected levels.
+- Detect body-close breaks of protected levels.
+- Maintain bullish and bearish protected-range context.
+- Provide structural invalidation evidence.
 
-This module does not execute trades.
+Approved rules:
+- Bullish structure protects the relevant higher low.
+- Bearish structure protects the relevant lower high.
+- Wick-only breaks are not structural breaks.
+- Full candle-body close beyond a protected level confirms a break.
+
+This module does not authorize order execution.
 """
 
 from typing import Any, Dict, List, Optional
 
 
 class SMCProtectedRangeEngine:
+    VERSION = "2.0"
 
-    def __init__(self, tolerance: float = 0.0):
-        self.tolerance = max(0.0, float(tolerance))
-        self.protected_high: Optional[Dict[str, Any]] = None
-        self.protected_low: Optional[Dict[str, Any]] = None
-        self.events: List[Dict[str, Any]] = []
+    def __init__(self, swing_strength: int = 2):
+        self.swing_strength = max(1, int(swing_strength))
+        self.last_result: Dict[str, Any] = {}
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
         try:
             number = float(value)
-            if number != number or number in (
-                float("inf"), float("-inf")
-            ):
+
+            if number != number:
                 return None
+
+            if number in (float("inf"), float("-inf")):
+                return None
+
             return number
         except (TypeError, ValueError):
             return None
 
-    def _candles(
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        value = str(value or "").upper()
+
+        if value in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
+
+        if value in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    @staticmethod
+    def _price(
+        candle: Dict[str, Any],
+        field: str,
+    ) -> Optional[float]:
+        value = candle.get(field)
+
+        if value is None:
+            value = candle.get(field.upper())
+
+        try:
+            number = float(value)
+
+            if number != number:
+                return None
+
+            if number in (float("inf"), float("-inf")):
+                return None
+
+            return number
+        except (TypeError, ValueError):
+            return None
+
+    def _normalise_candles(
         self,
-        candles: List[Dict[str, Any]]
-    ) -> List[Dict[str, float]]:
+        candles: Any,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(candles, list):
+            return []
 
         result = []
 
-        for candle in candles:
+        for index, candle in enumerate(candles):
             if not isinstance(candle, dict):
                 continue
 
-            values = {
-                key: self._number(candle.get(key))
-                for key in ("open", "high", "low", "close")
-            }
+            high = self._price(candle, "high")
+            low = self._price(candle, "low")
+            open_price = self._price(candle, "open")
+            close = self._price(candle, "close")
 
-            if any(value is None for value in values.values()):
+            if None in (high, low, open_price, close):
                 continue
 
-            if values["high"] < max(
-                values["open"], values["close"]
-            ):
+            if high < low:
                 continue
 
-            if values["low"] > min(
-                values["open"], values["close"]
-            ):
+            if high < max(open_price, close):
                 continue
 
-            if values["high"] < values["low"]:
+            if low > min(open_price, close):
                 continue
 
-            result.append(values)
+            result.append({
+                "index": index,
+                "high": high,
+                "low": low,
+                "open": open_price,
+                "close": close,
+            })
 
         return result
 
-    def identify_swings(
+    def _find_swings(
         self,
         candles: List[Dict[str, Any]],
-        left: int = 2,
-        right: int = 2
-    ) -> Dict[str, Any]:
-
-        data = self._candles(candles)
-        left = max(1, int(left))
-        right = max(1, int(right))
-
+    ) -> Dict[str, List[Dict[str, Any]]]:
         highs = []
         lows = []
+        strength = self.swing_strength
 
-        if len(data) < left + right + 1:
-            return {
-                "valid": False,
-                "status": "INSUFFICIENT_CANDLES",
-                "highs": [],
-                "lows": [],
-            }
+        for index in range(
+            strength,
+            len(candles) - strength,
+        ):
+            current = candles[index]
 
-        for index in range(left, len(data) - right):
-
-            candle = data[index]
-
-            surrounding = (
-                data[index-left:index] +
-                data[index+1:index+right+1]
-            )
+            left = candles[index - strength:index]
+            right = candles[index + 1:index + strength + 1]
 
             is_high = all(
-                candle["high"] > item["high"]
-                for item in surrounding
+                current["high"] > item["high"]
+                for item in left + right
             )
 
             is_low = all(
-                candle["low"] < item["low"]
-                for item in surrounding
+                current["low"] < item["low"]
+                for item in left + right
             )
 
             if is_high:
                 highs.append({
-                    "index": index,
-                    "price": candle["high"],
+                    "price": current["high"],
+                    "index": current["index"],
+                    "type": "SWING_HIGH",
                     "confirmed": True,
                 })
 
             if is_low:
                 lows.append({
-                    "index": index,
-                    "price": candle["low"],
+                    "price": current["low"],
+                    "index": current["index"],
+                    "type": "SWING_LOW",
                     "confirmed": True,
                 })
 
         return {
-            "valid": True,
-            "status": "SWINGS_IDENTIFIED",
             "highs": highs,
             "lows": lows,
         }
 
-    def set_protected_levels(
+    def _select_protected_levels(
         self,
+        swings: Dict[str, List[Dict[str, Any]]],
         direction: str,
-        swing_high: Dict[str, Any],
-        swing_low: Dict[str, Any],
     ) -> Dict[str, Any]:
+        highs = swings["highs"]
+        lows = swings["lows"]
 
-        direction = str(direction).upper()
+        if direction == "BULLISH":
+            protected_low = (
+                lows[-1] if lows else None
+            )
 
-        if direction not in ("BULLISH", "BEARISH"):
+            protected_high = (
+                highs[-1] if highs else None
+            )
+
+        else:
+            protected_high = (
+                highs[-1] if highs else None
+            )
+
+            protected_low = (
+                lows[-1] if lows else None
+            )
+
+        return {
+            "protected_high": protected_high,
+            "protected_low": protected_low,
+        }
+
+    def _check_break(
+        self,
+        candles: List[Dict[str, Any]],
+        protected: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        if not candles:
             return {
-                "valid": False,
-                "error": "INVALID_DIRECTION",
+                "broken": False,
+                "confirmation": None,
             }
 
-        high = self._number(swing_high.get("price"))
-        low = self._number(swing_low.get("price"))
+        latest = candles[-1]
+        protected_level = (
+            protected.get("protected_low")
+            if direction == "BULLISH"
+            else protected.get("protected_high")
+        )
 
-        if high is None or low is None or high <= low:
+        if not isinstance(protected_level, dict):
             return {
-                "valid": False,
-                "error": "INVALID_SWING_LEVELS",
+                "broken": False,
+                "confirmation": None,
+                "reason": "PROTECTED_LEVEL_UNAVAILABLE",
+            }
+
+        level = self._number(
+            protected_level.get("price")
+        )
+
+        if level is None:
+            return {
+                "broken": False,
+                "confirmation": None,
+                "reason": "INVALID_PROTECTED_LEVEL",
             }
 
         if direction == "BULLISH":
-            self.protected_low = {
-                "price": low,
-                "index": swing_low.get("index"),
-                "direction": direction,
-                "active": True,
-                "status": "PROTECTED",
-            }
-
+            wick_broken = latest["low"] < level
+            body_broken = latest["close"] < level
         else:
-            self.protected_high = {
-                "price": high,
-                "index": swing_high.get("index"),
-                "direction": direction,
-                "active": True,
-                "status": "PROTECTED",
-            }
+            wick_broken = latest["high"] > level
+            body_broken = latest["close"] > level
 
         return {
-            "valid": True,
-            "status": "PROTECTED_LEVELS_UPDATED",
-            "direction": direction,
-            "protected_high": self.protected_high,
-            "protected_low": self.protected_low,
+            "broken": body_broken,
+            "wick_probe": wick_broken and not body_broken,
+            "confirmation": (
+                "BODY_CLOSE"
+                if body_broken
+                else (
+                    "WICK_ONLY"
+                    if wick_broken
+                    else None
+                )
+            ),
+            "level": level,
+            "candle_index": latest["index"],
         }
 
-    def update(
-        self,
-        candles: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-
-        data = self._candles(candles)
-
-        if not data:
-            return {
-                "valid": False,
-                "status": "NO_VALID_CANDLES",
-            }
-
-        candle = data[-1]
-        events = []
-
-        if self.protected_low and self.protected_low["active"]:
-
-            level = self.protected_low["price"]
-
-            if candle["close"] < level - self.tolerance:
-                self.protected_low["active"] = False
-                self.protected_low["status"] = "INVALIDATED"
-
-                events.append({
-                    "type": "PROTECTED_LOW_BROKEN",
-                    "direction": "BEARISH",
-                    "level": level,
-                    "confirmed": True,
-                    "method": "BODY_CLOSE",
-                })
-
-            elif candle["low"] < level - self.tolerance:
-                events.append({
-                    "type": "PROTECTED_LOW_SWEPT",
-                    "direction": "BEARISH",
-                    "level": level,
-                    "confirmed": False,
-                    "method": "WICK_ONLY",
-                })
-
-        if self.protected_high and self.protected_high["active"]:
-
-            level = self.protected_high["price"]
-
-            if candle["close"] > level + self.tolerance:
-                self.protected_high["active"] = False
-                self.protected_high["status"] = "INVALIDATED"
-
-                events.append({
-                    "type": "PROTECTED_HIGH_BROKEN",
-                    "direction": "BULLISH",
-                    "level": level,
-                    "confirmed": True,
-                    "method": "BODY_CLOSE",
-                })
-
-            elif candle["high"] > level + self.tolerance:
-                events.append({
-                    "type": "PROTECTED_HIGH_SWEPT",
-                    "direction": "BULLISH",
-                    "level": level,
-                    "confirmed": False,
-                    "method": "WICK_ONLY",
-                })
-
-        self.events.extend(events)
-        self.events = self.events[-200:]
-
-        return {
-            "valid": True,
-            "status": "PROTECTED_LEVELS_UPDATED",
-            "events": events,
-            "protected_high": self.protected_high,
-            "protected_low": self.protected_low,
-        }
-
-    def analyse(
+    def analyze(
         self,
         candles: List[Dict[str, Any]],
         direction: str,
-        left: int = 2,
-        right: int = 2,
     ) -> Dict[str, Any]:
+        direction = self._direction(direction)
 
-        swings = self.identify_swings(
-            candles,
-            left=left,
-            right=right,
-        )
-
-        if not swings["valid"]:
-            return swings
-
-        if not swings["highs"] or not swings["lows"]:
+        if direction is None:
             return {
+                "status": "REJECTED",
                 "valid": False,
-                "status": "SWING_LEVELS_NOT_FOUND",
-                "swings": swings,
+                "reason": "INVALID_DIRECTION",
             }
 
-        swing_high = swings["highs"][-1]
-        swing_low = swings["lows"][-1]
+        normalized = self._normalise_candles(candles)
 
-        levels = self.set_protected_levels(
+        minimum = (self.swing_strength * 2) + 3
+
+        if len(normalized) < minimum:
+            return {
+                "status": "REJECTED",
+                "valid": False,
+                "reason": "INSUFFICIENT_CANDLES",
+                "required": minimum,
+                "received": len(normalized),
+            }
+
+        swings = self._find_swings(normalized)
+
+        protected = self._select_protected_levels(
+            swings,
             direction,
-            swing_high,
-            swing_low,
         )
 
-        if not levels["valid"]:
-            return levels
+        break_result = self._check_break(
+            normalized,
+            protected,
+            direction,
+        )
 
-        update = self.update(candles)
-
-        return {
-            "valid": update["valid"],
-            "status": "ANALYSIS_COMPLETE",
-            "direction": direction.upper(),
-            "swings": swings,
-            "levels": levels,
-            "update": update,
+        result = {
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "valid": True,
+            "direction": direction,
+            "swing_highs": swings["highs"],
+            "swing_lows": swings["lows"],
+            "protected_high": protected["protected_high"],
+            "protected_low": protected["protected_low"],
+            "protected_level_broken": break_result["broken"],
+            "wick_probe": break_result.get(
+                "wick_probe",
+                False,
+            ),
+            "break_evidence": break_result,
+            "execution_authorized": False,
         }
 
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "module": "SMCProtectedRangeEngine",
-            "protected_high": self.protected_high,
-            "protected_low": self.protected_low,
-            "recent_events": self.events[-20:],
-        }
+        self.last_result = result
+
+        return result
+
+    def get_state(self) -> Dict[str, Any]:
+        return dict(self.last_result)
 
 
 smc_protected_range_engine = SMCProtectedRangeEngine()
