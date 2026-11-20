@@ -1,272 +1,360 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Breaker Engine
 
-Detects potential breaker blocks from previously identified
-Order Blocks.
+Purpose:
+- Identify potential bullish and bearish breaker blocks.
+- Require a full candle-body close through the original zone.
+- Track retests of broken zones.
+- Distinguish confirmed breakers from unconfirmed candidates.
+- Return structured evidence for the master SMC engine.
 
-Bullish breaker:
-- Original bearish Order Block.
-- Price closes above its upper boundary.
-- Price subsequently retests the broken zone.
-
-Bearish breaker:
-- Original bullish Order Block.
-- Price closes below its lower boundary.
-- Price subsequently retests the broken zone.
-
-A breaker candidate is evidence only. Additional SMC confirmation
-is required before any trading decision.
+Rules:
+- A wick through a zone is not a confirmed breaker.
+- A bullish breaker requires a bearish-origin zone broken upward.
+- A bearish breaker requires a bullish-origin zone broken downward.
+- A retest must interact with the broken zone.
+- This module does not authorize or execute trades.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class BreakerResult:
-    zone_id: str
-    breaker_direction: Optional[str]
-    status: str
-    lower: float
-    upper: float
-    formation_index: int
-    break_index: Optional[int]
-    retest_index: Optional[int]
-    reason: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
 class SMCBreakerEngine:
+    VERSION = "2.0"
 
-    def __init__(self):
-        self.blocks: Dict[str, Dict[str, Any]] = {}
+    def __init__(self, require_retest: bool = True):
+        self.require_retest = bool(require_retest)
 
     @staticmethod
-    def _number(value: Any, field: str) -> float:
+    def _number(value: Any) -> Optional[float]:
         try:
             result = float(value)
+            if result != result or abs(result) == float("inf"):
+                return None
+            return result
         except (TypeError, ValueError):
-            raise ValueError(f"Invalid {field}")
+            return None
 
-        if result != result or result in (
-            float("inf"),
-            float("-inf"),
-        ):
-            raise ValueError(f"Non-finite {field}")
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        value = str(value or "").upper()
+
+        if value in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
+
+        if value in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    def _normalise_zone(
+        self,
+        zone: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(zone, dict):
+            return None
+
+        lower = self._number(zone.get("lower", zone.get("low")))
+        upper = self._number(zone.get("upper", zone.get("high")))
+
+        origin = self._direction(
+            zone.get("origin_direction", zone.get("direction"))
+        )
+
+        if lower is None or upper is None or lower >= upper:
+            return None
+
+        if origin is None:
+            return None
+
+        return {
+            "zone_id": zone.get("zone_id", zone.get("id")),
+            "lower": lower,
+            "upper": upper,
+            "origin_direction": origin,
+            "zone_type": str(
+                zone.get("zone_type", zone.get("type", "UNKNOWN"))
+            ).upper(),
+        }
+
+    @staticmethod
+    def _normalise_candles(
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, float]]:
+        result = []
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            values = {}
+
+            for key in ("open", "high", "low", "close"):
+                try:
+                    value = float(candle[key])
+                except (KeyError, TypeError, ValueError):
+                    values = {}
+                    break
+
+                if value != value or abs(value) == float("inf"):
+                    values = {}
+                    break
+
+                values[key] = value
+
+            if not values:
+                continue
+
+            if values["high"] < values["low"]:
+                continue
+
+            if values["high"] < max(values["open"], values["close"]):
+                continue
+
+            if values["low"] > min(values["open"], values["close"]):
+                continue
+
+            result.append(values)
 
         return result
 
     @staticmethod
-    def _validate_direction(direction: str) -> str:
-        direction = direction.upper()
+    def _detect_break(
+        candle: Dict[str, float],
+        zone: Dict[str, Any],
+    ) -> Optional[str]:
+        if (
+            zone["origin_direction"] == "BEARISH"
+            and candle["open"] <= zone["upper"]
+            and candle["close"] > zone["upper"]
+            and candle["close"] > candle["open"]
+        ):
+            return "BULLISH"
 
-        if direction not in ("BULLISH", "BEARISH"):
-            raise ValueError("Direction must be BULLISH or BEARISH")
+        if (
+            zone["origin_direction"] == "BULLISH"
+            and candle["open"] >= zone["lower"]
+            and candle["close"] < zone["lower"]
+            and candle["close"] < candle["open"]
+        ):
+            return "BEARISH"
 
-        return direction
+        return None
 
-    def register_order_block(
-        self,
-        zone_id: str,
-        original_direction: str,
-        lower: float,
-        upper: float,
-        formation_index: int,
-    ) -> Dict[str, Any]:
-
-        if not isinstance(zone_id, str) or not zone_id.strip():
-            raise ValueError("zone_id must be a non-empty string")
-
-        if zone_id in self.blocks:
-            raise ValueError(f"Order Block already registered: {zone_id}")
-
-        original_direction = self._validate_direction(
-            original_direction
+    @staticmethod
+    def _retest(
+        candle: Dict[str, float],
+        zone: Dict[str, Any],
+        breaker_direction: str,
+    ) -> bool:
+        overlaps = (
+            candle["high"] >= zone["lower"]
+            and candle["low"] <= zone["upper"]
         )
 
-        lower = self._number(lower, "lower")
-        upper = self._number(upper, "upper")
+        if not overlaps:
+            return False
 
-        if lower >= upper:
-            raise ValueError("lower must be below upper")
+        if breaker_direction == "BULLISH":
+            return candle["close"] >= zone["lower"]
 
-        if not isinstance(formation_index, int) or formation_index < 0:
-            raise ValueError("formation_index must be non-negative")
+        return candle["close"] <= zone["upper"]
 
-        self.blocks[zone_id] = {
-            "zone_id": zone_id,
-            "original_direction": original_direction,
-            "breaker_direction": (
-                "BULLISH"
-                if original_direction == "BEARISH"
-                else "BEARISH"
-            ),
-            "lower": lower,
-            "upper": upper,
-            "formation_index": formation_index,
-            "status": "WAITING_FOR_BREAK",
-            "break_index": None,
-            "retest_index": None,
-        }
-
-        return self.get_block(zone_id)
-
-    def get_block(self, zone_id: str) -> Dict[str, Any]:
-        if zone_id not in self.blocks:
-            raise KeyError(f"Unknown Order Block: {zone_id}")
-
-        return dict(self.blocks[zone_id])
-
-    def _result(
+    def analyse_zone(
         self,
-        block: Dict[str, Any],
-        reason: str,
-    ) -> Dict[str, Any]:
-
-        return BreakerResult(
-            zone_id=block["zone_id"],
-            breaker_direction=block["breaker_direction"],
-            status=block["status"],
-            lower=block["lower"],
-            upper=block["upper"],
-            formation_index=block["formation_index"],
-            break_index=block["break_index"],
-            retest_index=block["retest_index"],
-            reason=reason,
-        ).to_dict()
-
-    def update_block(
-        self,
-        zone_id: str,
+        zone: Dict[str, Any],
         candles: List[Dict[str, Any]],
-        start_index: Optional[int] = None,
+        formation_index: Optional[int] = None,
     ) -> Dict[str, Any]:
+        normalised_zone = self._normalise_zone(zone)
 
-        if zone_id not in self.blocks:
-            raise KeyError(f"Unknown Order Block: {zone_id}")
-
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
-
-        block = self.blocks[zone_id]
-
-        if start_index is None:
-            start_index = block["formation_index"] + 1
-
-        if not isinstance(start_index, int) or start_index < 0:
-            raise ValueError("start_index must be non-negative")
-
-        if start_index <= block["formation_index"]:
-            raise ValueError("Start index must follow formation")
-
-        if block["status"] == "BREAKER_RETEST_CONFIRMED":
-            return self._result(block, "BREAKER_ALREADY_CONFIRMED")
-
-        if block["status"] == "WAITING_FOR_RETEST":
-            scan_start = max(
-                start_index,
-                block["break_index"] + 1,
-            )
-        else:
-            scan_start = start_index
-
-        for index in range(scan_start, len(candles)):
-
-            raw = candles[index]
-
-            if not isinstance(raw, dict):
-                raise ValueError("Invalid candle")
-
-            candle = {
-                field: self._number(raw.get(field), field)
-                for field in ("open", "high", "low", "close")
+        if normalised_zone is None:
+            return {
+                "status": "ERROR",
+                "valid": False,
+                "reason": "INVALID_BREAKER_ZONE",
             }
 
-            if candle["high"] < candle["low"]:
-                raise ValueError("Candle high cannot be below low")
+        normalised_candles = self._normalise_candles(candles)
 
-            if not (
-                candle["low"] <= candle["open"] <= candle["high"]
-                and candle["low"] <= candle["close"] <= candle["high"]
+        if not normalised_candles:
+            return {
+                "status": "ERROR",
+                "valid": False,
+                "reason": "NO_VALID_CANDLES",
+            }
+
+        if formation_index is None:
+            start_index = 0
+        else:
+            try:
+                formation_index = int(formation_index)
+            except (TypeError, ValueError):
+                return {
+                    "status": "ERROR",
+                    "valid": False,
+                    "reason": "INVALID_FORMATION_INDEX",
+                }
+
+            if (
+                formation_index < -1
+                or formation_index >= len(normalised_candles)
             ):
-                raise ValueError("Invalid candle price range")
+                return {
+                    "status": "ERROR",
+                    "valid": False,
+                    "reason": "FORMATION_INDEX_OUT_OF_RANGE",
+                }
 
-            if block["status"] == "WAITING_FOR_BREAK":
+            start_index = formation_index + 1
 
-                if block["breaker_direction"] == "BULLISH":
-                    broken = candle["close"] > block["upper"]
-                else:
-                    broken = candle["close"] < block["lower"]
+        break_index = None
+        breaker_direction = None
+        retest_index = None
+        events = []
 
-                if broken:
-                    block["status"] = "WAITING_FOR_RETEST"
-                    block["break_index"] = index
+        for index in range(start_index, len(normalised_candles)):
+            candle = normalised_candles[index]
 
-            elif block["status"] == "WAITING_FOR_RETEST":
-
-                overlaps = (
-                    candle["high"] >= block["lower"]
-                    and candle["low"] <= block["upper"]
+            if break_index is None:
+                detected_direction = self._detect_break(
+                    candle,
+                    normalised_zone,
                 )
 
-                if overlaps:
-                    block["status"] = "BREAKER_RETEST_CONFIRMED"
-                    block["retest_index"] = index
+                if detected_direction is None:
+                    continue
 
-                    return self._result(
-                        block,
-                        "BROKEN_ORDER_BLOCK_RETESTED",
-                    )
+                break_index = index
+                breaker_direction = detected_direction
 
-        return self._result(block, "UPDATE_COMPLETE")
+                events.append({
+                    "index": index,
+                    "event": "BODY_CLOSE_BREAK",
+                    "direction": detected_direction,
+                    "close": candle["close"],
+                })
 
-    def update_all(
-        self,
-        candles: List[Dict[str, Any]],
-    ) -> Dict[str, Dict[str, Any]]:
-
-        results = {}
-
-        for zone_id, block in list(self.blocks.items()):
-
-            if block["status"] == "BREAKER_RETEST_CONFIRMED":
                 continue
 
-            results[zone_id] = self.update_block(
-                zone_id,
-                candles,
-            )
+            if index <= break_index:
+                continue
 
-        return results
+            if self._retest(
+                candle,
+                normalised_zone,
+                breaker_direction,
+            ):
+                retest_index = index
 
-    def get_confirmed_breakers(self) -> List[Dict[str, Any]]:
-        return [
-            dict(block)
-            for block in self.blocks.values()
-            if block["status"] == "BREAKER_RETEST_CONFIRMED"
-        ]
+                events.append({
+                    "index": index,
+                    "event": "RETEST",
+                    "direction": breaker_direction,
+                })
 
-    def get_status(self) -> Dict[str, Any]:
+                break
 
-        counts = {
-            "WAITING_FOR_BREAK": 0,
-            "WAITING_FOR_RETEST": 0,
-            "BREAKER_RETEST_CONFIRMED": 0,
-        }
+        broken = break_index is not None
+        retested = retest_index is not None
 
-        for block in self.blocks.values():
-            counts[block["status"]] += 1
+        confirmed = (
+            broken
+            and (retested or not self.require_retest)
+        )
+
+        if not broken:
+            status = "UNBROKEN"
+        elif confirmed:
+            status = "CONFIRMED_BREAKER"
+        elif self.require_retest:
+            status = "BROKEN_AWAITING_RETEST"
+        else:
+            status = "BROKEN_NO_RETEST_REQUIRED"
 
         return {
-            "total_order_blocks": len(self.blocks),
-            "states": counts,
+            "status": status,
+            "version": self.VERSION,
+            "valid": True,
+            "zone_id": normalised_zone["zone_id"],
+            "zone_type": normalised_zone["zone_type"],
+            "lower": normalised_zone["lower"],
+            "upper": normalised_zone["upper"],
+            "origin_direction": normalised_zone["origin_direction"],
+            "direction": breaker_direction,
+            "broken": broken,
+            "break_index": break_index,
+            "body_close_confirmed": broken,
+            "retested": retested,
+            "retest_index": retest_index,
+            "confirmed": confirmed,
+            "active": confirmed,
+            "events": events,
+            "confirmation": status,
         }
 
+    def analyse(
+        self,
+        zones: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+        formation_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(zones, list):
+            return {
+                "status": "ERROR",
+                "reason": "INVALID_ZONES_INPUT",
+                "breakers": [],
+            }
 
-# Shared engine instance
+        results = []
+
+        for index, zone in enumerate(zones):
+            formation_index = None
+
+            if formation_indices is not None and index < len(formation_indices):
+                formation_index = formation_indices[index]
+
+            results.append(
+                self.analyse_zone(
+                    zone,
+                    candles,
+                    formation_index,
+                )
+            )
+
+        confirmed = [
+            item for item in results
+            if item.get("confirmed")
+        ]
+
+        return {
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "zone_count": len(results),
+            "confirmed": bool(confirmed),
+            "bullish_breakers": [
+                item for item in confirmed
+                if item.get("direction") == "BULLISH"
+            ],
+            "bearish_breakers": [
+                item for item in confirmed
+                if item.get("direction") == "BEARISH"
+            ],
+            "awaiting_retest": [
+                item for item in results
+                if item.get("status") == "BROKEN_AWAITING_RETEST"
+            ],
+            "breakers": results,
+        }
+
+    def analyze(
+        self,
+        zones: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+        formation_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        return self.analyse(zones, candles, formation_indices)
+
+
 smc_breaker_engine = SMCBreakerEngine()
