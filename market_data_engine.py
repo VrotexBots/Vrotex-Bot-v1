@@ -6,10 +6,6 @@ from urllib.parse import urlencode
 
 from config import settings
 from logging_config import get_logger
-from utils.validators import (
-    validate_instrument,
-    validate_timeframe,
-)
 
 from broker.exness_connector import exness_connector
 
@@ -70,16 +66,6 @@ class MarketDataEngine:
 
         symbol = symbol.upper().strip()
         timeframe = timeframe.upper().strip()
-
-        if not validate_instrument(symbol):
-            raise ValueError(
-                f"Instrument not approved: {symbol}"
-            )
-
-        if not validate_timeframe(timeframe):
-            raise ValueError(
-                f"Timeframe not approved: {timeframe}"
-            )
 
         if symbol not in settings.INSTRUMENTS:
             raise ValueError(
