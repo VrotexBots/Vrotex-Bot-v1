@@ -1,7 +1,9 @@
 import asyncio
 import json
+import math
 import threading
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import websocket
@@ -16,18 +18,23 @@ logger = get_logger("live_tick_engine")
 
 class LiveTickEngine:
 
+    MAX_RECONNECT_DELAY = 60
+    INITIAL_RECONNECT_DELAY = 1
+    DEFAULT_MAX_TICK_AGE = 10
+    STARTUP_TIMEOUT = 45
+
     def __init__(self):
 
         self.connector = exness_connector
-
         self.instruments = list(settings.INSTRUMENTS)
 
         self.latest_ticks = {}
+        self.last_tick_time = {}
 
         self.connected = False
         self.running = False
+        self.ready = False
 
-        self.last_tick_time = {}
         self.last_error = None
 
         self.websocket_app = None
@@ -36,8 +43,42 @@ class LiveTickEngine:
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
 
+        self._loop = None
+        self._ready_event = None
+
         self.reconnect_attempts = 0
-        self.max_reconnect_delay = 60
+
+    @staticmethod
+    def _parse_timestamp(value):
+
+        if isinstance(value, (int, float)):
+
+            timestamp = float(value)
+
+            if timestamp > 100000000000:
+                timestamp /= 1000.0
+
+            return timestamp
+
+        if isinstance(value, str):
+
+            try:
+
+                parsed = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                return parsed.timestamp()
+
+            except ValueError:
+                return None
+
+        return None
 
     def build_websocket_url(self):
 
@@ -66,16 +107,27 @@ class LiveTickEngine:
                 "Unsupported Exness Access Point scheme"
             )
 
+        if not parsed.netloc:
+            raise ValueError(
+                "Invalid Exness Access Point"
+            )
+
         account_id = connection.account_id
+
+        if not account_id:
+            raise RuntimeError(
+                "Exness account ID is unavailable"
+            )
 
         path = (
             f"/v1/server-events/accounts/"
             f"{account_id}/ws/ticks"
         )
 
-        url = f"{scheme}://{parsed.netloc}{path}"
-
-        return url, path
+        return (
+            f"{scheme}://{parsed.netloc}{path}",
+            path,
+        )
 
     def build_headers(self, path):
 
@@ -88,7 +140,15 @@ class LiveTickEngine:
             idempotency_key="",
         )
 
-        return headers
+        if not isinstance(headers, dict):
+            raise RuntimeError(
+                "Exness authentication headers are invalid"
+            )
+
+        return [
+            f"{key}: {value}"
+            for key, value in headers.items()
+        ]
 
     def on_open(self, ws):
 
@@ -104,14 +164,31 @@ class LiveTickEngine:
             },
         }
 
-        ws.send(
-            json.dumps(subscription)
-        )
+        try:
 
-        with self._lock:
+            ws.send(
+                json.dumps(subscription)
+            )
 
-            self.connected = True
-            self.last_error = None
+            with self._lock:
+
+                self.connected = True
+                self.last_error = None
+
+            logger.info(
+                "Subscribed to live instruments: %s",
+                self.instruments,
+            )
+
+        except Exception as exc:
+
+            self.last_error = str(exc)
+
+            logger.exception(
+                "Live tick subscription failed."
+            )
+
+            ws.close()
 
     def on_message(self, ws, message):
 
@@ -119,7 +196,7 @@ class LiveTickEngine:
 
             data = json.loads(message)
 
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
 
             logger.warning(
                 "Invalid WebSocket message received."
@@ -132,18 +209,20 @@ class LiveTickEngine:
 
         if "error_message" in data:
 
-            logger.error(
-                "Exness stream error: %s",
-                data.get("error_message"),
+            self.last_error = str(
+                data.get("error_message")
             )
 
-            self.last_error = data.get(
-                "error_message"
+            logger.error(
+                "Exness stream error: %s",
+                self.last_error,
             )
 
             return
 
-        instrument = data.get("instrument")
+        instrument = str(
+            data.get("instrument", "")
+        ).upper()
 
         if instrument not in self.instruments:
             return
@@ -157,28 +236,75 @@ class LiveTickEngine:
 
             return
 
-        if bid <= 0 or ask <= 0 or ask < bid:
+        if not math.isfinite(bid):
+            return
+
+        if not math.isfinite(ask):
+            return
+
+        if bid <= 0 or ask < bid:
+            return
+
+        source_timestamp = self._parse_timestamp(
+            data.get("timestamp")
+        )
+
+        if source_timestamp is None:
+            logger.warning(
+                "Tick rejected: missing or invalid source timestamp."
+            )
+            return
+
+        received_at = time.time()
+
+        age = received_at - source_timestamp
+
+        if age < -5 or age > self.DEFAULT_MAX_TICK_AGE:
+            logger.warning(
+                "Stale or future tick rejected: %s age=%s",
+                instrument,
+                age,
+            )
             return
 
         tick = {
             "instrument": instrument,
             "bid": bid,
             "ask": ask,
+            "mid": (bid + ask) / 2.0,
             "spread": ask - bid,
-            "timestamp": data.get("timestamp"),
-            "received_at": time.time(),
+            "timestamp": source_timestamp,
+            "received_at": received_at,
+            "age_seconds": max(0.0, age),
+            "valid": True,
         }
 
         with self._lock:
 
             self.latest_ticks[instrument] = tick
 
-            self.last_tick_time[instrument] = (
-                tick["received_at"]
+            self.last_tick_time[instrument] = received_at
+
+            self.ready = all(
+                self._is_fresh_locked(symbol)
+                for symbol in self.instruments
             )
 
+            ready = self.ready
+
+        if ready and self._loop and self._ready_event:
+
+            try:
+
+                self._loop.call_soon_threadsafe(
+                    self._ready_event.set
+                )
+
+            except RuntimeError:
+                pass
+
         logger.debug(
-            "Tick | %s | Bid: %s | Ask: %s",
+            "Tick | %s | Bid=%s | Ask=%s",
             instrument,
             bid,
             ask,
@@ -203,16 +329,17 @@ class LiveTickEngine:
         with self._lock:
 
             self.connected = False
+            self.ready = False
 
         logger.warning(
-            "Tick stream closed | Code: %s | Message: %s",
+            "Tick stream closed | Code=%s | Message=%s",
             close_status_code,
             close_message,
         )
 
     def connection_loop(self):
 
-        delay = 1
+        delay = self.INITIAL_RECONNECT_DELAY
 
         while not self._stop_event.is_set():
 
@@ -240,46 +367,44 @@ class LiveTickEngine:
                     ping_timeout=10,
                 )
 
-                if self._stop_event.is_set():
-                    break
-
-                self.connected = False
-
-                self.reconnect_attempts += 1
-
-                logger.warning(
-                    "Tick stream disconnected. "
-                    "Reconnect attempt %s",
-                    self.reconnect_attempts,
-                )
-
-                self._stop_event.wait(delay)
-
-                delay = min(
-                    delay * 2,
-                    self.max_reconnect_delay,
-                )
-
             except Exception as exc:
 
-                self.connected = False
                 self.last_error = str(exc)
 
                 logger.exception(
                     "Tick stream connection failure."
                 )
 
-                self.reconnect_attempts += 1
+            finally:
 
-                self._stop_event.wait(delay)
+                with self._lock:
 
-                delay = min(
-                    delay * 2,
-                    self.max_reconnect_delay,
-                )
+                    self.connected = False
+                    self.ready = False
 
-        self.connected = False
-        self.running = False
+            if self._stop_event.is_set():
+                break
+
+            self.reconnect_attempts += 1
+
+            logger.warning(
+                "Tick stream reconnect attempt %s in %s seconds.",
+                self.reconnect_attempts,
+                delay,
+            )
+
+            self._stop_event.wait(delay)
+
+            delay = min(
+                delay * 2,
+                self.MAX_RECONNECT_DELAY,
+            )
+
+        with self._lock:
+
+            self.connected = False
+            self.ready = False
+            self.running = False
 
         logger.info(
             "Live tick engine thread stopped."
@@ -288,11 +413,8 @@ class LiveTickEngine:
     async def start(self):
 
         if self.running:
-            return {
-                "running": True,
-                "connected": self.connected,
-                "message": "Already running",
-            }
+
+            return self.get_status()
 
         if not self.connector.connected:
 
@@ -300,13 +422,26 @@ class LiveTickEngine:
 
             if not result.get("success"):
                 raise ConnectionError(
-                    "Cannot start tick engine: "
-                    "Exness connection failed"
+                    "Cannot start tick engine: Exness connection failed"
                 )
+
+        if not self.connector.connection.access_point:
+            raise ConnectionError(
+                "Exness access point is unavailable"
+            )
+
+        self._loop = asyncio.get_running_loop()
+        self._ready_event = asyncio.Event()
 
         self._stop_event.clear()
 
-        self.running = True
+        with self._lock:
+
+            self.running = True
+            self.connected = False
+            self.ready = False
+            self.last_error = None
+            self.reconnect_attempts = 0
 
         self.thread = threading.Thread(
             target=self.connection_loop,
@@ -321,61 +456,127 @@ class LiveTickEngine:
             len(self.instruments),
         )
 
-        return {
-            "running": True,
-            "connected": self.connected,
-            "instruments": self.instruments,
-            "message": "Tick engine started",
-        }
+        try:
+
+            await asyncio.wait_for(
+                self._ready_event.wait(),
+                timeout=self.STARTUP_TIMEOUT,
+            )
+
+            if not self.is_ready():
+                raise ConnectionError(
+                    "Live tick feed lost readiness during startup"
+                )
+
+            logger.info(
+                "Live Bid/Ask feed ready for all instruments."
+            )
+
+            return self.get_status()
+
+        except Exception:
+
+            await self.stop()
+
+            raise
 
     async def stop(self):
 
         self._stop_event.set()
 
-        if self.websocket_app is not None:
+        ws = self.websocket_app
+
+        if ws is not None:
 
             try:
-                self.websocket_app.close()
+                ws.close()
 
-            except Exception:
-                pass
+            except Exception as exc:
 
-        if self.thread is not None:
+                logger.warning(
+                    "WebSocket shutdown warning: %s",
+                    exc,
+                )
+
+        thread = self.thread
+
+        if thread is not None and thread.is_alive():
 
             await asyncio.to_thread(
-                self.thread.join,
+                thread.join,
                 10,
             )
 
-        self.running = False
-        self.connected = False
+        with self._lock:
+
+            self.running = False
+            self.connected = False
+            self.ready = False
+
+        self.websocket_app = None
+        self.thread = None
 
         logger.info(
             "Live tick engine stopped."
         )
 
-    def get_tick(self, instrument):
+    def _is_fresh_locked(
+        self,
+        instrument,
+        max_age_seconds=None,
+    ):
 
-        instrument = instrument.upper()
+        tick = self.latest_ticks.get(instrument)
+
+        if tick is None:
+            return False
+
+        max_age = (
+            max_age_seconds
+            if max_age_seconds is not None
+            else self.DEFAULT_MAX_TICK_AGE
+        )
+
+        age = time.time() - tick["timestamp"]
+
+        return (
+            -5 <= age <= max_age
+            and tick["bid"] > 0
+            and tick["ask"] >= tick["bid"]
+        )
+
+    def get_tick(
+        self,
+        instrument,
+        max_age_seconds=None,
+    ):
+
+        instrument = str(instrument).upper()
 
         with self._lock:
+
+            if not self._is_fresh_locked(
+                instrument,
+                max_age_seconds,
+            ):
+                return None
 
             tick = self.latest_ticks.get(instrument)
 
-            if tick is None:
-                return None
-
-            return dict(tick)
+            return dict(tick) if tick else None
 
     def get_all_ticks(self):
 
-        with self._lock:
+        result = {}
 
-            return {
-                symbol: dict(tick)
-                for symbol, tick
-                in self.latest_ticks.items()
-            }
+        for instrument in self.instruments:
+
+            tick = self.get_tick(instrument)
+
+            if tick is not None:
+                result[instrument] = tick
+
+        return result
 
     def is_tick_fresh(
         self,
@@ -383,38 +584,51 @@ class LiveTickEngine:
         max_age_seconds=10,
     ):
 
-        instrument = instrument.upper()
+        instrument = str(instrument).upper()
 
         with self._lock:
 
-            timestamp = self.last_tick_time.get(
-                instrument
+            return self._is_fresh_locked(
+                instrument,
+                max_age_seconds,
             )
 
-        if timestamp is None:
-            return False
+    def is_ready(self):
 
-        return (
-            time.time() - timestamp
-        ) <= max_age_seconds
+        with self._lock:
+
+            return (
+                self.running
+                and self.connected
+                and all(
+                    self._is_fresh_locked(symbol)
+                    for symbol in self.instruments
+                )
+            )
 
     def get_status(self):
 
         with self._lock:
 
-            ticks_received = len(
-                self.latest_ticks
-            )
+            ticks = {}
+
+            for instrument in self.instruments:
+
+                if self._is_fresh_locked(instrument):
+
+                    ticks[instrument] = dict(
+                        self.latest_ticks[instrument]
+                    )
 
             return {
                 "running": self.running,
                 "connected": self.connected,
-                "instruments": self.instruments,
-                "ticks_received": ticks_received,
-                "latest_ticks": self.get_all_ticks(),
-                "reconnect_attempts": (
-                    self.reconnect_attempts
-                ),
+                "ready": self.is_ready(),
+                "instruments": list(self.instruments),
+                "ticks_received": len(ticks),
+                "expected_ticks": len(self.instruments),
+                "latest_ticks": ticks,
+                "reconnect_attempts": self.reconnect_attempts,
                 "last_error": self.last_error,
             }
 
