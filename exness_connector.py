@@ -1,11 +1,12 @@
+
 import asyncio
 from typing import Optional
 
 from logging_config import get_logger
-from broker.exness_connection import exness_connection
+from exness_connection import exness_connection
 
 
-logger = get_logger("broker.exness_connector")
+logger = get_logger("exness_connector")
 
 
 class ExnessConnector:
