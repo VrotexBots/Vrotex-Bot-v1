@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import math
@@ -10,7 +11,7 @@ import websocket
 
 from config import settings
 from logging_config import get_logger
-from broker.exness_connector import exness_connector
+from exness_connector import exness_connector
 
 
 logger = get_logger("live_tick_engine")
@@ -20,8 +21,18 @@ class LiveTickEngine:
 
     MAX_RECONNECT_DELAY = 60
     INITIAL_RECONNECT_DELAY = 1
-    DEFAULT_MAX_TICK_AGE = 10
-    STARTUP_TIMEOUT = 45
+
+    DEFAULT_MAX_TICK_AGE = getattr(
+        settings,
+        "LIVE_TICK_MAX_AGE_SECONDS",
+        10,
+    )
+
+    STARTUP_TIMEOUT = getattr(
+        settings,
+        "LIVE_TICK_STARTUP_TIMEOUT_SECONDS",
+        45,
+    )
 
     def __init__(self):
 
@@ -55,6 +66,9 @@ class LiveTickEngine:
 
             timestamp = float(value)
 
+            if not math.isfinite(timestamp):
+                return None
+
             if timestamp > 100000000000:
                 timestamp /= 1000.0
 
@@ -69,6 +83,7 @@ class LiveTickEngine:
                 )
 
                 if parsed.tzinfo is None:
+
                     parsed = parsed.replace(
                         tzinfo=timezone.utc
                     )
@@ -85,6 +100,7 @@ class LiveTickEngine:
         connection = self.connector.connection
 
         if not connection.access_point:
+
             raise RuntimeError(
                 "Exness Access Point is unavailable"
             )
@@ -103,11 +119,13 @@ class LiveTickEngine:
             scheme = parsed.scheme
 
         else:
+
             raise ValueError(
                 "Unsupported Exness Access Point scheme"
             )
 
         if not parsed.netloc:
+
             raise ValueError(
                 "Invalid Exness Access Point"
             )
@@ -115,6 +133,7 @@ class LiveTickEngine:
         account_id = connection.account_id
 
         if not account_id:
+
             raise RuntimeError(
                 "Exness account ID is unavailable"
             )
@@ -141,6 +160,7 @@ class LiveTickEngine:
         )
 
         if not isinstance(headers, dict):
+
             raise RuntimeError(
                 "Exness authentication headers are invalid"
             )
@@ -250,21 +270,28 @@ class LiveTickEngine:
         )
 
         if source_timestamp is None:
+
             logger.warning(
                 "Tick rejected: missing or invalid source timestamp."
             )
+
             return
 
         received_at = time.time()
 
         age = received_at - source_timestamp
 
-        if age < -5 or age > self.DEFAULT_MAX_TICK_AGE:
+        if (
+            age < -5
+            or age > self.DEFAULT_MAX_TICK_AGE
+        ):
+
             logger.warning(
                 "Stale or future tick rejected: %s age=%s",
                 instrument,
                 age,
             )
+
             return
 
         tick = {
@@ -413,7 +440,6 @@ class LiveTickEngine:
     async def start(self):
 
         if self.running:
-
             return self.get_status()
 
         if not self.connector.connected:
@@ -421,11 +447,13 @@ class LiveTickEngine:
             result = await self.connector.connect()
 
             if not result.get("success"):
+
                 raise ConnectionError(
                     "Cannot start tick engine: Exness connection failed"
                 )
 
         if not self.connector.connection.access_point:
+
             raise ConnectionError(
                 "Exness access point is unavailable"
             )
@@ -464,6 +492,7 @@ class LiveTickEngine:
             )
 
             if not self.is_ready():
+
                 raise ConnectionError(
                     "Live tick feed lost readiness during startup"
                 )
@@ -489,6 +518,7 @@ class LiveTickEngine:
         if ws is not None:
 
             try:
+
                 ws.close()
 
             except Exception as exc:
@@ -559,6 +589,7 @@ class LiveTickEngine:
                 instrument,
                 max_age_seconds,
             ):
+
                 return None
 
             tick = self.latest_ticks.get(instrument)
