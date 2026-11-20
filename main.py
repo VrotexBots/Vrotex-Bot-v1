@@ -5,15 +5,12 @@ import sys
 
 from config import settings, validate_settings
 from logging_config import setup_logging
-from engine import engine
 
 
 logger = setup_logging()
 
 
 class VrotexBot:
-
-    VERSION = "1.0"
 
     def __init__(self):
 
@@ -23,74 +20,73 @@ class VrotexBot:
 
     async def initialize(self):
 
-        logger.info("=" * 55)
+        logger.info("=" * 50)
         logger.info("INITIALIZING %s", settings.BOT_NAME)
-        logger.info("=" * 55)
+        logger.info("=" * 50)
 
         validate_settings()
 
-        logger.info("Bot version: %s", self.VERSION)
         logger.info("Mode: %s", settings.BOT_MODE)
+
         logger.info(
             "Execution enabled: %s",
-            settings.ORDER_EXECUTION_ENABLED
+            settings.ORDER_EXECUTION_ENABLED,
         )
+
         logger.info(
             "Instruments: %s",
-            ", ".join(settings.INSTRUMENTS)
+            ", ".join(settings.INSTRUMENTS),
         )
+
         logger.info("Strategy: H1 -> M5 -> M1")
 
-        if settings.BOT_MODE.upper() != "DEMO":
-            logger.warning(
-                "BOT MODE IS NOT DEMO. "
-                "Verify configuration before starting."
-            )
-
         self.running = True
-
-        logger.info("Configuration validation completed.")
 
     async def start(self):
 
         await self.initialize()
 
-        logger.info("Starting Vrotex master engine.")
+        logger.info("Vrotex Bot V1 starting.")
+
+        from engine import engine
 
         self.engine_task = asyncio.create_task(
             engine.start(),
-            name="vrotex-master-engine"
+            name="vrotex-trading-engine",
+        )
+
+        shutdown_task = asyncio.create_task(
+            self.shutdown_event.wait(),
+            name="vrotex-shutdown-waiter",
         )
 
         try:
 
-            shutdown_task = asyncio.create_task(
-                self.shutdown_event.wait(),
-                name="vrotex-shutdown-waiter"
-            )
-
             done, pending = await asyncio.wait(
                 [self.engine_task, shutdown_task],
-                return_when=asyncio.FIRST_COMPLETED
+                return_when=asyncio.FIRST_COMPLETED,
             )
 
-            for task in pending:
-                task.cancel()
+            if shutdown_task in done:
 
-            await asyncio.gather(
-                *pending,
-                return_exceptions=True
-            )
+                logger.info(
+                    "Shutdown signal received."
+                )
+
+                await engine.stop()
 
             if self.engine_task in done:
+
                 await self.engine_task
 
-        except asyncio.CancelledError:
-
-            logger.info("Bot startup task cancelled.")
-            raise
-
         finally:
+
+            shutdown_task.cancel()
+
+            await asyncio.gather(
+                shutdown_task,
+                return_exceptions=True,
+            )
 
             await self.stop()
 
@@ -99,28 +95,34 @@ class VrotexBot:
         if not self.running:
             return
 
-        logger.info("Vrotex shutdown requested.")
+        logger.info("Shutdown requested.")
 
         self.running = False
         self.shutdown_event.set()
 
         try:
 
+            from engine import engine
+
             await engine.stop()
 
         except Exception:
 
             logger.exception(
-                "Error while stopping master engine."
+                "Engine shutdown failed."
             )
 
-        if self.engine_task and not self.engine_task.done():
+        if (
+            self.engine_task
+            and not self.engine_task.done()
+            and self.engine_task is not asyncio.current_task()
+        ):
 
             self.engine_task.cancel()
 
             await asyncio.gather(
                 self.engine_task,
-                return_exceptions=True
+                return_exceptions=True,
             )
 
         logger.info("Vrotex Bot V1 stopped.")
@@ -138,17 +140,33 @@ async def main():
 
             loop.add_signal_handler(
                 sig,
-                bot.shutdown_event.set
+                bot.shutdown_event.set,
             )
 
         except (NotImplementedError, RuntimeError):
 
             logger.warning(
                 "Signal handler unavailable for %s",
-                sig
+                sig,
             )
 
-    await bot.start()
+    try:
+
+        await bot.start()
+
+    except asyncio.CancelledError:
+
+        logger.info("Bot task cancelled.")
+
+        raise
+
+    except Exception:
+
+        logger.exception(
+            "Fatal bot startup/runtime error."
+        )
+
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -159,12 +177,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        logger.info("Bot interrupted by user.")
-
-    except Exception:
-
-        logger.exception(
-            "Fatal Vrotex Bot V1 startup/runtime error."
-        )
-
-        sys.exit(1)
+        logger.info("Bot interrupted.")
