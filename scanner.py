@@ -6,12 +6,15 @@ Market Scanner
 Version: 2.0
 
 Purpose:
-- Continuously scan all six approved instruments.
+- Continuously scan the approved pilot instruments.
 - Retrieve H1, M5 and M1 market candles.
 - Run technical analysis on each timeframe.
 - Submit collected market data to the master SMC engine.
 - Reject incomplete setups.
 - Keep execution disabled.
+
+Pilot:
+EURUSD, GBPUSD, BTCUSD
 
 Strategy:
 H1 = External narrative
@@ -23,8 +26,9 @@ This module does not place orders.
 
 import asyncio
 import inspect
+import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from config import settings
 from logging_config import get_logger
@@ -41,6 +45,12 @@ class MarketScanner:
 
     VERSION = "2.0"
 
+    PILOT_INSTRUMENTS = (
+        "EURUSD",
+        "GBPUSD",
+        "BTCUSD",
+    )
+
     STRATEGY_TIMEFRAMES = (
         "H1",
         "M5",
@@ -55,15 +65,9 @@ class MarketScanner:
         self.technical_analysis = technical_analysis_engine
         self.smc = smc_engine
 
+        # Pilot restriction
         self.instruments = list(
-            getattr(settings, "INSTRUMENTS", [
-                "EURUSD",
-                "GBPUSD",
-                "USDJPY",
-                "EURJPY",
-                "EURGBP",
-                "BTCUSD",
-            ])
+            self.PILOT_INSTRUMENTS
         )
 
         self.running = False
@@ -86,7 +90,10 @@ class MarketScanner:
         self.successful_scans = 0
         self.failed_scans = 0
 
-        self.results: Dict[str, Dict[str, Any]] = {}
+        self.results: Dict[
+            str,
+            Dict[str, Any]
+        ] = {}
 
         self.status = "INITIALIZED"
 
@@ -135,12 +142,14 @@ class MarketScanner:
                 ]
 
                 if any(
-                    not __import__("math").isfinite(v)
-                    for v in values
+                    not math.isfinite(value)
+                    for value in values
                 ):
                     return False
 
-                open_price, high, low, close = values
+                open_price, high, low, close = (
+                    values
+                )
 
                 if low <= 0 or high <= 0:
                     return False
@@ -154,7 +163,11 @@ class MarketScanner:
                 ):
                     return False
 
-            except (KeyError, TypeError, ValueError):
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 return False
 
         return True
@@ -169,20 +182,26 @@ class MarketScanner:
         timeframe: str,
     ) -> Dict[str, Any]:
 
-        candles = await self.market_data.get_recent_candles(
-            symbol=symbol,
-            timeframe=timeframe,
-            count=self.CANDLE_COUNT,
-            price_type="bid",
+        candles = await (
+            self.market_data.get_recent_candles(
+                symbol=symbol,
+                timeframe=timeframe,
+                count=self.CANDLE_COUNT,
+                price_type="bid",
+            )
         )
 
-        if not self._valid_candles(candles):
+        if not self._valid_candles(
+            candles
+        ):
 
             return {
                 "valid": False,
                 "timeframe": timeframe,
                 "candles": [],
-                "reason": "INSUFFICIENT_OR_INVALID_CANDLES",
+                "reason": (
+                    "INSUFFICIENT_OR_INVALID_CANDLES"
+                ),
             }
 
         analysis = await self._resolve(
@@ -193,13 +212,18 @@ class MarketScanner:
             )
         )
 
-        if not isinstance(analysis, dict):
+        if not isinstance(
+            analysis,
+            dict,
+        ):
 
             return {
                 "valid": False,
                 "timeframe": timeframe,
                 "candles": candles,
-                "reason": "TECHNICAL_ANALYSIS_FAILED",
+                "reason": (
+                    "TECHNICAL_ANALYSIS_FAILED"
+                ),
             }
 
         return {
@@ -239,16 +263,20 @@ class MarketScanner:
 
         try:
 
-            # Fetch H1, M5 and M1 concurrently.
-            timeframe_results = await asyncio.gather(
-                *[
-                    self._collect_timeframe(
-                        symbol,
-                        timeframe,
-                    )
-                    for timeframe in self.STRATEGY_TIMEFRAMES
-                ],
-                return_exceptions=True,
+            # H1, M5 and M1
+            timeframe_results = (
+                await asyncio.gather(
+                    *[
+                        self._collect_timeframe(
+                            symbol,
+                            timeframe,
+                        )
+                        for timeframe in (
+                            self.STRATEGY_TIMEFRAMES
+                        )
+                    ],
+                    return_exceptions=True,
+                )
             )
 
             market_data = {}
@@ -259,7 +287,10 @@ class MarketScanner:
                 timeframe_results,
             ):
 
-                if isinstance(item, Exception):
+                if isinstance(
+                    item,
+                    Exception,
+                ):
 
                     data_errors.append({
                         "timeframe": timeframe,
@@ -268,13 +299,17 @@ class MarketScanner:
 
                     continue
 
-                result["timeframes"][timeframe] = item
+                result["timeframes"][
+                    timeframe
+                ] = item
 
                 if item.get("valid") is not True:
 
                     data_errors.append({
                         "timeframe": timeframe,
-                        "error": item.get("reason"),
+                        "error": item.get(
+                            "reason"
+                        ),
                     })
 
                     continue
@@ -284,7 +319,7 @@ class MarketScanner:
                     "technical": item["technical"],
                 }
 
-            # Every strategy timeframe is mandatory.
+            # Required timeframes must all be valid.
             if (
                 data_errors
                 or len(market_data) != 3
@@ -292,7 +327,9 @@ class MarketScanner:
 
                 result.update({
                     "status": "DATA_INCOMPLETE",
-                    "reason": "REQUIRED_TIMEFRAME_DATA_UNAVAILABLE",
+                    "reason": (
+                        "REQUIRED_TIMEFRAME_DATA_UNAVAILABLE"
+                    ),
                     "data_errors": data_errors,
                 })
 
@@ -301,16 +338,20 @@ class MarketScanner:
                     result,
                 )
 
-            # Current price comes from the latest M1 close.
+            # Current price from latest M1 candle.
             current_price = float(
-                market_data["M1"]["candles"][-1]["close"]
+                market_data["M1"][
+                    "candles"
+                ][-1]["close"]
             )
 
             if current_price <= 0:
 
                 result.update({
                     "status": "INVALID_PRICE",
-                    "reason": "CURRENT_PRICE_INVALID",
+                    "reason": (
+                        "CURRENT_PRICE_INVALID"
+                    ),
                 })
 
                 return self._store_result(
@@ -318,19 +359,15 @@ class MarketScanner:
                     result,
                 )
 
-            result["current_price"] = current_price
+            result["current_price"] = (
+                current_price
+            )
 
-            # --------------------------------------------------
-            # MASTER SMC DECISION
-            # --------------------------------------------------
+            # MASTER SMC ENGINE
             #
-            # The dedicated SMC evidence-generation pipeline
-            # must supply entry, POI, FVG, displacement and
-            # measured risk evidence before a setup can pass.
-            #
-            # Missing evidence is deliberately passed as None.
-            # The master engine must reject incomplete setups.
-            # --------------------------------------------------
+            # Evidence modules are not yet integrated.
+            # Missing evidence remains None.
+            # Execution is always disabled.
 
             decision = await self._resolve(
                 self.smc.analyse(
@@ -346,11 +383,16 @@ class MarketScanner:
                 )
             )
 
-            if not isinstance(decision, dict):
+            if not isinstance(
+                decision,
+                dict,
+            ):
 
                 result.update({
                     "status": "ANALYSIS_ERROR",
-                    "reason": "MASTER_SMC_RETURNED_INVALID_RESULT",
+                    "reason": (
+                        "MASTER_SMC_RETURNED_INVALID_RESULT"
+                    ),
                 })
 
                 return self._store_result(
@@ -358,15 +400,20 @@ class MarketScanner:
                     result,
                 )
 
-            result["analysis"] = decision
-
-            setup_found = (
-                decision.get("status") == "A_PLUS_SETUP"
-                and decision.get("a_plus") is True
-                and decision.get("execution_authorized") is True
+            result["analysis"] = (
+                decision
             )
 
-            # The scanner never authorizes execution itself.
+            setup_found = (
+                decision.get("status")
+                == "A_PLUS_SETUP"
+                and decision.get("a_plus")
+                is True
+                and decision.get(
+                    "execution_authorized"
+                ) is True
+            )
+
             result.update({
                 "status": (
                     "SETUP_CANDIDATE"
@@ -374,10 +421,24 @@ class MarketScanner:
                     else "NO_CONFIRMED_SETUP"
                 ),
                 "setup_found": setup_found,
-                "direction": decision.get("direction"),
-                "reason": decision.get("reason"),
+                "direction": decision.get(
+                    "direction"
+                ),
+                "reason": decision.get(
+                    "reason"
+                ),
                 "execution_authorized": False,
             })
+
+            logger.info(
+                "Analysis complete | %s | "
+                "Price: %s | Status: %s | "
+                "Direction: %s",
+                symbol,
+                current_price,
+                result["status"],
+                result["direction"],
+            )
 
             return self._store_result(
                 symbol,
@@ -409,7 +470,7 @@ class MarketScanner:
         self,
         symbol: str,
         result: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ):
 
         self.results[symbol] = result
 
@@ -424,27 +485,37 @@ class MarketScanner:
         return result
 
     # --------------------------------------------------
-    # SCAN ALL INSTRUMENTS
+    # SCAN PILOT
     # --------------------------------------------------
 
-    async def scan_all(self) -> Dict[str, Any]:
+    async def scan_all(self):
 
         async with self.scan_lock:
 
             self.total_scans += 1
 
-            self.last_scan_time = datetime.now(
-                timezone.utc
-            ).isoformat()
+            self.last_scan_time = (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
 
             logger.info(
-                "Starting market scan: %s instruments",
+                "Starting pilot market scan: "
+                "%s instruments | %s",
                 len(self.instruments),
+                ", ".join(
+                    self.instruments
+                ),
             )
 
             tasks = [
-                self.scan_instrument(symbol)
-                for symbol in self.instruments
+                self.scan_instrument(
+                    symbol
+                )
+                for symbol in (
+                    self.instruments
+                )
             ]
 
             results = await asyncio.gather(
@@ -459,10 +530,13 @@ class MarketScanner:
                 results,
             ):
 
-                if isinstance(result, Exception):
+                if isinstance(
+                    result,
+                    Exception,
+                ):
 
                     logger.error(
-                        "Scan task failed for %s: %s",
+                        "Scan task failed | %s | %s",
                         symbol,
                         result,
                     )
@@ -479,27 +553,41 @@ class MarketScanner:
 
                 else:
 
-                    completed[symbol] = result
+                    completed[symbol] = (
+                        result
+                    )
 
             self.status = "RUNNING"
 
             setup_count = sum(
                 1
-                for item in completed.values()
-                if item.get("setup_found") is True
+                for item in (
+                    completed.values()
+                )
+                if item.get(
+                    "setup_found"
+                ) is True
             )
 
             logger.info(
-                "Market scan complete: %s instruments, %s setup candidates",
+                "Pilot scan complete | "
+                "%s instruments | "
+                "%s setup candidates",
                 len(completed),
                 setup_count,
             )
 
             return {
                 "status": "COMPLETED",
-                "timestamp": self.last_scan_time,
-                "total_instruments": len(completed),
-                "setup_candidates": setup_count,
+                "timestamp": (
+                    self.last_scan_time
+                ),
+                "total_instruments": (
+                    len(completed)
+                ),
+                "setup_candidates": (
+                    setup_count
+                ),
                 "results": completed,
                 "execution_authorized": False,
             }
@@ -511,9 +599,11 @@ class MarketScanner:
     async def run(self):
 
         if self.running:
+
             logger.warning(
                 "Market scanner is already running"
             )
+
             return
 
         self.running = True
@@ -521,25 +611,41 @@ class MarketScanner:
         self.status = "RUNNING"
 
         logger.info(
-            "Vrotex V1 market scanner started"
+            "Vrotex V1 pilot scanner started"
+        )
+
+        logger.info(
+            "Pilot instruments: %s",
+            ", ".join(
+                self.instruments
+            ),
+        )
+
+        logger.info(
+            "Strategy timeframes: H1 -> M5 -> M1"
         )
 
         try:
 
             while self.running:
 
-                started = asyncio.get_running_loop().time()
+                started = (
+                    asyncio.get_running_loop()
+                    .time()
+                )
 
                 await self.scan_all()
 
                 elapsed = (
-                    asyncio.get_running_loop().time()
+                    asyncio.get_running_loop()
+                    .time()
                     - started
                 )
 
                 delay = max(
                     1,
-                    self.scan_interval - elapsed,
+                    self.scan_interval
+                    - elapsed,
                 )
 
                 try:
@@ -552,6 +658,7 @@ class MarketScanner:
                     break
 
                 except asyncio.TimeoutError:
+
                     continue
 
         except asyncio.CancelledError:
@@ -578,7 +685,7 @@ class MarketScanner:
                 self.status = "STOPPED"
 
             logger.info(
-                "Vrotex V1 market scanner stopped"
+                "Vrotex V1 pilot scanner stopped"
             )
 
     # --------------------------------------------------
@@ -598,22 +705,34 @@ class MarketScanner:
     # STATUS
     # --------------------------------------------------
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self):
 
         return {
             "module": "MarketScanner",
             "version": self.VERSION,
             "status": self.status,
             "running": self.running,
-            "instruments": list(self.instruments),
+            "instruments": list(
+                self.instruments
+            ),
             "strategy_timeframes": list(
                 self.STRATEGY_TIMEFRAMES
             ),
-            "scan_interval_seconds": self.scan_interval,
-            "total_scans": self.total_scans,
-            "successful_scans": self.successful_scans,
-            "failed_scans": self.failed_scans,
-            "last_scan_time": self.last_scan_time,
+            "scan_interval_seconds": (
+                self.scan_interval
+            ),
+            "total_scans": (
+                self.total_scans
+            ),
+            "successful_scans": (
+                self.successful_scans
+            ),
+            "failed_scans": (
+                self.failed_scans
+            ),
+            "last_scan_time": (
+                self.last_scan_time
+            ),
             "execution_authorized": False,
         }
 
