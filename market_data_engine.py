@@ -1,5 +1,7 @@
+
 import asyncio
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from config import settings
@@ -19,6 +21,12 @@ class MarketDataEngine:
 
     MAX_CANDLES_PER_REQUEST = 1000
 
+    REQUIRED_STRATEGY_TIMEFRAMES = (
+        "H1",
+        "M5",
+        "M1",
+    )
+
     def __init__(self):
 
         self.connector = exness_connector
@@ -26,11 +34,12 @@ class MarketDataEngine:
         self._lock = asyncio.Lock()
 
         self.cache = {}
-
         self.last_update = {}
         self.errors = {}
 
         self.ready = False
+        self.verified_pairs = []
+        self.failed_pairs = []
 
     @staticmethod
     def utc_now():
@@ -50,8 +59,14 @@ class MarketDataEngine:
         symbol,
         timeframe,
         count,
-        price_type
+        price_type,
     ):
+
+        if not isinstance(symbol, str):
+            raise ValueError("Invalid instrument")
+
+        if not isinstance(timeframe, str):
+            raise ValueError("Invalid timeframe")
 
         symbol = symbol.upper().strip()
         timeframe = timeframe.upper().strip()
@@ -76,7 +91,10 @@ class MarketDataEngine:
                 f"Timeframe not configured: {timeframe}"
             )
 
-        if not isinstance(count, int):
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+        ):
             raise ValueError(
                 "Candle count must be an integer"
             )
@@ -98,6 +116,116 @@ class MarketDataEngine:
 
         return symbol, timeframe
 
+    @staticmethod
+    def valid_ohlc(data):
+
+        if not isinstance(data, dict):
+            return False
+
+        required = (
+            "open",
+            "high",
+            "low",
+            "close",
+        )
+
+        values = {}
+
+        for field in required:
+
+            value = data.get(field)
+
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return False
+
+            if not math.isfinite(value):
+                return False
+
+            values[field] = value
+
+        if values["high"] < max(
+            values["open"],
+            values["close"],
+            values["low"],
+        ):
+            return False
+
+        if values["low"] > min(
+            values["open"],
+            values["close"],
+            values["high"],
+        ):
+            return False
+
+        return True
+
+    def normalize_candles(
+        self,
+        candles,
+        symbol,
+        timeframe,
+        price_type,
+    ):
+
+        normalized = []
+
+        for candle in candles:
+
+            if not isinstance(candle, dict):
+                continue
+
+            candle_time = candle.get("time")
+
+            if not candle_time:
+                continue
+
+            if price_type == "both":
+
+                bid = candle.get("bid")
+                ask = candle.get("ask")
+
+                if not self.valid_ohlc(bid):
+                    continue
+
+                if not self.valid_ohlc(ask):
+                    continue
+
+                normalized_candle = {
+                    "time": candle_time,
+                    "bid": bid,
+                    "ask": ask,
+                    "volume": candle.get("volume", 0),
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                }
+
+            else:
+
+                if not self.valid_ohlc(candle):
+                    continue
+
+                normalized_candle = {
+                    "time": candle_time,
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "volume": candle.get("volume", 0),
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "price_type": price_type,
+                }
+
+            normalized.append(normalized_candle)
+
+        normalized.sort(
+            key=lambda item: str(item["time"])
+        )
+
+        return normalized
+
     async def request_candles(
         self,
         symbol,
@@ -113,127 +241,126 @@ class MarketDataEngine:
             price_type,
         )
 
-        if not self.connector.connected:
-
-            result = await self.connector.connect()
-
-            if not result.get("success"):
-                raise ConnectionError(
-                    "Exness connection unavailable"
-                )
-
-        connection = self.connector.connection
-
-        if not connection.access_point:
-            raise ConnectionError(
-                "Exness Access Point not resolved"
-            )
-
-        # Negative count requests candles preceding
-        # the supplied starting timestamp.
-        start_time = self.utc_now()
-
-        query = urlencode({
-            "instrument": symbol,
-            "timeframe": timeframe,
-            "price_type": price_type,
-            "from": self.format_time(start_time),
-            "count": -count,
-        })
-
-        path = (
-            f"/v1/market-data/accounts/"
-            f"{connection.account_id}/candles"
-            f"?{query}"
-        )
-
-        logger.info(
-            "Requesting candles | %s | %s | %s | %s",
-            symbol,
-            timeframe,
-            count,
-            price_type,
-        )
-
-        response = await connection.signed_request(
-            connection.access_point,
-            "GET",
-            path,
-        )
-
-        candles = response.get("candles", [])
-
-        if not isinstance(candles, list):
-            raise RuntimeError(
-                "Invalid candle response format"
-            )
-
-        normalized = []
-
-        for candle in candles:
-
-            if not isinstance(candle, dict):
-                continue
-
-            if price_type == "both":
-
-                bid = candle.get("bid")
-                ask = candle.get("ask")
-
-                if not bid or not ask:
-                    continue
-
-                normalized_candle = {
-                    "time": candle.get("time"),
-                    "bid": bid,
-                    "ask": ask,
-                    "volume": candle.get("volume", 0),
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                }
-
-            else:
-
-                normalized_candle = {
-                    "time": candle.get("time"),
-                    "open": candle.get("open"),
-                    "high": candle.get("high"),
-                    "low": candle.get("low"),
-                    "close": candle.get("close"),
-                    "volume": candle.get("volume", 0),
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "price_type": price_type,
-                }
-
-            normalized.append(normalized_candle)
-
-        normalized.sort(
-            key=lambda candle: candle["time"]
-        )
-
         cache_key = (
             symbol,
             timeframe,
             price_type,
         )
 
-        self.cache[cache_key] = normalized
+        try:
 
-        self.last_update[cache_key] = (
-            self.utc_now().isoformat()
-        )
+            async with self._lock:
 
-        self.errors.pop(cache_key, None)
+                if not (
+                    self.connector.connected
+                    and self.connector.connection.connected
+                ):
 
-        logger.info(
-            "Candles received | %s | %s | %s",
-            symbol,
-            timeframe,
-            len(normalized),
-        )
+                    result = await self.connector.connect()
 
-        return normalized
+                    if not result.get("success"):
+                        raise ConnectionError(
+                            result.get(
+                                "error",
+                                "Exness connection unavailable",
+                            )
+                        )
+
+                connection = self.connector.connection
+
+                if not connection.connected:
+                    raise ConnectionError(
+                        "Exness connection is not active"
+                    )
+
+                if not connection.access_point:
+                    raise ConnectionError(
+                        "Exness Access Point not resolved"
+                    )
+
+                start_time = self.utc_now()
+
+                query = urlencode({
+                    "instrument": symbol,
+                    "timeframe": timeframe,
+                    "price_type": price_type,
+                    "from": self.format_time(start_time),
+                    "count": -count,
+                })
+
+                path = (
+                    "/v1/market-data/accounts/"
+                    f"{connection.account_id}/candles"
+                    f"?{query}"
+                )
+
+                logger.info(
+                    "Requesting candles | %s | %s | %s | %s",
+                    symbol,
+                    timeframe,
+                    count,
+                    price_type,
+                )
+
+                response = await connection.signed_request(
+                    connection.access_point,
+                    "GET",
+                    path,
+                )
+
+                if not isinstance(response, dict):
+                    raise RuntimeError(
+                        "Invalid Exness response"
+                    )
+
+                candles = response.get("candles")
+
+                if not isinstance(candles, list):
+                    raise RuntimeError(
+                        "Invalid candle response format"
+                    )
+
+                normalized = self.normalize_candles(
+                    candles,
+                    symbol,
+                    timeframe,
+                    price_type,
+                )
+
+                if not normalized:
+                    raise RuntimeError(
+                        f"No valid candles received: "
+                        f"{symbol} {timeframe}"
+                    )
+
+                self.cache[cache_key] = normalized
+
+                self.last_update[cache_key] = (
+                    self.utc_now().isoformat()
+                )
+
+                self.errors.pop(cache_key, None)
+
+                logger.info(
+                    "Candles received | %s | %s | %s",
+                    symbol,
+                    timeframe,
+                    len(normalized),
+                )
+
+                return list(normalized)
+
+        except Exception as exc:
+
+            self.errors[cache_key] = str(exc)
+
+            logger.exception(
+                "Market data request failed | %s | %s",
+                symbol,
+                timeframe,
+            )
+
+            raise
 
     async def get_recent_candles(
         self,
@@ -249,6 +376,79 @@ class MarketDataEngine:
             count=count,
             price_type=price_type,
         )
+
+    async def verify_required_market_data(
+        self,
+        count=100,
+    ):
+
+        logger.info(
+            "Starting V1 strategy market-data verification."
+        )
+
+        self.ready = False
+        self.verified_pairs = []
+        self.failed_pairs = []
+
+        for symbol in settings.INSTRUMENTS:
+
+            for timeframe in self.REQUIRED_STRATEGY_TIMEFRAMES:
+
+                pair = f"{symbol}:{timeframe}"
+
+                try:
+
+                    candles = await self.request_candles(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        count=count,
+                        price_type="bid",
+                    )
+
+                    if not candles:
+                        raise RuntimeError(
+                            "No valid candles available"
+                        )
+
+                    self.verified_pairs.append(pair)
+
+                except Exception as exc:
+
+                    self.failed_pairs.append({
+                        "pair": pair,
+                        "error": str(exc),
+                    })
+
+                    logger.error(
+                        "Market data verification failed: %s",
+                        pair,
+                    )
+
+        expected = (
+            len(settings.INSTRUMENTS)
+            * len(self.REQUIRED_STRATEGY_TIMEFRAMES)
+        )
+
+        self.ready = (
+            len(self.verified_pairs) == expected
+            and not self.failed_pairs
+        )
+
+        logger.info(
+            "Market data verification complete | "
+            "Verified: %s/%s | Ready: %s",
+            len(self.verified_pairs),
+            expected,
+            self.ready,
+        )
+
+        return {
+            "ready": self.ready,
+            "verified": len(self.verified_pairs),
+            "expected": expected,
+            "verified_pairs": list(self.verified_pairs),
+            "failed_pairs": list(self.failed_pairs),
+        }
 
     def get_cached_candles(
         self,
@@ -271,6 +471,12 @@ class MarketDataEngine:
 
         return {
             "ready": self.ready,
+            "verified_pairs": len(self.verified_pairs),
+            "failed_pairs": len(self.failed_pairs),
+            "expected_pairs": (
+                len(settings.INSTRUMENTS)
+                * len(self.REQUIRED_STRATEGY_TIMEFRAMES)
+            ),
             "cached_pairs": len(self.cache),
             "last_updates": dict(self.last_update),
             "errors": dict(self.errors),
