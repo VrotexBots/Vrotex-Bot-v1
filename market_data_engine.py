@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 from config import settings
 from logging_config import get_logger
 
-from broker.exness_connector import exness_connector
+from exness_connector import exness_connector
 
 
 logger = get_logger("market_data_engine")
