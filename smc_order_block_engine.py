@@ -1,399 +1,662 @@
 
 """
-Vrotex Bot V1 - SMC Order Block Engine
+VROTEX BOT V1
+SMC Order Block Engine
+Version 2.0
 
-Detects potential:
+Detects:
 - Bullish order blocks
 - Bearish order blocks
-- Displacement after opposing candles
-- Structural-break confirmation
-- Partial mitigation
-- Full mitigation
-- Invalidated order blocks
+- Displacement away from the order block
+- Zone boundaries and midpoint
+- Partial and full mitigation
+- Clean, unmitigated order-block candidates
 
-An opposing candle alone is NOT a confirmed order block.
+Bullish OB:
+The last bearish candle before a qualifying bullish
+displacement move.
 
-A valid candidate requires:
-1. An opposing candle.
-2. Subsequent directional displacement.
-3. A confirmed structural break.
-4. A zone that has not been invalidated.
+Bearish OB:
+The last bullish candle before a qualifying bearish
+displacement move.
 
-This module identifies candidates only.
-It does not authorize trades.
+A candidate is not automatically a confirmed trade POI.
+Additional structure, liquidity and timeframe validation
+must be performed by the master SMC engine.
+
+This module does not execute trades.
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class SMCOrderBlockEngine:
 
-    VERSION = "1.0"
+    VERSION = "2.0"
 
     def __init__(
         self,
-        lookback=20,
-        minimum_displacement_ratio=1.5,
+        lookback: int = 100,
+        displacement_atr_multiple: float = 1.0,
+        atr_period: int = 14,
+        mitigation_tolerance: float = 0.0
     ):
-        if lookback < 2:
-            raise ValueError("lookback must be at least 2")
+        self.lookback = max(10, int(lookback))
+        self.displacement_atr_multiple = max(
+            0.0, float(displacement_atr_multiple)
+        )
+        self.atr_period = max(2, int(atr_period))
+        self.mitigation_tolerance = max(
+            0.0, float(mitigation_tolerance)
+        )
 
-        if minimum_displacement_ratio <= 0:
-            raise ValueError(
-                "minimum_displacement_ratio must be positive"
+        self.last_result: Dict[str, Any] = {}
+
+    # ---------------------------------------------------------
+    # HELPERS
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _number(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+            if result != result:
+                return None
+            return result
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_candles(
+        self,
+        candles: Any
+    ) -> List[Dict[str, float]]:
+
+        if not isinstance(candles, list):
+            return []
+
+        validated = []
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            open_price = self._number(candle.get("open"))
+            high = self._number(candle.get("high"))
+            low = self._number(candle.get("low"))
+            close = self._number(candle.get("close"))
+
+            if None in (
+                open_price, high, low, close
+            ):
+                continue
+
+            if high < low:
+                continue
+
+            if not (
+                low <= open_price <= high
+                and low <= close <= high
+            ):
+                continue
+
+            validated.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close
+            })
+
+        return validated
+
+    @staticmethod
+    def _true_range(
+        current: Dict[str, float],
+        previous: Optional[Dict[str, float]]
+    ) -> float:
+
+        if previous is None:
+            return current["high"] - current["low"]
+
+        return max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        )
+
+    def _calculate_atr(
+        self,
+        candles: List[Dict[str, float]],
+        index: int
+    ) -> Optional[float]:
+
+        start = max(0, index - self.atr_period + 1)
+
+        ranges = []
+
+        for position in range(start, index + 1):
+            previous = (
+                candles[position - 1]
+                if position > 0
+                else None
             )
 
-        self.lookback = lookback
-        self.minimum_displacement_ratio = (
-            float(minimum_displacement_ratio)
-        )
-
-        self.total_analyses = 0
-        self.last_result = None
-
-    @staticmethod
-    def _validate_candles(candles):
-        if not isinstance(candles, list):
-            raise TypeError("Candles must be a list")
-
-        result = []
-
-        for index, candle in enumerate(candles):
-            if not isinstance(candle, dict):
-                raise ValueError(
-                    f"Candle {index} must be a dictionary"
+            ranges.append(
+                self._true_range(
+                    candles[position],
+                    previous
                 )
+            )
 
-            item = {}
+        if not ranges:
+            return None
 
-            for field in ("open", "high", "low", "close"):
-                try:
-                    item[field] = float(candle[field])
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        f"Candle {index} has invalid {field}"
-                    )
+        return sum(ranges) / len(ranges)
 
-            if item["high"] < max(
-                item["open"],
-                item["close"],
-                item["low"],
-            ):
-                raise ValueError(
-                    f"Candle {index} has invalid high"
-                )
+    # ---------------------------------------------------------
+    # DISPLACEMENT VALIDATION
+    # ---------------------------------------------------------
 
-            if item["low"] > min(
-                item["open"],
-                item["close"],
-                item["high"],
-            ):
-                raise ValueError(
-                    f"Candle {index} has invalid low"
-                )
-
-            result.append(item)
-
-        return result
-
-    @staticmethod
-    def _body_size(candle):
-        return abs(candle["close"] - candle["open"])
-
-    @staticmethod
-    def _average_body(candles):
-        if not candles:
-            return 0.0
-
-        return sum(
-            abs(candle["close"] - candle["open"])
-            for candle in candles
-        ) / len(candles)
-
-    def _has_bullish_displacement(
+    def _validate_displacement(
         self,
-        candles,
-        index,
-    ):
-        current = candles[index]
+        candles: List[Dict[str, float]],
+        index: int,
+        direction: str
+    ) -> Dict[str, Any]:
 
-        previous = candles[
-            max(0, index - 5):index
-        ]
+        candle = candles[index]
 
-        average = self._average_body(previous)
-
-        if average <= 0:
-            return False
-
-        return (
-            current["close"] > current["open"]
-            and self._body_size(current)
-            >= average * self.minimum_displacement_ratio
+        atr = self._calculate_atr(
+            candles,
+            index
         )
 
-    def _has_bearish_displacement(
+        body = abs(
+            candle["close"] - candle["open"]
+        )
+
+        if atr is None or atr <= 0:
+            return {
+                "confirmed": False,
+                "reason": "ATR_UNAVAILABLE",
+                "atr": atr,
+                "body_size": body
+            }
+
+        required_body = (
+            atr * self.displacement_atr_multiple
+        )
+
+        if direction == "BUY":
+            directional_close = (
+                candle["close"] > candle["open"]
+            )
+        else:
+            directional_close = (
+                candle["close"] < candle["open"]
+            )
+
+        confirmed = (
+            directional_close
+            and body >= required_body
+        )
+
+        return {
+            "confirmed": confirmed,
+            "direction": direction,
+            "atr": atr,
+            "body_size": body,
+            "required_body_size": required_body,
+            "body_atr_ratio": body / atr
+        }
+
+    # ---------------------------------------------------------
+    # ORDER BLOCK CANDIDATE DETECTION
+    # ---------------------------------------------------------
+
+    def _find_order_blocks(
         self,
-        candles,
-        index,
-    ):
-        current = candles[index]
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
 
-        previous = candles[
-            max(0, index - 5):index
-        ]
+        candidates = []
 
-        average = self._average_body(previous)
-
-        if average <= 0:
-            return False
-
-        return (
-            current["close"] < current["open"]
-            and self._body_size(current)
-            >= average * self.minimum_displacement_ratio
+        start = max(
+            1,
+            len(candles) - self.lookback
         )
-
-    @staticmethod
-    def _confirmed_bullish_break(
-        candle,
-        structural_high,
-    ):
-        return (
-            structural_high is not None
-            and candle["close"] > structural_high
-        )
-
-    @staticmethod
-    def _confirmed_bearish_break(
-        candle,
-        structural_low,
-    ):
-        return (
-            structural_low is not None
-            and candle["close"] < structural_low
-        )
-
-    def detect_order_blocks(
-        self,
-        candles,
-        structural_high=None,
-        structural_low=None,
-    ):
-        candles = self._validate_candles(candles)
-
-        blocks = []
-
-        if len(candles) < 7:
-            return blocks
-
-        start = max(1, len(candles) - self.lookback)
 
         for index in range(start, len(candles)):
 
             candle = candles[index]
 
-            previous_candle = candles[index - 1]
-
-            # Bullish candidate:
-            # Final bearish candle before bullish displacement.
-
-            if (
-                previous_candle["close"]
-                < previous_candle["open"]
-            ):
-
-                if (
-                    self._has_bullish_displacement(
-                        candles,
-                        index,
-                    )
-                    and self._confirmed_bullish_break(
-                        candle,
-                        structural_high,
-                    )
-                ):
-                    blocks.append({
-                        "type": "BULLISH_ORDER_BLOCK",
-                        "lower": previous_candle["low"],
-                        "upper": previous_candle["high"],
-                        "formation_index": index,
-                        "source_candle_index": index - 1,
-                        "displacement_confirmed": True,
-                        "structure_break_confirmed": True,
-                        "mitigation": "UNMITIGATED",
-                        "invalidation": "NOT_INVALIDATED",
-                    })
-
-            # Bearish candidate:
-            # Final bullish candle before bearish displacement.
-
-            if (
-                previous_candle["close"]
-                > previous_candle["open"]
-            ):
-
-                if (
-                    self._has_bearish_displacement(
-                        candles,
-                        index,
-                    )
-                    and self._confirmed_bearish_break(
-                        candle,
-                        structural_low,
-                    )
-                ):
-                    blocks.append({
-                        "type": "BEARISH_ORDER_BLOCK",
-                        "lower": previous_candle["low"],
-                        "upper": previous_candle["high"],
-                        "formation_index": index,
-                        "source_candle_index": index - 1,
-                        "displacement_confirmed": True,
-                        "structure_break_confirmed": True,
-                        "mitigation": "UNMITIGATED",
-                        "invalidation": "NOT_INVALIDATED",
-                    })
-
-        return blocks
-
-    def update_block_states(
-        self,
-        blocks,
-        candles,
-    ):
-        candles = self._validate_candles(candles)
-
-        updated = []
-
-        for block in blocks:
-
-            item = dict(block)
-
-            lower = float(item["lower"])
-            upper = float(item["upper"])
-
-            if lower >= upper:
-                item["invalidation"] = "INVALID_ZONE"
-                updated.append(item)
-                continue
-
-            start_index = (
-                item["formation_index"] + 1
+            bullish_candle = (
+                candle["close"] > candle["open"]
             )
 
-            invalidated = False
-            touched = False
+            bearish_candle = (
+                candle["close"] < candle["open"]
+            )
 
-            for candle in candles[start_index:]:
+            # A bearish candle can be the origin of a
+            # subsequent bullish displacement.
+            if bearish_candle:
 
-                if item["type"] == "BULLISH_ORDER_BLOCK":
+                displacement = self._validate_displacement(
+                    candles,
+                    index + 1,
+                    "BUY"
+                ) if index + 1 < len(candles) else {
+                    "confirmed": False,
+                    "reason": "NO_FOLLOWING_CANDLE"
+                }
 
-                    if candle["close"] < lower:
-                        invalidated = True
-                        break
+                if displacement["confirmed"]:
+                    candidates.append({
+                        "id": f"BULLISH_OB_{index}",
+                        "type": "BULLISH_ORDER_BLOCK",
+                        "direction": "BUY",
+                        "lower": candle["low"],
+                        "upper": candle["high"],
+                        "midpoint": (
+                            candle["low"] + candle["high"]
+                        ) / 2.0,
+                        "formation_index": index,
+                        "displacement_index": index + 1,
+                        "displacement": displacement,
+                        "origin_candle": dict(candle)
+                    })
+
+            # A bullish candle can be the origin of a
+            # subsequent bearish displacement.
+            if bullish_candle:
+
+                displacement = self._validate_displacement(
+                    candles,
+                    index + 1,
+                    "SELL"
+                ) if index + 1 < len(candles) else {
+                    "confirmed": False,
+                    "reason": "NO_FOLLOWING_CANDLE"
+                }
+
+                if displacement["confirmed"]:
+                    candidates.append({
+                        "id": f"BEARISH_OB_{index}",
+                        "type": "BEARISH_ORDER_BLOCK",
+                        "direction": "SELL",
+                        "lower": candle["low"],
+                        "upper": candle["high"],
+                        "midpoint": (
+                            candle["low"] + candle["high"]
+                        ) / 2.0,
+                        "formation_index": index,
+                        "displacement_index": index + 1,
+                        "displacement": displacement,
+                        "origin_candle": dict(candle)
+                    })
+
+        return candidates
+
+    # ---------------------------------------------------------
+    # MITIGATION
+    # ---------------------------------------------------------
+
+    def _check_mitigation(
+        self,
+        order_block: Dict[str, Any],
+        candles: List[Dict[str, float]]
+    ) -> Dict[str, Any]:
+
+        lower = order_block["lower"]
+        upper = order_block["upper"]
+        midpoint = order_block["midpoint"]
+
+        direction = order_block["direction"]
+        formation_index = order_block["formation_index"]
+
+        touched = False
+        midpoint_reached = False
+        fully_mitigated = False
+
+        mitigation_index = None
+        deepest_price = None
+
+        for index in range(
+            order_block["displacement_index"] + 1,
+            len(candles)
+        ):
+
+            candle = candles[index]
+
+            if direction == "BUY":
+
+                # Bullish OB is mitigated when price
+                # retraces downward into its zone.
+                if candle["low"] <= upper:
+                    touched = True
+                    mitigation_index = index
+                    deepest_price = candle["low"]
+
+                    if candle["low"] <= midpoint:
+                        midpoint_reached = True
 
                     if (
-                        candle["low"] <= upper
-                        and candle["high"] >= lower
+                        candle["low"]
+                        <= lower + self.mitigation_tolerance
                     ):
-                        touched = True
-
-                elif item["type"] == "BEARISH_ORDER_BLOCK":
-
-                    if candle["close"] > upper:
-                        invalidated = True
+                        fully_mitigated = True
                         break
-
-                    if (
-                        candle["high"] >= lower
-                        and candle["low"] <= upper
-                    ):
-                        touched = True
-
-            if invalidated:
-                item["invalidation"] = "INVALIDATED"
-                item["mitigation"] = "INVALIDATED"
-
-            elif touched:
-                item["mitigation"] = "MITIGATED"
 
             else:
-                item["mitigation"] = "UNMITIGATED"
 
-            updated.append(item)
+                # Bearish OB is mitigated when price
+                # retraces upward into its zone.
+                if candle["high"] >= lower:
+                    touched = True
+                    mitigation_index = index
+                    deepest_price = candle["high"]
 
-        return updated
+                    if candle["high"] >= midpoint:
+                        midpoint_reached = True
 
-    def get_valid_blocks(self, blocks):
-        return [
-            dict(block)
-            for block in blocks
-            if (
-                block.get("invalidation")
-                == "NOT_INVALIDATED"
-                and block.get("mitigation")
-                == "UNMITIGATED"
+                    if (
+                        candle["high"]
+                        >= upper - self.mitigation_tolerance
+                    ):
+                        fully_mitigated = True
+                        break
+
+        if fully_mitigated:
+            status = "FULLY_MITIGATED"
+
+        elif midpoint_reached:
+            status = "MIDPOINT_MITIGATED"
+
+        elif touched:
+            status = "PARTIALLY_MITIGATED"
+
+        else:
+            status = "UNMITIGATED"
+
+        return {
+            "mitigated": touched,
+            "partially_mitigated": (
+                touched and not fully_mitigated
+            ),
+            "midpoint_reached": midpoint_reached,
+            "fully_mitigated": fully_mitigated,
+            "mitigation_status": status,
+            "mitigation_index": mitigation_index,
+            "deepest_price": deepest_price
+        }
+
+    # ---------------------------------------------------------
+    # ENRICH ORDER BLOCKS
+    # ---------------------------------------------------------
+
+    def _enrich_order_blocks(
+        self,
+        candidates: List[Dict[str, Any]],
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
+
+        enriched = []
+
+        for candidate in candidates:
+
+            item = dict(candidate)
+
+            mitigation = self._check_mitigation(
+                item,
+                candles
             )
-        ]
+
+            item.update(mitigation)
+
+            item["clean"] = (
+                not item["mitigated"]
+                and not item["fully_mitigated"]
+            )
+
+            item["unmitigated"] = (
+                not item["mitigated"]
+            )
+
+            item["valid_candidate"] = (
+                item["displacement"]["confirmed"]
+            )
+
+            enriched.append(item)
+
+        return enriched
+
+    # ---------------------------------------------------------
+    # MAIN ANALYSIS
+    # ---------------------------------------------------------
 
     def analyze(
         self,
-        candles,
-        structural_high=None,
-        structural_low=None,
-    ):
-        candles = self._validate_candles(candles)
+        candles: Any,
+        current_price: Optional[float] = None
+    ) -> Dict[str, Any]:
 
-        detected = self.detect_order_blocks(
-            candles,
-            structural_high=structural_high,
-            structural_low=structural_low,
+        validated = self._validate_candles(candles)
+
+        if len(validated) < self.atr_period + 2:
+            result = {
+                "status": "INSUFFICIENT_DATA",
+                "version": self.VERSION,
+                "order_blocks": [],
+                "clean_order_blocks": [],
+                "bullish_order_blocks": [],
+                "bearish_order_blocks": []
+            }
+
+            self.last_result = result
+            return result
+
+        if current_price is None:
+            current_price = validated[-1]["close"]
+
+        current_price = self._number(current_price)
+
+        if current_price is None or current_price <= 0:
+            result = {
+                "status": "INVALID_CURRENT_PRICE",
+                "version": self.VERSION,
+                "order_blocks": []
+            }
+
+            self.last_result = result
+            return result
+
+        candidates = self._find_order_blocks(
+            validated
         )
 
-        updated = self.update_block_states(
-            detected,
-            candles,
+        enriched = self._enrich_order_blocks(
+            candidates,
+            validated
         )
 
-        self.total_analyses += 1
+        clean = [
+            item for item in enriched
+            if item["clean"]
+        ]
+
+        bullish = [
+            item for item in enriched
+            if item["direction"] == "BUY"
+        ]
+
+        bearish = [
+            item for item in enriched
+            if item["direction"] == "SELL"
+        ]
+
+        clean_bullish = [
+            item for item in clean
+            if item["direction"] == "BUY"
+        ]
+
+        clean_bearish = [
+            item for item in clean
+            if item["direction"] == "SELL"
+        ]
 
         result = {
-            "status": (
-                "ANALYZED"
-                if len(candles) >= 7
-                else "INSUFFICIENT_DATA"
-            ),
+            "status": "ANALYZED",
             "version": self.VERSION,
-            "total_candidates": len(updated),
-            "bullish_blocks": [
-                block for block in updated
-                if block["type"] == "BULLISH_ORDER_BLOCK"
-            ],
-            "bearish_blocks": [
-                block for block in updated
-                if block["type"] == "BEARISH_ORDER_BLOCK"
-            ],
-            "valid_unmitigated_blocks": (
-                self.get_valid_blocks(updated)
-            ),
-            "trade_authorized": False,
+            "candle_count": len(validated),
+            "current_price": current_price,
+
+            "order_block_count": len(enriched),
+            "clean_order_block_count": len(clean),
+
+            "order_blocks": enriched,
+            "clean_order_blocks": clean,
+
+            "bullish_order_blocks": bullish,
+            "bearish_order_blocks": bearish,
+
+            "clean_bullish_order_blocks": clean_bullish,
+            "clean_bearish_order_blocks": clean_bearish
         }
 
         self.last_result = result
-
         return result
 
-    def get_status(self):
+    # British spelling compatibility
+    def analyse(
+        self,
+        candles: Any,
+        current_price: Optional[float] = None
+    ) -> Dict[str, Any]:
+
+        return self.analyze(candles, current_price)
+
+    # ---------------------------------------------------------
+    # DIRECTIONAL POI VALIDATION
+    # ---------------------------------------------------------
+
+    def validate_directional_order_block(
+        self,
+        analysis: Dict[str, Any],
+        trade_direction: str
+    ) -> Dict[str, Any]:
+
+        direction = str(
+            trade_direction
+        ).strip().upper()
+
+        if direction in {"BUY", "BULLISH", "LONG"}:
+            expected = "BUY"
+
+        elif direction in {"SELL", "BEARISH", "SHORT"}:
+            expected = "SELL"
+
+        else:
+            return {
+                "valid": False,
+                "reason": "INVALID_TRADE_DIRECTION",
+                "matching_order_blocks": []
+            }
+
+        clean_blocks = analysis.get(
+            "clean_order_blocks", []
+        )
+
+        matching = [
+            item for item in clean_blocks
+            if (
+                isinstance(item, dict)
+                and item.get("direction") == expected
+                and item.get("clean") is True
+                and item.get("unmitigated") is True
+                and item.get("valid_candidate") is True
+            )
+        ]
+
+        return {
+            "valid": bool(matching),
+            "trade_direction": direction,
+            "matching_order_blocks": matching,
+            "count": len(matching)
+        }
+
+    # ---------------------------------------------------------
+    # ADAPTER-FRIENDLY POI OUTPUT
+    # ---------------------------------------------------------
+
+    def get_poi_evidence(
+        self,
+        analysis: Dict[str, Any],
+        trade_direction: str
+    ) -> Dict[str, Any]:
+
+        validation = self.validate_directional_order_block(
+            analysis,
+            trade_direction
+        )
+
+        blocks = validation["matching_order_blocks"]
+
+        if not blocks:
+            return {
+                "detected": False,
+                "direction": self._normal_direction(
+                    trade_direction
+                ),
+                "clean": False,
+                "unmitigated": False,
+                "lower": None,
+                "upper": None,
+                "confirmed": False
+            }
+
+        # Prefer the most recently formed qualifying block.
+        selected = max(
+            blocks,
+            key=lambda item: item["formation_index"]
+        )
+
+        return {
+            "detected": True,
+            "direction": selected["direction"],
+            "clean": selected["clean"],
+            "unmitigated": selected["unmitigated"],
+            "lower": selected["lower"],
+            "upper": selected["upper"],
+            "midpoint": selected["midpoint"],
+            "formation_index": selected["formation_index"],
+            "confirmed": True,
+            "order_block_id": selected["id"]
+        }
+
+    @staticmethod
+    def _normal_direction(value: str) -> Optional[str]:
+        value = str(value).strip().upper()
+
+        if value in {"BUY", "BULLISH", "LONG"}:
+            return "BUY"
+
+        if value in {"SELL", "BEARISH", "SHORT"}:
+            return "SELL"
+
+        return None
+
+    # ---------------------------------------------------------
+    # STATUS
+    # ---------------------------------------------------------
+
+    def get_last_result(self) -> Dict[str, Any]:
+        return dict(self.last_result)
+
+    def get_status(self) -> Dict[str, Any]:
         return {
             "component": "SMC_ORDER_BLOCK_ENGINE",
-            "status": "ACTIVE",
             "version": self.VERSION,
-            "lookback": self.lookback,
-            "minimum_displacement_ratio": (
-                self.minimum_displacement_ratio
-            ),
-            "total_analyses": self.total_analyses,
+            "status": "ACTIVE"
         }
 
 
