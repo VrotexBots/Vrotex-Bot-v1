@@ -1,254 +1,458 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Setup Validator
 
 Purpose:
-- Validate H1, M5 and M1 SMC evidence.
-- Check structure, POI, liquidity and displacement.
-- Check entry model and timeframe alignment.
+- Validate H1 -> M5 -> M1 setup requirements.
+- Check structure, liquidity, POI, FVG and displacement evidence.
+- Validate directional consistency.
 - Reject incomplete or contradictory setups.
-- Enforce the minimum A+ score of 85.
+- Keep setup validation separate from order execution.
 
-This module validates setups only.
-It does not execute trades or change strategy rules.
+Approved strategy:
+H1 = External narrative
+M5 = Confirmation
+M1 = Entry
+
+A+ score threshold is handled by the master SMC engine.
+This module does not execute trades.
 """
 
-from __future__ import annotations
-
-from typing import Any, Dict, List
-
-
-MINIMUM_A_PLUS_SCORE = 85
-
-CATEGORY_WEIGHTS = {
-    "structure": 20,
-    "poi": 15,
-    "liquidity": 15,
-    "entry_model": 20,
-    "timeframe_alignment": 15,
-    "fundamentals": 5,
-    "trade_quality_risk": 10,
-}
+from typing import Any, Dict, List, Optional
 
 
 class SMCSetupValidator:
+    VERSION = "2.0"
 
-    def __init__(
+    VALID_DIRECTIONS = {"BULLISH", "BEARISH"}
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        value = str(value or "").upper()
+
+        if value in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
+
+        if value in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    @staticmethod
+    def _is_confirmed(evidence: Any) -> bool:
+        if not isinstance(evidence, dict):
+            return False
+
+        return (
+            evidence.get("confirmed") is True
+            or evidence.get("valid") is True
+        )
+
+    def _validate_direction(
         self,
-        minimum_score: int = MINIMUM_A_PLUS_SCORE,
-    ):
-        if not 0 <= minimum_score <= 100:
-            raise ValueError("minimum_score must be between 0 and 100")
+        evidence: Any,
+        expected_direction: str,
+    ) -> bool:
+        if not isinstance(evidence, dict):
+            return False
 
-        self.minimum_score = minimum_score
+        direction = self._direction(
+            evidence.get("direction")
+        )
 
-    @staticmethod
-    def _valid_score(value: Any, field: str) -> float:
+        if direction is None:
+            return False
+
+        return direction == expected_direction
+
+    def _validate_h1(
+        self,
+        evidence: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        structure = evidence.get("structure", {})
+
+        if not isinstance(structure, dict):
+            structure = {}
+
+        h1_direction = self._direction(
+            evidence.get("direction")
+            or structure.get("bias")
+            or structure.get("direction")
+        )
+
+        valid = h1_direction == direction
+
+        return {
+            "valid": valid,
+            "direction": h1_direction,
+            "reason": (
+                "H1_DIRECTION_CONFIRMED"
+                if valid
+                else "H1_DIRECTION_MISSING_OR_CONFLICTING"
+            ),
+        }
+
+    def _validate_m5(
+        self,
+        evidence: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        breaks = evidence.get("breaks", [])
+
+        if not isinstance(breaks, list):
+            breaks = []
+
+        matching_breaks = []
+
+        for item in breaks:
+            if not isinstance(item, dict):
+                continue
+
+            break_direction = self._direction(
+                item.get("direction")
+            )
+
+            confirmation = str(
+                item.get("confirmation", "")
+            ).upper()
+
+            body_close = (
+                item.get("body_close_confirmed") is True
+                or confirmation == "BODY_CLOSE"
+            )
+
+            break_type = str(
+                item.get("type", "")
+            ).upper()
+
+            if (
+                break_direction == direction
+                and body_close
+                and break_type in (
+                    "CHOCH",
+                    "BOS",
+                    "BULLISH_BREAK",
+                    "BEARISH_BREAK",
+                )
+            ):
+                matching_breaks.append(item)
+
+        explicit = (
+            evidence.get("confirmed") is True
+            and self._direction(evidence.get("direction")) == direction
+            and evidence.get("body_close_confirmed") is True
+        )
+
+        valid = bool(matching_breaks) or explicit
+
+        return {
+            "valid": valid,
+            "matching_breaks": matching_breaks,
+            "reason": (
+                "M5_BODY_CLOSE_CONFIRMED"
+                if valid
+                else "M5_CONFIRMATION_NOT_CONFIRMED"
+            ),
+        }
+
+    def _validate_liquidity(
+        self,
+        evidence: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        sweeps = evidence.get(
+            "liquidity_sweeps",
+            evidence.get("sweeps", []),
+        )
+
+        if isinstance(sweeps, dict):
+            sweeps = [sweeps]
+
+        if not isinstance(sweeps, list):
+            sweeps = []
+
+        required_type = (
+            "SELL_SIDE_SWEEP"
+            if direction == "BULLISH"
+            else "BUY_SIDE_SWEEP"
+        )
+
+        matching = []
+
+        for sweep in sweeps:
+            if not isinstance(sweep, dict):
+                continue
+
+            sweep_type = str(
+                sweep.get("type", "")
+            ).upper()
+
+            confirmation = str(
+                sweep.get("confirmation", "")
+            ).upper()
+
+            if (
+                sweep_type == required_type
+                and confirmation == "WICK_THROUGH_CLOSE_BACK_INSIDE"
+            ):
+                matching.append(sweep)
+
+        return {
+            "valid": bool(matching),
+            "matching_sweeps": matching,
+            "reason": (
+                "DIRECTIONAL_LIQUIDITY_SWEEP_CONFIRMED"
+                if matching
+                else "REQUIRED_LIQUIDITY_SWEEP_MISSING"
+            ),
+        }
+
+    def _validate_zone(
+        self,
+        evidence: Any,
+        direction: str,
+        name: str,
+    ) -> Dict[str, Any]:
+        if not isinstance(evidence, dict):
+            return {
+                "valid": False,
+                "reason": f"{name}_EVIDENCE_MISSING",
+            }
+
+        zone_direction = self._direction(
+            evidence.get("direction")
+        )
+
+        clean = (
+            evidence.get("clean") is True
+            or evidence.get("unmitigated") is True
+        )
+
+        lower = evidence.get(
+            "lower",
+            evidence.get("low"),
+        )
+
+        upper = evidence.get(
+            "upper",
+            evidence.get("high"),
+        )
+
         try:
-            score = float(value)
+            lower = float(lower)
+            upper = float(upper)
+            valid_bounds = lower < upper
         except (TypeError, ValueError):
-            raise ValueError(f"Invalid score: {field}")
+            valid_bounds = False
 
-        if score != score or score in (
-            float("inf"),
-            float("-inf"),
-        ):
-            raise ValueError(f"Non-finite score: {field}")
+        valid = (
+            zone_direction == direction
+            and clean
+            and valid_bounds
+            and evidence.get("invalidated") is not True
+        )
 
-        if not 0 <= score <= 100:
-            raise ValueError(f"{field} must be between 0 and 100")
+        return {
+            "valid": valid,
+            "direction": zone_direction,
+            "clean": clean,
+            "valid_bounds": valid_bounds,
+            "reason": (
+                f"{name}_VALID"
+                if valid
+                else f"{name}_MISSING_DIRTY_OR_INVALID"
+            ),
+        }
 
-        return score
+    def _validate_displacement(
+        self,
+        evidence: Dict[str, Any],
+        direction: str,
+    ) -> Dict[str, Any]:
+        detected = evidence.get(
+            "latest_displacement",
+            evidence,
+        )
 
-    @staticmethod
-    def _direction(value: Any) -> str:
-        if not isinstance(value, str):
-            return "UNKNOWN"
+        if not isinstance(detected, dict):
+            detected = {}
 
-        value = value.strip().upper()
+        confirmed = (
+            detected.get("confirmed") is True
+            or detected.get("detected") is True
+        )
 
-        if value in ("BULLISH", "BEARISH"):
-            return value
+        displacement_direction = self._direction(
+            detected.get("direction")
+        )
 
-        return "UNKNOWN"
+        valid = (
+            confirmed
+            and displacement_direction == direction
+        )
 
-    @staticmethod
-    def _boolean(value: Any) -> bool:
-        return value is True
+        return {
+            "valid": valid,
+            "direction": displacement_direction,
+            "reason": (
+                "DIRECTIONAL_DISPLACEMENT_CONFIRMED"
+                if valid
+                else "DIRECTIONAL_DISPLACEMENT_MISSING"
+            ),
+        }
+
+    def _validate_entry(
+        self,
+        evidence: Any,
+        direction: str,
+    ) -> Dict[str, Any]:
+        if not isinstance(evidence, dict):
+            return {
+                "valid": False,
+                "reason": "ENTRY_MODEL_EVIDENCE_MISSING",
+            }
+
+        models = evidence.get(
+            "confirmed_models",
+            evidence.get("entry_models", []),
+        )
+
+        if isinstance(models, dict):
+            models = [models]
+
+        if not isinstance(models, list):
+            models = []
+
+        matching = []
+
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+
+            model_direction = self._direction(
+                model.get("direction")
+            )
+
+            if (
+                model.get("confirmed") is True
+                and model_direction == direction
+            ):
+                matching.append(model)
+
+        direct_confirmation = (
+            evidence.get("confirmed") is True
+            and self._direction(evidence.get("direction")) == direction
+        )
+
+        valid = bool(matching) or direct_confirmation
+
+        return {
+            "valid": valid,
+            "matching_models": matching,
+            "reason": (
+                "ENTRY_MODEL_CONFIRMED"
+                if valid
+                else "NO_DIRECTIONAL_ENTRY_MODEL_CONFIRMED"
+            ),
+        }
 
     def validate(
         self,
         evidence: Dict[str, Any],
+        direction: str,
     ) -> Dict[str, Any]:
-
         if not isinstance(evidence, dict):
-            raise ValueError("evidence must be a dictionary")
+            return self._error("INVALID_EVIDENCE_INPUT")
 
-        reasons: List[str] = []
-        category_scores: Dict[str, float] = {}
+        expected_direction = self._direction(direction)
 
-        scores = evidence.get("category_scores", {})
+        if expected_direction is None:
+            return self._error("INVALID_EXPECTED_DIRECTION")
 
-        if not isinstance(scores, dict):
-            raise ValueError("category_scores must be a dictionary")
+        h1 = evidence.get("H1", {})
+        m5 = evidence.get("M5", {})
 
-        for category, weight in CATEGORY_WEIGHTS.items():
+        if not isinstance(h1, dict):
+            h1 = {}
 
-            if category not in scores:
-                reasons.append(f"MISSING_SCORE_{category.upper()}")
-                category_scores[category] = 0.0
-                continue
-
-            raw_score = self._valid_score(
-                scores[category],
-                category,
-            )
-
-            category_scores[category] = (
-                raw_score * weight / 100.0
-            )
-
-        total_score = round(
-            sum(category_scores.values()),
-            2,
-        )
-
-        h1_direction = self._direction(
-            evidence.get("h1_direction")
-        )
-
-        m5_direction = self._direction(
-            evidence.get("m5_direction")
-        )
-
-        m1_direction = self._direction(
-            evidence.get("m1_direction")
-        )
-
-        if h1_direction == "UNKNOWN":
-            reasons.append("INVALID_H1_DIRECTION")
-
-        if m5_direction == "UNKNOWN":
-            reasons.append("INVALID_M5_DIRECTION")
-
-        if m1_direction == "UNKNOWN":
-            reasons.append("INVALID_M1_DIRECTION")
-
-        directions_aligned = (
-            h1_direction == m5_direction == m1_direction
-            and h1_direction in ("BULLISH", "BEARISH")
-        )
-
-        if not directions_aligned:
-            reasons.append("H1_M5_M1_NOT_ALIGNED")
-
-        structure_confirmed = self._boolean(
-            evidence.get("structure_confirmed")
-        )
-
-        body_close_confirmed = self._boolean(
-            evidence.get("body_close_confirmed")
-        )
-
-        clean_poi = self._boolean(
-            evidence.get("clean_unmitigated_poi")
-        )
-
-        liquidity_confirmed = self._boolean(
-            evidence.get("liquidity_confirmed")
-        )
-
-        displacement_confirmed = self._boolean(
-            evidence.get("displacement_confirmed")
-        )
-
-        fvg_confirmed = self._boolean(
-            evidence.get("fvg_confirmed")
-        )
-
-        entry_model_confirmed = self._boolean(
-            evidence.get("entry_model_confirmed")
-        )
-
-        spread_acceptable = self._boolean(
-            evidence.get("spread_acceptable")
-        )
-
-        risk_acceptable = self._boolean(
-            evidence.get("risk_acceptable")
-        )
-
-        fundamentals_checked = self._boolean(
-            evidence.get("fundamentals_checked")
-        )
+        if not isinstance(m5, dict):
+            m5 = {}
 
         checks = {
-            "structure_confirmed": structure_confirmed,
-            "body_close_confirmed": body_close_confirmed,
-            "clean_unmitigated_poi": clean_poi,
-            "liquidity_confirmed": liquidity_confirmed,
-            "displacement_confirmed": displacement_confirmed,
-            "fvg_confirmed": fvg_confirmed,
-            "entry_model_confirmed": entry_model_confirmed,
-            "spread_acceptable": spread_acceptable,
-            "risk_acceptable": risk_acceptable,
-            "fundamentals_checked": fundamentals_checked,
-            "directions_aligned": directions_aligned,
+            "h1_structure": self._validate_h1(
+                h1,
+                expected_direction,
+            ),
+            "m5_confirmation": self._validate_m5(
+                m5,
+                expected_direction,
+            ),
+            "liquidity": self._validate_liquidity(
+                evidence.get("liquidity", {}),
+                expected_direction,
+            ),
+            "poi": self._validate_zone(
+                evidence.get("poi"),
+                expected_direction,
+                "POI",
+            ),
+            "fvg": self._validate_zone(
+                evidence.get("fvg"),
+                expected_direction,
+                "FVG",
+            ),
+            "displacement": self._validate_displacement(
+                evidence.get("displacement", {}),
+                expected_direction,
+            ),
+            "entry_model": self._validate_entry(
+                evidence.get("entry"),
+                expected_direction,
+            ),
         }
 
-        mandatory_checks = (
-            "structure_confirmed",
-            "body_close_confirmed",
-            "clean_unmitigated_poi",
-            "liquidity_confirmed",
-            "displacement_confirmed",
-            "entry_model_confirmed",
-            "spread_acceptable",
-            "risk_acceptable",
-            "directions_aligned",
-        )
+        failed = [
+            name
+            for name, result in checks.items()
+            if not result["valid"]
+        ]
 
-        for check in mandatory_checks:
-            if not checks[check]:
-                reasons.append(f"FAILED_{check.upper()}")
-
-        if total_score < self.minimum_score:
-            reasons.append("A_PLUS_SCORE_BELOW_THRESHOLD")
-
-        approved = (
-            total_score >= self.minimum_score
-            and all(checks[item] for item in mandatory_checks)
-        )
-
-        if approved:
-            reasons.append("A_PLUS_SETUP_VALIDATED")
+        valid = not failed
 
         return {
-            "approved": approved,
             "status": (
-                "A_PLUS_VALIDATED"
-                if approved
-                else "REJECTED"
+                "SETUP_VALID"
+                if valid
+                else "SETUP_REJECTED"
             ),
-            "score": total_score,
-            "minimum_score": self.minimum_score,
-            "direction": (
-                h1_direction if approved else None
-            ),
-            "category_scores": category_scores,
+            "version": self.VERSION,
+            "valid": valid,
+            "confirmed": valid,
+            "direction": expected_direction,
             "checks": checks,
-            "reasons": reasons,
-            "strategy_timeframes": ["H1", "M5", "M1"],
+            "failed_checks": failed,
+            "passed_count": sum(
+                1 for item in checks.values()
+                if item["valid"]
+            ),
+            "total_checks": len(checks),
+            "execution_authorized": False,
+        }
+
+    @staticmethod
+    def _error(reason: str) -> Dict[str, Any]:
+        return {
+            "status": "ERROR",
+            "version": "2.0",
+            "valid": False,
+            "confirmed": False,
+            "reason": reason,
             "execution_authorized": False,
         }
 
 
-# Shared validator instance
 smc_setup_validator = SMCSetupValidator()
-
-
-def validate_smc_setup(
-    evidence: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    return smc_setup_validator.validate(evidence)
