@@ -1,5 +1,6 @@
 
 import os
+import math
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -40,24 +41,35 @@ class Settings:
     ORDER_EXECUTION_ENABLED: bool = True
 
     # ==================================================
+    # AUTOMATIC TRADING
+    # ==================================================
+
+    AUTO_TRADING_ENABLED: bool = True
+
+    # A+ setup threshold
+    MIN_SETUP_SCORE: int = int(
+        os.getenv("MIN_SETUP_SCORE", "85")
+    )
+
+    # ==================================================
     # EXNESS CREDENTIALS
     # ==================================================
 
     EXN_API_KEY: str = os.getenv(
         "EXN_API_KEY", ""
-    )
+    ).strip()
 
     EXN_PRIVATE_KEY: str = os.getenv(
         "EXN_PRIVATE_KEY", ""
-    )
+    ).strip()
 
     EXN_ACCOUNT_ID: str = os.getenv(
         "EXN_ACCOUNT_ID", ""
-    )
+    ).strip()
 
     EXN_GATEWAY_HOST: str = os.getenv(
         "EXN_GATEWAY_HOST", ""
-    )
+    ).strip()
 
     # ==================================================
     # APPROVED ACTIVE INSTRUMENTS
@@ -93,14 +105,6 @@ class Settings:
     )
 
     # ==================================================
-    # SETUP VALIDATION
-    # ==================================================
-
-    MIN_SETUP_SCORE: int = int(
-        os.getenv("MIN_SETUP_SCORE", "85")
-    )
-
-    # ==================================================
     # RISK MANAGEMENT
     # ==================================================
 
@@ -118,6 +122,14 @@ class Settings:
 
     MAX_DAILY_LOSS_PERCENT: float = float(
         os.getenv("MAX_DAILY_LOSS_PERCENT", "2.0")
+    )
+
+    # ==================================================
+    # SCANNER
+    # ==================================================
+
+    SCAN_INTERVAL_SECONDS: int = int(
+        os.getenv("SCAN_INTERVAL_SECONDS", "15")
     )
 
     # ==================================================
@@ -143,53 +155,90 @@ def validate_settings():
             "BOT_MODE must be DEMO or REAL."
         )
 
-    if not settings.ORDER_EXECUTION_ENABLED:
+    if settings.ORDER_EXECUTION_ENABLED is not True:
         raise RuntimeError(
             "Automatic order execution must be enabled."
         )
 
-    if not settings.INSTRUMENTS:
-        raise ValueError(
-            "No trading instruments configured."
+    if settings.AUTO_TRADING_ENABLED is not True:
+        raise RuntimeError(
+            "Automatic trading must be enabled."
         )
 
-    approved_instruments = {
+    # Exactly three approved instruments, without duplicates.
+    approved_instruments = (
         "EURUSD",
         "GBPUSD",
         "BTCUSD",
-    }
+    )
 
-    if set(settings.INSTRUMENTS) != approved_instruments:
+    if settings.INSTRUMENTS != approved_instruments:
         raise ValueError(
             "Vrotex Bot V1 must use exactly "
-            "EURUSD, GBPUSD and BTCUSD."
+            "EURUSD, GBPUSD and BTCUSD, without duplicates. "
+            "Check the INSTRUMENTS environment variable."
         )
 
-    if not 0 < settings.RISK_PERCENT <= 1:
+    # Strategy timeframe validation.
+    if settings.ANALYSIS_TIMEFRAMES != (
+        "H1",
+        "M5",
+        "M1",
+    ):
         raise ValueError(
-            "Risk must be greater than 0 and no more than 1%."
+            "Strategy timeframes must be H1, M5 and M1."
+        )
+
+    # Market data timeframe validation.
+    approved_data_timeframes = (
+        "D1",
+        "H4",
+        "H1",
+        "M30",
+        "M15",
+        "M5",
+        "M1",
+    )
+
+    if settings.DATA_TIMEFRAMES != approved_data_timeframes:
+        raise ValueError(
+            "Market data timeframes do not match V1."
+        )
+
+    # Exact approved risk settings.
+    if not math.isclose(settings.RISK_PERCENT, 1.0):
+        raise ValueError(
+            "Risk per trade must be exactly 1%."
         )
 
     if settings.MIN_SETUP_SCORE < 85:
         raise ValueError(
-            "Minimum setup score cannot be below 85."
+            "Minimum A+ setup score cannot be below 85."
         )
 
-    if settings.MAX_DAILY_TRADES < 1:
+    if settings.MAX_DAILY_TRADES != 5:
         raise ValueError(
-            "MAX_DAILY_TRADES must be at least 1."
+            "Maximum daily trades must be exactly 5."
         )
 
-    if settings.MAX_CONSECUTIVE_LOSSES < 1:
+    if settings.MAX_CONSECUTIVE_LOSSES != 2:
         raise ValueError(
-            "MAX_CONSECUTIVE_LOSSES must be at least 1."
+            "Maximum consecutive losses must be exactly 2."
         )
 
-    if settings.MAX_DAILY_LOSS_PERCENT <= 0:
+    if not math.isclose(
+        settings.MAX_DAILY_LOSS_PERCENT, 2.0
+    ):
         raise ValueError(
-            "Daily loss limit must be greater than zero."
+            "Maximum daily loss must be exactly 2%."
         )
 
+    if settings.SCAN_INTERVAL_SECONDS < 1:
+        raise ValueError(
+            "Scanner interval must be at least 1 second."
+        )
+
+    # REAL mode credential validation.
     if settings.BOT_MODE == "REAL":
 
         credentials = (
@@ -201,23 +250,19 @@ def validate_settings():
 
         if not all(credentials):
             raise ValueError(
-                "REAL mode requires all Exness credentials."
+                "REAL mode requires all four Exness credentials."
             )
 
-    print("=" * 45)
+    # Configuration report.
+    print("=" * 50)
     print("VROTEX BOT V1 CONFIGURATION")
-    print("=" * 45)
+    print("=" * 50)
 
     print(f"Mode: {settings.BOT_MODE}")
-    print(
-        f"Execution enabled: "
-        f"{settings.ORDER_EXECUTION_ENABLED}"
-    )
+    print(f"Execution enabled: {settings.ORDER_EXECUTION_ENABLED}")
+    print(f"Automatic trading: {settings.AUTO_TRADING_ENABLED}")
 
-    print(
-        f"Instruments: "
-        f"{', '.join(settings.INSTRUMENTS)}"
-    )
+    print(f"Instruments: {', '.join(settings.INSTRUMENTS)}")
 
     print(
         f"Strategy: "
@@ -225,32 +270,25 @@ def validate_settings():
     )
 
     print(
-        f"Minimum setup score: "
-        f"{settings.MIN_SETUP_SCORE}"
+        f"Data timeframes: "
+        f"{', '.join(settings.DATA_TIMEFRAMES)}"
     )
 
-    print(
-        f"Risk per trade: "
-        f"{settings.RISK_PERCENT}%"
-    )
-
-    print(
-        f"Maximum daily trades: "
-        f"{settings.MAX_DAILY_TRADES}"
-    )
-
+    print(f"Minimum A+ score: {settings.MIN_SETUP_SCORE}")
+    print(f"Risk per trade: {settings.RISK_PERCENT}%")
+    print(f"Maximum daily trades: {settings.MAX_DAILY_TRADES}")
     print(
         f"Maximum consecutive losses: "
         f"{settings.MAX_CONSECUTIVE_LOSSES}"
     )
-
     print(
         f"Maximum daily loss: "
         f"{settings.MAX_DAILY_LOSS_PERCENT}%"
     )
 
-    print("=" * 45)
-    print("Configuration validation successful.")
+    print("=" * 50)
+    print("CONFIGURATION VALIDATION SUCCESSFUL")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
