@@ -1,415 +1,137 @@
 
 """
 VROTEX BOT V1
-MASTER SMC INTEGRATION ENGINE
+Master Smart Money Concepts Engine
 
-Coordinates the SMC analysis modules.
+Flow:
+H1 external structure
+    -> M5 confirmation
+        -> M1 entry
+            -> Evidence validation
+                -> A+ decision
 
-Strategy:
-H1 = External structure and narrative
-M5 = Confirmation
-M1 = Entry
-
-Important:
-- Evidence collection only.
-- No broker orders.
-- No automatic execution authorization.
-- Missing or invalid evidence fails closed.
+This engine evaluates evidence only.
+It does not place orders or authorize execution.
 """
 
 from typing import Any, Dict, Optional
 
+from smc_integration_adapter import SMCIntegrationAdapter
+
 
 class SMCEngine:
 
-    REQUIRED_TIMEFRAMES = ("H1", "M5", "M1")
+    VERSION = "1.0"
+
+    A_PLUS_THRESHOLD = 85
+
+    CATEGORY_WEIGHTS = {
+        "structure": 20,
+        "poi": 15,
+        "liquidity": 15,
+        "entry_models": 20,
+        "timeframe_alignment": 15,
+        "fundamentals": 5,
+        "trade_quality_risk": 10
+    }
 
     def __init__(
         self,
-        structure_engine=None,
-        liquidity_engine=None,
-        range_engine=None,
-        protected_range_engine=None,
-        entry_model_engine=None,
-        confluence_engine=None,
-        evidence_aggregator=None,
-        setup_validator=None,
-        opposing_liquidity_engine=None,
+        adapter: Optional[SMCIntegrationAdapter] = None
     ):
-        self.structure_engine = structure_engine
-        self.liquidity_engine = liquidity_engine
-        self.range_engine = range_engine
-        self.protected_range_engine = protected_range_engine
-        self.entry_model_engine = entry_model_engine
-        self.confluence_engine = confluence_engine
-        self.evidence_aggregator = evidence_aggregator
-        self.setup_validator = setup_validator
-        self.opposing_liquidity_engine = opposing_liquidity_engine
+        self.adapter = adapter or SMCIntegrationAdapter()
+        self.last_analysis: Dict[str, Any] = {}
 
-        self.last_result: Dict[str, Any] = {}
-        self.analysis_count = 0
+    # ---------------------------------------------------------
+    # HELPERS
+    # ---------------------------------------------------------
 
     @staticmethod
-    def _direction(value: Any) -> str:
-        value = str(value or "").upper()
-
-        if value in ("BULLISH", "BEARISH"):
-            return value
-
-        return "NONE"
-
-    @staticmethod
-    def _valid_result(value: Any) -> bool:
-        return (
-            isinstance(value, dict)
-            and value.get("valid") is True
-        )
-
-    @staticmethod
-    def _safe_copy(value: Any) -> Dict[str, Any]:
+    def _dict(value: Any) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
 
-    def _validate_market_data(
-        self,
-        market_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        if not isinstance(market_data, dict):
-            return {
-                "valid": False,
-                "error": "INVALID_MARKET_DATA",
-            }
-
-        missing = []
-
-        for timeframe in self.REQUIRED_TIMEFRAMES:
-            candles = market_data.get(timeframe)
-
-            if not isinstance(candles, list) or len(candles) < 3:
-                missing.append(timeframe)
-
-        if missing:
-            return {
-                "valid": False,
-                "error": "MISSING_TIMEFRAME_DATA",
-                "missing_timeframes": missing,
-            }
-
-        return {
-            "valid": True,
-            "status": "MARKET_DATA_VALID",
-        }
-
-    def _run_module(
-        self,
-        module,
-        method_name: str,
-        *args,
-        **kwargs,
-    ) -> Dict[str, Any]:
-
-        if module is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-            }
-
-        method = getattr(module, method_name, None)
-
-        if not callable(method):
-            return {
-                "valid": False,
-                "status": "MODULE_METHOD_UNAVAILABLE",
-                "method": method_name,
-            }
-
+    @staticmethod
+    def _number(value: Any, default: float = 0.0) -> float:
         try:
-            result = method(*args, **kwargs)
-
-            if not isinstance(result, dict):
-                return {
-                    "valid": False,
-                    "status": "INVALID_MODULE_RESPONSE",
-                }
-
+            result = float(value)
             return result
+        except (TypeError, ValueError):
+            return default
 
-        except Exception as exc:
-            return {
-                "valid": False,
-                "status": "MODULE_ERROR",
-                "error": str(exc),
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        return SMCIntegrationAdapter.direction(value)
+
+    # ---------------------------------------------------------
+    # A+ SCORE
+    # ---------------------------------------------------------
+
+    def calculate_a_plus_score(
+        self,
+        category_scores: Any
+    ) -> Dict[str, Any]:
+
+        supplied = self._dict(category_scores)
+
+        scores = {}
+        weighted_total = 0.0
+        missing_categories = []
+
+        for category, weight in self.CATEGORY_WEIGHTS.items():
+
+            if category not in supplied:
+                score = 0.0
+                missing_categories.append(category)
+            else:
+                score = self._number(supplied[category])
+
+            score = max(0.0, min(100.0, score))
+
+            scores[category] = {
+                "score": score,
+                "weight": weight,
+                "weighted_score": score * weight / 100.0
             }
 
-    def analyse_timeframes(
-        self,
-        market_data: Dict[str, Any],
-        direction: Optional[str] = None,
-    ) -> Dict[str, Any]:
+            weighted_total += score * weight / 100.0
 
-        validation = self._validate_market_data(market_data)
-
-        if not validation["valid"]:
-            return validation
-
-        results = {}
-
-        # H1 external narrative.
-        results["H1"] = self._run_module(
-            self.structure_engine,
-            "analyse",
-            market_data["H1"],
-        )
-
-        # M5 confirmation.
-        results["M5"] = self._run_module(
-            self.structure_engine,
-            "analyse",
-            market_data["M5"],
-        )
-
-        # M1 entry structure.
-        results["M1"] = self._run_module(
-            self.structure_engine,
-            "analyse",
-            market_data["M1"],
-        )
-
-        for timeframe, result in results.items():
-            if not isinstance(result, dict):
-                return {
-                    "valid": False,
-                    "status": "TIMEFRAME_ANALYSIS_FAILED",
-                    "timeframe": timeframe,
-                }
+        total = round(weighted_total, 2)
 
         return {
-            "valid": True,
-            "status": "TIMEFRAME_ANALYSIS_COMPLETE",
-            "timeframes": results,
-        }
-
-    def evaluate_alignment(
-        self,
-        timeframe_results: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        directions = {}
-
-        for timeframe in self.REQUIRED_TIMEFRAMES:
-            result = self._safe_copy(
-                timeframe_results.get(timeframe)
-            )
-
-            directions[timeframe] = self._direction(
-                result.get("direction")
-            )
-
-        missing = [
-            timeframe
-            for timeframe, value in directions.items()
-            if value == "NONE"
-        ]
-
-        aligned = (
-            not missing
-            and len(set(directions.values())) == 1
-        )
-
-        return {
-            "valid": not missing,
-            "aligned": aligned,
-            "directions": directions,
-            "dominant_direction": (
-                next(iter(set(directions.values())))
-                if aligned else "NONE"
+            "score": total,
+            "threshold": self.A_PLUS_THRESHOLD,
+            "is_a_plus": (
+                total >= self.A_PLUS_THRESHOLD
+                and not missing_categories
             ),
-            "missing_directions": missing,
-            "confirmed": aligned,
+            "category_scores": scores,
+            "missing_categories": missing_categories
         }
 
-    def analyse_ranges(
+    # ---------------------------------------------------------
+    # STRUCTURE DIRECTION
+    # ---------------------------------------------------------
+
+    def determine_h1_direction(
         self,
-        market_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        h1_structure: Any
+    ) -> Optional[str]:
 
-        h1 = self._run_module(
-            self.range_engine,
-            "analyse",
-            market_data["H1"],
-            source="H1",
+        data = self._dict(h1_structure)
+        nested = self._dict(data.get("structure"))
+
+        direction = self._direction(
+            data.get("direction", nested.get("direction"))
         )
 
-        m5 = self._run_module(
-            self.range_engine,
-            "analyse",
-            market_data["M5"],
-            source="M5",
-        )
+        if direction not in {"BUY", "SELL"}:
+            return None
 
-        return {
-            "valid": h1.get("valid") is True and m5.get("valid") is True,
-            "H1": h1,
-            "M5": m5,
-        }
+        return direction
 
-    def analyse_protected_levels(
-        self,
-        market_data: Dict[str, Any],
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        if direction not in ("BULLISH", "BEARISH"):
-            return {
-                "valid": False,
-                "status": "DIRECTION_NOT_CONFIRMED",
-            }
-
-        h1 = self._run_module(
-            self.protected_range_engine,
-            "analyse",
-            market_data["H1"],
-            direction=direction,
-        )
-
-        m5 = self._run_module(
-            self.protected_range_engine,
-            "analyse",
-            market_data["M5"],
-            direction=direction,
-        )
-
-        return {
-            "valid": h1.get("valid") is True and m5.get("valid") is True,
-            "H1": h1,
-            "M5": m5,
-        }
-
-    def analyse_opposing_liquidity(
-        self,
-        market_data: Dict[str, Any],
-        direction: str,
-        current_price: float,
-    ) -> Dict[str, Any]:
-
-        if self.opposing_liquidity_engine is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-            }
-
-        return self._run_module(
-            self.opposing_liquidity_engine,
-            "analyse",
-            market_data["H1"],
-            direction=direction,
-            current_price=current_price,
-        )
-
-    def analyse_entry_models(
-        self,
-        direction: str,
-        entry_evidence: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        if self.entry_model_engine is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-            }
-
-        return self._run_module(
-            self.entry_model_engine,
-            "evaluate_all",
-            direction,
-            entry_evidence,
-        )
-
-    def run_confluence(
-        self,
-        h1: Dict[str, Any],
-        m5: Dict[str, Any],
-        m1: Dict[str, Any],
-        structure: Dict[str, Any],
-        liquidity: Dict[str, Any],
-        poi: Dict[str, Any],
-        displacement: Dict[str, Any],
-        fvg: Dict[str, Any],
-        entry_model: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        if self.confluence_engine is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-            }
-
-        return self._run_module(
-            self.confluence_engine,
-            "analyse",
-            h1=h1,
-            m5=m5,
-            m1=m1,
-            structure=structure,
-            liquidity=liquidity,
-            poi=poi,
-            displacement=displacement,
-            fvg=fvg,
-            entry_model=entry_model,
-        )
-
-    def aggregate_evidence(
-        self,
-        evidence: Dict[str, Any],
-    ) -> Dict[str, Any]:
-
-        if self.evidence_aggregator is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-            }
-
-        return self._run_module(
-            self.evidence_aggregator,
-            "aggregate",
-            evidence,
-        )
-
-    def validate_setup(
-        self,
-        aggregated_evidence: Dict[str, Any],
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        if self.setup_validator is None:
-            return {
-                "valid": False,
-                "status": "MODULE_NOT_CONNECTED",
-                "execution_authorized": False,
-            }
-
-        if not aggregated_evidence.get("valid"):
-            return {
-                "valid": False,
-                "status": "AGGREGATED_EVIDENCE_INVALID",
-                "execution_authorized": False,
-            }
-
-        category_scores = aggregated_evidence.get(
-            "category_scores", {}
-        )
-
-        checks = aggregated_evidence.get(
-            "checks", {}
-        )
-
-        return self._run_module(
-            self.setup_validator,
-            "validate",
-            direction=direction,
-            category_scores=category_scores,
-            checks=checks,
-        )
+    # ---------------------------------------------------------
+    # MAIN ANALYSIS
+    # ---------------------------------------------------------
 
     def analyse(
         self,
@@ -420,175 +142,144 @@ class SMCEngine:
         displacement_evidence: Dict[str, Any],
         fvg_evidence: Dict[str, Any],
         risk_checks: Dict[str, Any],
+        category_scores: Optional[Dict[str, Any]] = None,
+        fundamentals: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
 
-        self.analysis_count += 1
+        market_data = self._dict(market_data)
+        entry_evidence = self._dict(entry_evidence)
+        poi_evidence = self._dict(poi_evidence)
+        displacement_evidence = self._dict(displacement_evidence)
+        fvg_evidence = self._dict(fvg_evidence)
+        risk_checks = self._dict(risk_checks)
 
-        validation = self._validate_market_data(
-            market_data
+        h1 = self._dict(market_data.get("H1"))
+        m5 = self._dict(market_data.get("M5"))
+        m1 = self._dict(market_data.get("M1"))
+
+        # H1 determines the intended trade direction.
+        direction = self.determine_h1_direction(h1)
+
+        if direction is None:
+            return self._reject(
+                "H1_DIRECTION_NOT_CONFIRMED",
+                current_price
+            )
+
+        # The lower timeframes must support the H1 direction.
+        liquidity = self._dict(
+            market_data.get("liquidity")
         )
 
-        if not validation["valid"]:
-            return self._finish_failure(validation)
-
-        timeframe_analysis = self.analyse_timeframes(
-            market_data
-        )
-
-        if not timeframe_analysis.get("valid"):
-            return self._finish_failure(timeframe_analysis)
-
-        timeframe_results = timeframe_analysis["timeframes"]
-
-        alignment = self.evaluate_alignment(
-            timeframe_results
-        )
-
-        if not alignment["aligned"]:
-            return self._finish_failure({
-                "valid": False,
-                "status": "TIMEFRAMES_NOT_ALIGNED",
-                "alignment": alignment,
-            })
-
-        direction = alignment["dominant_direction"]
-
-        ranges = self.analyse_ranges(market_data)
-
-        if not ranges["valid"]:
-            return self._finish_failure({
-                "valid": False,
-                "status": "RANGE_ANALYSIS_FAILED",
-                "ranges": ranges,
-            })
-
-        protected = self.analyse_protected_levels(
-            market_data,
-            direction,
-        )
-
-        if not protected["valid"]:
-            return self._finish_failure({
-                "valid": False,
-                "status": "PROTECTED_LEVEL_ANALYSIS_FAILED",
-                "protected_levels": protected,
-            })
-
-        opposing = self.analyse_opposing_liquidity(
-            market_data,
-            direction,
-            current_price,
-        )
-
-        entry_models = self.analyse_entry_models(
-            direction,
-            entry_evidence,
-        )
-
-        if not entry_models.get("valid"):
-            return self._finish_failure({
-                "valid": False,
-                "status": "ENTRY_MODEL_ANALYSIS_FAILED",
-                "entry_models": entry_models,
-            })
-
-        if not entry_models.get("entry_model_confirmed"):
-            return self._finish_failure({
-                "valid": False,
-                "status": "NO_ENTRY_MODEL_CONFIRMED",
-                "entry_models": entry_models,
-            })
-
-        structure = {
-            "direction": direction,
-            "H1": timeframe_results["H1"],
-            "M5": timeframe_results["M5"],
-            "M1": timeframe_results["M1"],
-            "alignment": alignment,
+        structure_evidence = {
+            "H1": h1,
+            "M5": m5,
+            "M1": m1
         }
 
-        liquidity = {
-            "opposing_target": opposing,
-            "evidence": entry_evidence.get("sweep", {}),
-        }
-
-        evidence = {
-            "h1": timeframe_results["H1"],
-            "m5": timeframe_results["M5"],
-            "m1": timeframe_results["M1"],
-            "structure": structure,
-            "liquidity": liquidity,
-            "poi": poi_evidence,
-            "displacement": displacement_evidence,
-            "fvg": fvg_evidence,
-            "entry_model": entry_models,
-            "risk_checks": risk_checks,
-            "ranges": ranges,
-            "protected_levels": protected,
-        }
-
-        aggregated = self.aggregate_evidence(evidence)
-
-        if not aggregated.get("valid"):
-            return self._finish_failure({
-                "valid": False,
-                "status": "EVIDENCE_AGGREGATION_FAILED",
-                "aggregation": aggregated,
-            })
-
-        validation_result = self.validate_setup(
-            aggregated,
-            direction,
+        evidence = self.adapter.build_evidence(
+            trade_direction=direction,
+            h1_structure=structure_evidence["H1"],
+            m5_structure=structure_evidence["M5"],
+            m1_structure=structure_evidence["M1"],
+            liquidity=liquidity,
+            fvg=fvg_evidence,
+            poi=poi_evidence,
+            displacement=displacement_evidence,
+            entry_models=entry_evidence,
+            risk_checks=risk_checks
         )
 
-        passed = (
-            validation_result.get("valid") is True
-            and validation_result.get("approved") is True
+        # Evidence failure always rejects the setup.
+        if not evidence.get("valid", False):
+            result = {
+                "status": "REJECTED",
+                "reason": "SMC_EVIDENCE_INCOMPLETE",
+                "direction": direction,
+                "current_price": current_price,
+                "evidence": evidence,
+                "a_plus": None,
+                "execution_authorized": False
+            }
+
+            self.last_analysis = result
+            return result
+
+        # Calculate the weighted A+ score.
+        score_result = self.calculate_a_plus_score(
+            category_scores or {}
         )
+
+        if not score_result["is_a_plus"]:
+            result = {
+                "status": "REJECTED",
+                "reason": "A_PLUS_THRESHOLD_NOT_MET",
+                "direction": direction,
+                "current_price": current_price,
+                "evidence": evidence,
+                "a_plus": score_result,
+                "execution_authorized": False
+            }
+
+            self.last_analysis = result
+            return result
 
         result = {
-            "valid": True,
-            "status": (
-                "SMC_SETUP_APPROVED"
-                if passed else "SMC_SETUP_REJECTED"
-            ),
+            "status": "A_PLUS_SETUP",
+            "reason": "ALL_REQUIRED_CHECKS_PASSED",
             "direction": direction,
-            "timeframe_alignment": alignment,
-            "ranges": ranges,
-            "protected_levels": protected,
-            "opposing_liquidity": opposing,
-            "entry_models": entry_models,
-            "aggregated_evidence": aggregated,
-            "validation": validation_result,
-            "execution_authorized": False,
+            "current_price": current_price,
+            "evidence": evidence,
+            "a_plus": score_result,
+            "execution_authorized": False
         }
 
-        self.last_result = result
+        self.last_analysis = result
         return result
 
-    def _finish_failure(
+    # ---------------------------------------------------------
+    # REJECTION
+    # ---------------------------------------------------------
+
+    def _reject(
         self,
-        failure: Dict[str, Any],
+        reason: str,
+        current_price: float
     ) -> Dict[str, Any]:
 
         result = {
-            **failure,
-            "execution_authorized": False,
+            "status": "REJECTED",
+            "reason": reason,
+            "direction": None,
+            "current_price": current_price,
+            "evidence": None,
+            "a_plus": None,
+            "execution_authorized": False
         }
 
-        self.last_result = result
+        self.last_analysis = result
         return result
+
+    # ---------------------------------------------------------
+    # STATUS
+    # ---------------------------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
+
         return {
-            "module": "SMCEngine",
-            "analysis_count": self.analysis_count,
-            "required_timeframes": list(
-                self.REQUIRED_TIMEFRAMES
-            ),
+            "engine": "Vrotex SMC Engine",
+            "version": self.VERSION,
+            "strategy_timeframes": ["H1", "M5", "M1"],
+            "a_plus_threshold": self.A_PLUS_THRESHOLD,
+            "category_weights": dict(self.CATEGORY_WEIGHTS),
             "execution_authorized": False,
-            "last_result": self.last_result,
+            "last_status": self.last_analysis.get(
+                "status", "NOT_ANALYSED"
+            )
         }
+
+    def get_last_analysis(self) -> Dict[str, Any]:
+        return dict(self.last_analysis)
 
 
 smc_engine = SMCEngine()
