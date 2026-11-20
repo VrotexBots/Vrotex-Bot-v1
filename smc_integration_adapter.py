@@ -2,15 +2,19 @@
 """
 VROTEX BOT V1
 SMC Integration Adapter
+Version 2.0
 
-Purpose:
-- Normalize outputs from individual SMC engines.
-- Keep trade direction separate from liquidity sweep direction.
-- Validate H1 -> M5 -> M1 alignment.
-- Produce a consistent evidence contract for the master SMC engine.
-- Fail closed when required evidence is missing.
+Connects the individual SMC engines to the master SMC engine.
 
-This module does not authorize order execution.
+Approved strategy:
+H1 = external directional narrative
+M5 = confirmation
+M1 = entry trigger
+
+BOS and CHoCH require full candle-body close confirmation.
+Wick-only movement is never a confirmed structure break.
+
+Execution authorization is always disabled here.
 """
 
 from typing import Any, Dict, Optional
@@ -18,11 +22,13 @@ from typing import Any, Dict, Optional
 
 class SMCIntegrationAdapter:
 
+    VERSION = "2.0"
+
     BUY = "BUY"
     SELL = "SELL"
 
     def __init__(self):
-        self.last_result = {}
+        self.last_result: Dict[str, Any] = {}
 
     # ---------------------------------------------------------
     # GENERAL HELPERS
@@ -31,6 +37,10 @@ class SMCIntegrationAdapter:
     @staticmethod
     def _dict(value: Any) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _list(value: Any) -> list:
+        return value if isinstance(value, list) else []
 
     @staticmethod
     def _bool(value: Any) -> bool:
@@ -89,91 +99,164 @@ class SMCIntegrationAdapter:
     def normalize_structure(
         self,
         raw: Any,
-        timeframe: str
+        timeframe: str,
+        expected_direction: Optional[str] = None
     ) -> Dict[str, Any]:
 
         data = self._dict(raw)
-        structure = self._dict(
-            self._first(data, "structure", "result", default={})
-        )
+        structure = self._dict(data.get("structure"))
 
-        trade_direction = self.direction(
-            self._first(
-                data,
+        expected_direction = self.direction(expected_direction)
+
+        raw_direction = self._first(
+            data,
+            "direction",
+            "bias",
+            default=self._first(
+                structure,
                 "direction",
-                default=self._first(structure, "direction")
+                "bias"
             )
         )
 
-        event = str(
+        if raw_direction is None:
+            raw_direction = structure.get("bias")
+
+        actual_direction = self.direction(raw_direction)
+
+        # The original structure engine stores events in "breaks".
+        raw_breaks = self._list(data.get("breaks"))
+
+        # Also support direct event fields from other SMC modules.
+        direct_event = str(
             self._first(
                 data,
                 "event",
                 "structure_event",
-                default=self._first(
-                    structure, "event", "structure_event", default=""
-                )
+                default=""
             )
         ).upper()
 
-        bos = self._bool(
-            self._first(
-                data,
-                "bos",
-                "bos_confirmed",
-                default=self._first(
-                    structure, "bos", "bos_confirmed", default=False
+        if direct_event in {"BOS", "CHOCH"}:
+            raw_breaks.append({
+                "type": direct_event,
+                "direction": data.get("direction"),
+                "confirmation": self._first(
+                    data,
+                    "confirmation",
+                    "body_close_confirmation"
+                )
+            })
+
+        confirmed_breaks = []
+
+        for event in raw_breaks:
+            event_data = self._dict(event)
+
+            event_type = str(
+                event_data.get("type", "")
+            ).upper()
+
+            event_direction = self.direction(
+                event_data.get("direction")
+            )
+
+            confirmation = str(
+                event_data.get("confirmation", "")
+            ).upper()
+
+            body_close = (
+                confirmation in {
+                    "BODY_CLOSE",
+                    "FULL_BODY_CLOSE",
+                    "BODY_CLOSE_CONFIRMED"
+                }
+                or event_data.get(
+                    "body_close_confirmed"
+                ) is True
+            )
+
+            valid_event = (
+                event_type in {"BOS", "CHOCH"}
+                and event_direction is not None
+                and body_close
+            )
+
+            if valid_event:
+                confirmed_breaks.append({
+                    "type": event_type,
+                    "direction": event_direction,
+                    "body_close_confirmed": True,
+                    "level": event_data.get("level"),
+                    "candle_index": event_data.get(
+                        "candle_index"
+                    )
+                })
+
+        matching_breaks = [
+            event for event in confirmed_breaks
+            if (
+                expected_direction is None
+                or event["direction"] == expected_direction
+            )
+        ]
+
+        # H1 directional narrative may be established by HH/HL
+        # or LH/LL structure without a new break on the last candle.
+        if timeframe == "H1":
+            bullish_structure = (
+                actual_direction == "BUY"
+                or (
+                    actual_direction is None
+                    and structure.get("bias") == "BULLISH"
                 )
             )
-        )
 
-        choch = self._bool(
-            self._first(
-                data,
-                "choch",
-                "choch_confirmed",
-                default=self._first(
-                    structure, "choch", "choch_confirmed", default=False
+            bearish_structure = (
+                actual_direction == "SELL"
+                or (
+                    actual_direction is None
+                    and structure.get("bias") == "BEARISH"
                 )
             )
-        )
 
-        if event == "BOS":
-            bos = True
-        elif event in {"CHOCH", "CHoCH"}:
-            choch = True
+            if expected_direction == "BUY":
+                confirmed = bullish_structure
 
-        body_close = self._bool(
-            self._first(
-                data,
-                "body_close_confirmed",
-                "full_body_close",
-                "close_confirmed",
-                default=self._first(
-                    structure,
-                    "body_close_confirmed",
-                    "full_body_close",
-                    "close_confirmed",
-                    default=False
+            elif expected_direction == "SELL":
+                confirmed = bearish_structure
+
+            else:
+                confirmed = (
+                    bullish_structure or bearish_structure
                 )
-            )
-        )
 
-        confirmed = bool(
-            trade_direction
-            and body_close
-            and (bos or choch)
-        )
+        # M5 needs a confirmed directional structure event.
+        elif timeframe == "M5":
+            confirmed = bool(matching_breaks)
+
+        # M1 is an entry timeframe. Its structure event is useful
+        # evidence but is not required here when a separately
+        # validated M1 entry model supplies the trigger.
+        elif timeframe == "M1":
+            confirmed = (
+                actual_direction == expected_direction
+                if actual_direction and expected_direction
+                else bool(matching_breaks)
+            )
+
+        else:
+            confirmed = bool(matching_breaks)
 
         return {
             "timeframe": timeframe,
-            "direction": trade_direction,
-            "event": "CHOCH" if choch else "BOS" if bos else None,
-            "bos": bos,
-            "choch": choch,
-            "body_close_confirmed": body_close,
-            "confirmed": confirmed,
-            "valid": confirmed,
+            "direction": actual_direction,
+            "expected_direction": expected_direction,
+            "bias": structure.get("bias"),
+            "confirmed_breaks": confirmed_breaks,
+            "matching_breaks": matching_breaks,
+            "confirmed": bool(confirmed),
+            "valid": bool(confirmed),
             "raw": data
         }
 
@@ -190,100 +273,76 @@ class SMCIntegrationAdapter:
         data = self._dict(raw)
         trade_direction = self.direction(trade_direction)
 
-        detected = self._bool(
-            self._first(
-                data,
-                "detected",
-                "sweep_detected",
-                "swept",
-                "confirmed",
-                default=False
-            )
+        raw_sweeps = self._list(
+            data.get("liquidity_sweeps")
         )
 
-        sweep_direction = self.direction(
-            self._first(
-                data,
-                "sweep_direction",
-                "direction",
-                "liquidity_direction"
-            )
-        )
+        if not raw_sweeps and data:
+            raw_sweeps = [data]
 
-        side = str(
-            self._first(
-                data,
-                "side",
-                "liquidity_side",
-                "target_side",
-                default=""
-            )
-        ).upper()
-
-        if not sweep_direction:
-            if side in {"SELL_SIDE", "SSL", "LOW", "LOWS"}:
-                sweep_direction = "SELL"
-            elif side in {"BUY_SIDE", "BSL", "HIGH", "HIGHS"}:
-                sweep_direction = "BUY"
-
-        wick_sweep = self._bool(
-            self._first(
-                data,
-                "wick_sweep",
-                "wick_beyond_level",
-                "sweep_confirmed",
-                default=detected
-            )
-        )
-
-        close_back_inside = self._bool(
-            self._first(
-                data,
-                "close_back_inside",
-                "rejection_close",
-                "closed_back_inside",
-                default=False
-            )
-        )
-
-        # A bullish setup generally needs a sell-side sweep.
-        # A bearish setup generally needs a buy-side sweep.
         expected_sweep = (
             "SELL" if trade_direction == "BUY"
             else "BUY" if trade_direction == "SELL"
             else None
         )
 
-        correct_sweep_side = bool(
-            expected_sweep
-            and sweep_direction == expected_sweep
-        )
+        valid_sweeps = []
 
-        confirmed = bool(
-            detected
-            and wick_sweep
-            and correct_sweep_side
-            and close_back_inside
-        )
+        for item in raw_sweeps:
+            sweep = self._dict(item)
+
+            sweep_type = str(
+                sweep.get("type", "")
+            ).upper()
+
+            if sweep_type == "SELL_SIDE_SWEEP":
+                sweep_direction = "SELL"
+
+            elif sweep_type == "BUY_SIDE_SWEEP":
+                sweep_direction = "BUY"
+
+            else:
+                sweep_direction = self.direction(
+                    self._first(
+                        sweep,
+                        "sweep_direction",
+                        "direction"
+                    )
+                )
+
+            confirmation = str(
+                sweep.get("confirmation", "")
+            ).upper()
+
+            close_back_inside = (
+                confirmation in {
+                    "WICK_THROUGH_CLOSE_BACK_INSIDE",
+                    "CLOSE_BACK_INSIDE"
+                }
+                or sweep.get("close_back_inside") is True
+            )
+
+            if (
+                sweep_direction == expected_sweep
+                and close_back_inside
+            ):
+                valid_sweeps.append({
+                    "type": sweep_type,
+                    "sweep_direction": sweep_direction,
+                    "level": sweep.get("level"),
+                    "candle_index": sweep.get("candle_index"),
+                    "close_back_inside": True
+                })
+
+        confirmed = bool(valid_sweeps)
 
         return {
             "trade_direction": trade_direction,
-            "sweep_direction": sweep_direction,
             "expected_sweep_direction": expected_sweep,
-            "side": side or (
-                "SELL_SIDE" if sweep_direction == "SELL"
-                else "BUY_SIDE" if sweep_direction == "BUY"
-                else None
-            ),
-            "detected": detected,
-            "wick_sweep": wick_sweep,
-            "close_back_inside": close_back_inside,
-            "correct_sweep_side": correct_sweep_side,
+            "detected": bool(raw_sweeps),
             "confirmed": confirmed,
             "valid": confirmed,
-            "target": self._first(
-                data, "target", "level", "price_level"
-            ),
+            "sweeps": valid_sweeps,
             "raw": data
         }
 
@@ -298,22 +357,32 @@ class SMCIntegrationAdapter:
     ) -> Dict[str, Any]:
 
         data = self._dict(raw)
-
         expected_direction = self.direction(expected_direction)
+
         fvg_direction = self.direction(
             self._first(data, "direction", "bias")
         )
 
         detected = self._bool(
-            self._first(data, "detected", "fvg_detected", default=False)
+            self._first(
+                data,
+                "detected",
+                "fvg_detected",
+                default=False
+            )
         )
 
         valid = self._bool(
-            self._first(data, "valid", "confirmed", default=False)
+            self._first(
+                data,
+                "valid",
+                "confirmed",
+                default=False
+            )
         )
 
         mitigated = self._bool(
-            self._first(data, "mitigated", default=False)
+            data.get("mitigated", False)
         )
 
         clean = self._bool(
@@ -327,15 +396,16 @@ class SMCIntegrationAdapter:
 
         zone_valid = self._valid_zone(data)
 
-        direction_aligned = bool(
-            expected_direction
-            and fvg_direction == expected_direction
+        direction_aligned = (
+            fvg_direction == expected_direction
+            and expected_direction is not None
         )
 
         confirmed = bool(
             detected
             and valid
             and clean
+            and not mitigated
             and zone_valid
             and direction_aligned
         )
@@ -345,12 +415,16 @@ class SMCIntegrationAdapter:
             "expected_direction": expected_direction,
             "detected": detected,
             "valid": valid,
-            "mitigated": mitigated,
             "clean": clean,
+            "mitigated": mitigated,
             "zone_valid": zone_valid,
             "direction_aligned": direction_aligned,
-            "lower": self._first(data, "lower", "bottom", "low"),
-            "upper": self._first(data, "upper", "top", "high"),
+            "lower": self._first(
+                data, "lower", "bottom", "low"
+            ),
+            "upper": self._first(
+                data, "upper", "top", "high"
+            ),
             "confirmed": confirmed,
             "valid_for_setup": confirmed,
             "raw": data
@@ -374,11 +448,21 @@ class SMCIntegrationAdapter:
         )
 
         detected = self._bool(
-            self._first(data, "detected", "valid", default=False)
+            self._first(
+                data,
+                "detected",
+                "valid",
+                default=False
+            )
         )
 
         clean = self._bool(
-            self._first(data, "clean", "valid_zone", default=False)
+            self._first(
+                data,
+                "clean",
+                "valid_zone",
+                default=False
+            )
         )
 
         unmitigated = self._bool(
@@ -392,9 +476,9 @@ class SMCIntegrationAdapter:
 
         zone_valid = self._valid_zone(data)
 
-        direction_aligned = bool(
-            expected_direction
-            and poi_direction == expected_direction
+        direction_aligned = (
+            poi_direction == expected_direction
+            and expected_direction is not None
         )
 
         confirmed = bool(
@@ -413,8 +497,12 @@ class SMCIntegrationAdapter:
             "unmitigated": unmitigated,
             "zone_valid": zone_valid,
             "direction_aligned": direction_aligned,
-            "lower": self._first(data, "lower", "bottom", "low"),
-            "upper": self._first(data, "upper", "top", "high"),
+            "lower": self._first(
+                data, "lower", "bottom", "low"
+            ),
+            "upper": self._first(
+                data, "upper", "top", "high"
+            ),
             "confirmed": confirmed,
             "valid_for_setup": confirmed,
             "raw": data
@@ -441,7 +529,6 @@ class SMCIntegrationAdapter:
             self._first(
                 data,
                 "detected",
-                "confirmed",
                 "displacement_detected",
                 default=False
             )
@@ -456,13 +543,13 @@ class SMCIntegrationAdapter:
             )
         )
 
-        direction_aligned = bool(
-            expected_direction
-            and displacement_direction == expected_direction
+        aligned = (
+            displacement_direction == expected_direction
+            and expected_direction is not None
         )
 
         confirmed = bool(
-            detected and body_close and direction_aligned
+            detected and body_close and aligned
         )
 
         return {
@@ -470,7 +557,7 @@ class SMCIntegrationAdapter:
             "expected_direction": expected_direction,
             "detected": detected,
             "body_close_confirmed": body_close,
-            "direction_aligned": direction_aligned,
+            "direction_aligned": aligned,
             "confirmed": confirmed,
             "raw": data
         }
@@ -496,64 +583,37 @@ class SMCIntegrationAdapter:
             default=[]
         )
 
-        if not isinstance(models, list):
-            models = []
-
+        models = self._list(models)
         confirmed_models = []
 
         for model in models:
             if isinstance(model, str):
-                confirmed_models.append({
-                    "name": model,
-                    "direction": expected_direction,
-                    "confirmed": True
-                })
+                # A string alone is not proof of confirmation.
                 continue
 
-            model_data = self._dict(model)
+            item = self._dict(model)
 
             model_direction = self.direction(
-                self._first(model_data, "direction", "bias")
+                self._first(item, "direction", "bias")
             )
 
-            confirmed = self._bool(
-                self._first(
-                    model_data,
-                    "confirmed",
-                    "valid",
-                    default=False
-                )
+            model_confirmed = self._bool(
+                item.get("confirmed", False)
             )
 
             if (
-                confirmed
+                model_confirmed
                 and model_direction == expected_direction
             ):
                 confirmed_models.append({
                     "name": self._first(
-                        model_data, "name", "model", "type"
+                        item, "name", "model", "type"
                     ),
                     "direction": model_direction,
                     "confirmed": True
                 })
 
-        top_level_confirmed = self._bool(
-            self._first(
-                data,
-                "entry_model_confirmed",
-                "confirmed",
-                default=False
-            )
-        )
-
-        confirmed = bool(
-            confirmed_models or (
-                top_level_confirmed
-                and self.direction(
-                    self._first(data, "direction", "bias")
-                ) == expected_direction
-            )
-        )
+        confirmed = bool(confirmed_models)
 
         return {
             "direction": expected_direction,
@@ -567,32 +627,31 @@ class SMCIntegrationAdapter:
     # RISK CHECK NORMALIZATION
     # ---------------------------------------------------------
 
-    def normalize_risk_checks(self, raw: Any) -> Dict[str, Any]:
+    def normalize_risk_checks(
+        self,
+        raw: Any
+    ) -> Dict[str, Any]:
 
         data = self._dict(raw)
 
         checks = {
             "spread_valid": self._bool(
-                self._first(data, "spread_valid", default=False)
+                data.get("spread_valid")
             ),
             "stop_loss_valid": self._bool(
-                self._first(data, "stop_loss_valid", default=False)
+                data.get("stop_loss_valid")
             ),
             "risk_within_limit": self._bool(
-                self._first(data, "risk_within_limit", default=False)
+                data.get("risk_within_limit")
             ),
             "daily_limit_valid": self._bool(
-                self._first(data, "daily_limit_valid", default=False)
+                data.get("daily_limit_valid")
             ),
             "consecutive_loss_limit_valid": self._bool(
-                self._first(
-                    data,
-                    "consecutive_loss_limit_valid",
-                    default=False
-                )
+                data.get("consecutive_loss_limit_valid")
             ),
             "reward_risk_valid": self._bool(
-                self._first(data, "reward_risk_valid", default=False)
+                data.get("reward_risk_valid")
             )
         }
 
@@ -628,19 +687,33 @@ class SMCIntegrationAdapter:
                 "execution_authorized": False,
                 "reason": "INVALID_TRADE_DIRECTION"
             }
+
             self.last_result = result
             return result
 
-        h1 = self.normalize_structure(h1_structure, "H1")
-        m5 = self.normalize_structure(m5_structure, "M5")
-        m1 = self.normalize_structure(m1_structure, "M1")
+        h1 = self.normalize_structure(
+            h1_structure, "H1", direction
+        )
+
+        m5 = self.normalize_structure(
+            m5_structure, "M5", direction
+        )
+
+        m1 = self.normalize_structure(
+            m1_structure, "M1", direction
+        )
 
         liquidity_result = self.normalize_liquidity(
             liquidity, direction
         )
 
-        fvg_result = self.normalize_fvg(fvg, direction)
-        poi_result = self.normalize_poi(poi, direction)
+        fvg_result = self.normalize_fvg(
+            fvg, direction
+        )
+
+        poi_result = self.normalize_poi(
+            poi, direction
+        )
 
         displacement_result = self.normalize_displacement(
             displacement, direction
@@ -650,19 +723,24 @@ class SMCIntegrationAdapter:
             entry_models, direction
         )
 
-        risk_result = self.normalize_risk_checks(risk_checks)
+        risk_result = self.normalize_risk_checks(
+            risk_checks
+        )
 
-        structure_aligned = all(
-            item["confirmed"]
-            and item["direction"] == direction
-            for item in (h1, m5, m1)
+        structure_aligned = bool(
+            h1["confirmed"]
+            and h1["direction"] == direction
+            and m5["confirmed"]
+            and m5["matching_breaks"]
+            and m1["confirmed"]
+            and m1["direction"] in {None, direction}
         )
 
         required_checks = {
-            "h1_structure": h1["confirmed"],
-            "m5_structure": m5["confirmed"],
-            "m1_structure": m1["confirmed"],
-            "structure_direction_alignment": structure_aligned,
+            "h1_directional_narrative": h1["confirmed"],
+            "m5_confirmed_structure": m5["confirmed"],
+            "m1_entry_structure": m1["confirmed"],
+            "timeframe_alignment": structure_aligned,
             "correct_liquidity_sweep": liquidity_result["confirmed"],
             "clean_directional_fvg": fvg_result["confirmed"],
             "clean_unmitigated_poi": poi_result["confirmed"],
@@ -700,8 +778,20 @@ class SMCIntegrationAdapter:
         self.last_result = result
         return result
 
+    # ---------------------------------------------------------
+    # STATUS
+    # ---------------------------------------------------------
+
     def get_last_result(self) -> Dict[str, Any]:
         return dict(self.last_result)
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "component": "SMC_INTEGRATION_ADAPTER",
+            "version": self.VERSION,
+            "status": "ACTIVE",
+            "execution_authorized": False
+        }
 
 
 smc_integration_adapter = SMCIntegrationAdapter()
