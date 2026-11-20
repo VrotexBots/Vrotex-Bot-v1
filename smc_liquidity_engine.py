@@ -1,401 +1,556 @@
 
 """
-Vrotex Bot V1 - SMC Liquidity Engine
+VROTEX BOT V1
+SMC Liquidity Engine
+Version 2.0
 
-Detects:
-- Buy-side liquidity (BSL)
-- Sell-side liquidity (SSL)
-- Equal highs and equal lows
-- Previous swing liquidity
-- Liquidity clusters
-- Wick sweeps and rejection
-- Potential liquidity targets
+Responsibilities:
+- Detect swing-high and swing-low liquidity.
+- Identify equal highs and equal lows.
+- Detect buy-side and sell-side liquidity sweeps.
+- Require wick-through and close-back-inside confirmation.
+- Identify liquidity targets relative to trade direction.
 
-A liquidity sweep is not automatically a reversal
-or an entry signal.
+A wick through a level alone is not a confirmed structure break.
+A sweep requires price to return and close inside the level.
 
-All prices must be supplied using the instrument's
-actual quoted precision.
+This module does not execute trades.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class SMCLiquidityEngine:
 
-    VERSION = "1.0"
+    VERSION = "2.0"
 
     def __init__(
         self,
-        tolerance_by_instrument=None,
-        minimum_cluster_touches=2,
+        swing_left: int = 2,
+        swing_right: int = 2,
+        equal_tolerance: float = 0.0001
     ):
-        if minimum_cluster_touches < 2:
-            raise ValueError(
-                "minimum_cluster_touches must be at least 2"
-            )
-
-        self.minimum_cluster_touches = minimum_cluster_touches
-
-        self.tolerance_by_instrument = (
-            tolerance_by_instrument or {}
+        self.swing_left = max(1, int(swing_left))
+        self.swing_right = max(1, int(swing_right))
+        self.equal_tolerance = max(
+            0.0, float(equal_tolerance)
         )
 
-        self.total_analyses = 0
-        self.last_result = None
+        self.last_result: Dict[str, Any] = {}
+
+    # ---------------------------------------------------------
+    # CANDLE VALIDATION
+    # ---------------------------------------------------------
 
     @staticmethod
-    def _validate_candles(candles):
+    def _number(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+            if result != result:
+                return None
+            return result
+        except (TypeError, ValueError):
+            return None
+
+    def _validate_candles(
+        self,
+        candles: Any
+    ) -> List[Dict[str, float]]:
+
         if not isinstance(candles, list):
-            raise TypeError("Candles must be a list")
+            return []
 
         validated = []
 
-        for index, candle in enumerate(candles):
+        for candle in candles:
             if not isinstance(candle, dict):
-                raise ValueError(
-                    f"Candle {index} must be a dictionary"
-                )
+                continue
 
-            item = {}
+            high = self._number(candle.get("high"))
+            low = self._number(candle.get("low"))
+            open_price = self._number(candle.get("open"))
+            close = self._number(candle.get("close"))
 
-            for field in ("open", "high", "low", "close"):
-                try:
-                    item[field] = float(candle[field])
-                except (KeyError, TypeError, ValueError):
-                    raise ValueError(
-                        f"Candle {index} has invalid {field}"
-                    )
-
-            if item["high"] < max(
-                item["open"],
-                item["close"],
-                item["low"],
+            if None in (
+                high, low, open_price, close
             ):
-                raise ValueError(
-                    f"Candle {index} has invalid high"
-                )
+                continue
 
-            if item["low"] > min(
-                item["open"],
-                item["close"],
-                item["high"],
+            if high < low:
+                continue
+
+            if (
+                open_price < low
+                or open_price > high
+                or close < low
+                or close > high
             ):
-                raise ValueError(
-                    f"Candle {index} has invalid low"
-                )
+                continue
 
-            validated.append(item)
+            validated.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close
+            })
 
         return validated
 
-    def _get_tolerance(self, instrument):
-        tolerance = self.tolerance_by_instrument.get(
-            instrument
-        )
+    # ---------------------------------------------------------
+    # SWING DETECTION
+    # ---------------------------------------------------------
 
-        if tolerance is None:
-            return None
-
-        tolerance = float(tolerance)
-
-        if tolerance < 0:
-            raise ValueError(
-                "Liquidity tolerance cannot be negative"
-            )
-
-        return tolerance
-
-    def detect_equal_levels(
+    def _detect_swing_highs(
         self,
-        swings,
-        tolerance,
-    ):
-        if tolerance is None:
-            return {
-                "equal_highs": [],
-                "equal_lows": [],
-                "status": "CALIBRATION_REQUIRED",
-            }
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
 
-        highs = [
-            item for item in swings
-            if item.get("type") == "HIGH"
-        ]
+        swings = []
+        count = len(candles)
 
-        lows = [
-            item for item in swings
-            if item.get("type") == "LOW"
-        ]
+        for index in range(
+            self.swing_left,
+            count - self.swing_right
+        ):
+            current = candles[index]
+            left = candles[
+                index - self.swing_left:index
+            ]
+            right = candles[
+                index + 1:index + self.swing_right + 1
+            ]
 
-        equal_highs = self._cluster_levels(
-            highs,
-            tolerance,
-            "EQUAL_HIGHS",
-        )
-
-        equal_lows = self._cluster_levels(
-            lows,
-            tolerance,
-            "EQUAL_LOWS",
-        )
-
-        return {
-            "equal_highs": equal_highs,
-            "equal_lows": equal_lows,
-            "status": "ANALYZED",
-        }
-
-    def _cluster_levels(
-        self,
-        levels,
-        tolerance,
-        cluster_type,
-    ):
-        clusters = []
-        used = set()
-
-        for index, first in enumerate(levels):
-
-            if index in used:
+            if not left or not right:
                 continue
 
-            cluster = [first]
-            used.add(index)
+            is_swing = (
+                current["high"] > max(
+                    item["high"] for item in left
+                )
+                and current["high"] >= max(
+                    item["high"] for item in right
+                )
+            )
 
-            for other_index in range(
-                index + 1,
-                len(levels)
-            ):
-                if other_index in used:
-                    continue
-
-                other = levels[other_index]
-
-                if abs(
-                    float(first["price"])
-                    - float(other["price"])
-                ) <= tolerance:
-                    cluster.append(other)
-                    used.add(other_index)
-
-            if len(cluster) >= self.minimum_cluster_touches:
-                prices = [
-                    float(item["price"])
-                    for item in cluster
-                ]
-
-                clusters.append({
-                    "type": cluster_type,
-                    "touches": len(cluster),
-                    "level": sum(prices) / len(prices),
-                    "first_index": min(
-                        item["index"] for item in cluster
-                    ),
-                    "last_index": max(
-                        item["index"] for item in cluster
-                    ),
+            if is_swing:
+                swings.append({
+                    "index": index,
+                    "price": current["high"],
+                    "type": "SWING_HIGH"
                 })
 
-        return clusters
+        return swings
 
-    def identify_liquidity_pools(
+    def _detect_swing_lows(
         self,
-        swings,
-        equal_levels,
-    ):
-        pools = []
+        candles: List[Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
+
+        swings = []
+        count = len(candles)
+
+        for index in range(
+            self.swing_left,
+            count - self.swing_right
+        ):
+            current = candles[index]
+            left = candles[
+                index - self.swing_left:index
+            ]
+            right = candles[
+                index + 1:index + self.swing_right + 1
+            ]
+
+            if not left or not right:
+                continue
+
+            is_swing = (
+                current["low"] < min(
+                    item["low"] for item in left
+                )
+                and current["low"] <= min(
+                    item["low"] for item in right
+                )
+            )
+
+            if is_swing:
+                swings.append({
+                    "index": index,
+                    "price": current["low"],
+                    "type": "SWING_LOW"
+                })
+
+        return swings
+
+    # ---------------------------------------------------------
+    # EQUAL HIGH / LOW CLUSTERS
+    # ---------------------------------------------------------
+
+    def _group_equal_levels(
+        self,
+        swings: List[Dict[str, Any]],
+        level_type: str
+    ) -> List[Dict[str, Any]]:
+
+        groups = []
 
         for swing in swings:
-            if swing.get("type") == "HIGH":
-                pools.append({
-                    "type": "BUY_SIDE_LIQUIDITY",
-                    "level": float(swing["price"]),
-                    "source": "SWING_HIGH",
-                    "index": swing["index"],
+            price = swing["price"]
+            matched = None
+
+            for group in groups:
+                reference = group["level"]
+
+                if abs(price - reference) <= self.equal_tolerance:
+                    matched = group
+                    break
+
+            if matched is None:
+                groups.append({
+                    "level": price,
+                    "touches": 1,
+                    "indices": [swing["index"]],
+                    "type": level_type
                 })
+            else:
+                matched["touches"] += 1
+                matched["indices"].append(
+                    swing["index"]
+                )
 
-            elif swing.get("type") == "LOW":
-                pools.append({
-                    "type": "SELL_SIDE_LIQUIDITY",
-                    "level": float(swing["price"]),
-                    "source": "SWING_LOW",
-                    "index": swing["index"],
-                })
+                # Keep the average of the clustered levels.
+                matched["level"] = sum(
+                    [
+                        next(
+                            item["price"]
+                            for item in swings
+                            if item["index"] == idx
+                        )
+                        for idx in matched["indices"]
+                    ]
+                ) / matched["touches"]
 
-        for cluster in equal_levels.get(
-            "equal_highs", []
-        ):
-            pools.append({
-                "type": "BUY_SIDE_LIQUIDITY",
-                "level": cluster["level"],
-                "source": "EQUAL_HIGHS",
-                "touches": cluster["touches"],
-            })
+        return [
+            group for group in groups
+            if group["touches"] >= 2
+        ]
 
-        for cluster in equal_levels.get(
-            "equal_lows", []
-        ):
-            pools.append({
-                "type": "SELL_SIDE_LIQUIDITY",
-                "level": cluster["level"],
-                "source": "EQUAL_LOWS",
-                "touches": cluster["touches"],
-            })
+    # ---------------------------------------------------------
+    # LIQUIDITY SWEEP DETECTION
+    # ---------------------------------------------------------
 
-        return pools
-
-    def detect_sweeps(
+    def _detect_sweeps(
         self,
-        candles,
-        liquidity_pools,
-    ):
-        if not candles:
+        candles: List[Dict[str, float]],
+        swing_highs: List[Dict[str, Any]],
+        swing_lows: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+
+        if len(candles) < 2:
             return []
 
-        candle = candles[-1]
-        candle_index = len(candles) - 1
+        last_index = len(candles) - 1
+        last = candles[-1]
 
         sweeps = []
 
-        for pool in liquidity_pools:
-            level = pool["level"]
+        # Only levels formed before the current candle
+        # can be swept by the current candle.
+        for swing in swing_highs:
+            if swing["index"] >= last_index:
+                continue
 
-            if pool["type"] == "BUY_SIDE_LIQUIDITY":
+            level = swing["price"]
 
-                if (
-                    candle["high"] > level
-                    and candle["close"] < level
-                ):
-                    sweeps.append({
-                        "type": "BUY_SIDE_SWEEP",
-                        "level": level,
-                        "candle_index": candle_index,
-                        "rejection_confirmed": True,
-                        "confirmation": (
-                            "WICK_ABOVE_LEVEL_CLOSE_BELOW"
-                        ),
-                    })
+            wick_through = last["high"] > level
+            close_back_inside = last["close"] < level
 
-            elif pool["type"] == "SELL_SIDE_LIQUIDITY":
+            if wick_through and close_back_inside:
+                sweeps.append({
+                    "type": "BUY_SIDE_SWEEP",
+                    "level": level,
+                    "candle_index": last_index,
+                    "confirmation":
+                        "WICK_THROUGH_CLOSE_BACK_INSIDE",
+                    "wick_through": True,
+                    "close_back_inside": True
+                })
 
-                if (
-                    candle["low"] < level
-                    and candle["close"] > level
-                ):
-                    sweeps.append({
-                        "type": "SELL_SIDE_SWEEP",
-                        "level": level,
-                        "candle_index": candle_index,
-                        "rejection_confirmed": True,
-                        "confirmation": (
-                            "WICK_BELOW_LEVEL_CLOSE_ABOVE"
-                        ),
-                    })
+        for swing in swing_lows:
+            if swing["index"] >= last_index:
+                continue
+
+            level = swing["price"]
+
+            wick_through = last["low"] < level
+            close_back_inside = last["close"] > level
+
+            if wick_through and close_back_inside:
+                sweeps.append({
+                    "type": "SELL_SIDE_SWEEP",
+                    "level": level,
+                    "candle_index": last_index,
+                    "confirmation":
+                        "WICK_THROUGH_CLOSE_BACK_INSIDE",
+                    "wick_through": True,
+                    "close_back_inside": True
+                })
 
         return sweeps
 
-    def identify_external_targets(
+    # ---------------------------------------------------------
+    # LIQUIDITY TARGETS
+    # ---------------------------------------------------------
+
+    def _build_targets(
         self,
-        current_price,
-        liquidity_pools,
-    ):
-        current_price = float(current_price)
+        swing_highs: List[Dict[str, Any]],
+        swing_lows: List[Dict[str, Any]],
+        current_price: float
+    ) -> Dict[str, List[Dict[str, Any]]]:
 
-        above = [
-            pool for pool in liquidity_pools
-            if pool["level"] > current_price
-        ]
+        buy_side = []
+        sell_side = []
 
-        below = [
-            pool for pool in liquidity_pools
-            if pool["level"] < current_price
-        ]
+        for swing in swing_highs:
+            price = swing["price"]
 
-        nearest_bsl = (
-            min(above, key=lambda item: item["level"])
-            if above else None
+            if price > current_price:
+                buy_side.append({
+                    "type": "BUY_SIDE_LIQUIDITY",
+                    "level": price,
+                    "swing_index": swing["index"],
+                    "status": "UNSWEPT"
+                })
+
+        for swing in swing_lows:
+            price = swing["price"]
+
+            if price < current_price:
+                sell_side.append({
+                    "type": "SELL_SIDE_LIQUIDITY",
+                    "level": price,
+                    "swing_index": swing["index"],
+                    "status": "UNSWEPT"
+                })
+
+        buy_side.sort(
+            key=lambda item: item["level"]
         )
 
-        nearest_ssl = (
-            max(below, key=lambda item: item["level"])
-            if below else None
+        sell_side.sort(
+            key=lambda item: item["level"],
+            reverse=True
         )
 
         return {
-            "nearest_buy_side_target": nearest_bsl,
-            "nearest_sell_side_target": nearest_ssl,
+            "buy_side": buy_side,
+            "sell_side": sell_side
         }
+
+    # ---------------------------------------------------------
+    # MAIN ANALYSIS
+    # ---------------------------------------------------------
 
     def analyze(
         self,
-        instrument,
-        candles,
-        swings,
-    ):
-        candles = self._validate_candles(candles)
+        candles: Any,
+        current_price: Optional[float] = None,
+        tolerance: Optional[float] = None
+    ) -> Dict[str, Any]:
 
-        if not isinstance(swings, list):
-            raise TypeError("Swings must be a list")
+        original_tolerance = self.equal_tolerance
 
-        if not candles:
-            return {
-                "status": "INSUFFICIENT_DATA",
-                "instrument": instrument,
+        if tolerance is not None:
+            try:
+                self.equal_tolerance = max(
+                    0.0, float(tolerance)
+                )
+            except (TypeError, ValueError):
+                self.equal_tolerance = original_tolerance
+
+        try:
+            validated = self._validate_candles(candles)
+
+            if len(validated) < (
+                self.swing_left
+                + self.swing_right
+                + 2
+            ):
+                result = {
+                    "status": "INSUFFICIENT_DATA",
+                    "version": self.VERSION,
+                    "swing_highs": [],
+                    "swing_lows": [],
+                    "equal_highs": [],
+                    "equal_lows": [],
+                    "liquidity_sweeps": [],
+                    "targets": {
+                        "buy_side": [],
+                        "sell_side": []
+                    }
+                }
+
+                self.last_result = result
+                return result
+
+            if current_price is None:
+                current_price = validated[-1]["close"]
+
+            current_price = self._number(current_price)
+
+            if current_price is None or current_price <= 0:
+                result = {
+                    "status": "INVALID_CURRENT_PRICE",
+                    "version": self.VERSION,
+                    "liquidity_sweeps": []
+                }
+
+                self.last_result = result
+                return result
+
+            swing_highs = self._detect_swing_highs(
+                validated
+            )
+
+            swing_lows = self._detect_swing_lows(
+                validated
+            )
+
+            equal_highs = self._group_equal_levels(
+                swing_highs,
+                "EQUAL_HIGHS"
+            )
+
+            equal_lows = self._group_equal_levels(
+                swing_lows,
+                "EQUAL_LOWS"
+            )
+
+            sweeps = self._detect_sweeps(
+                validated,
+                swing_highs,
+                swing_lows
+            )
+
+            targets = self._build_targets(
+                swing_highs,
+                swing_lows,
+                current_price
+            )
+
+            result = {
+                "status": "ANALYZED",
+                "version": self.VERSION,
+                "candle_count": len(validated),
+                "current_price": current_price,
+
+                "swing_highs": swing_highs,
+                "swing_lows": swing_lows,
+
+                "equal_highs": equal_highs,
+                "equal_lows": equal_lows,
+
+                "equal_levels": {
+                    "equal_highs": equal_highs,
+                    "equal_lows": equal_lows
+                },
+
+                "liquidity_sweeps": sweeps,
+
+                "targets": targets,
+
+                "buy_side_liquidity_count": len(
+                    targets["buy_side"]
+                ),
+
+                "sell_side_liquidity_count": len(
+                    targets["sell_side"]
+                ),
+
+                "sweep_detected": bool(sweeps)
             }
 
-        tolerance = self._get_tolerance(instrument)
+            self.last_result = result
+            return result
 
-        equal_levels = self.detect_equal_levels(
-            swings,
-            tolerance,
-        )
+        finally:
+            self.equal_tolerance = original_tolerance
 
-        pools = self.identify_liquidity_pools(
-            swings,
-            equal_levels,
-        )
+    # British spelling compatibility
+    def analyse(
+        self,
+        candles: Any,
+        current_price: Optional[float] = None,
+        tolerance: Optional[float] = None
+    ) -> Dict[str, Any]:
 
-        sweeps = self.detect_sweeps(
+        return self.analyze(
             candles,
-            pools,
+            current_price,
+            tolerance
         )
 
-        targets = self.identify_external_targets(
-            candles[-1]["close"],
-            pools,
+    # ---------------------------------------------------------
+    # DIRECTIONAL SWEEP VALIDATION
+    # ---------------------------------------------------------
+
+    def validate_trade_sweep(
+        self,
+        analysis: Dict[str, Any],
+        trade_direction: str
+    ) -> Dict[str, Any]:
+
+        direction = str(
+            trade_direction
+        ).strip().upper()
+
+        if direction in {"BUY", "BULLISH", "LONG"}:
+            expected = "SELL_SIDE_SWEEP"
+
+        elif direction in {"SELL", "BEARISH", "SHORT"}:
+            expected = "BUY_SIDE_SWEEP"
+
+        else:
+            return {
+                "valid": False,
+                "reason": "INVALID_TRADE_DIRECTION",
+                "matching_sweeps": []
+            }
+
+        sweeps = analysis.get(
+            "liquidity_sweeps", []
         )
 
-        self.total_analyses += 1
+        matching = [
+            sweep for sweep in sweeps
+            if (
+                isinstance(sweep, dict)
+                and sweep.get("type") == expected
+                and sweep.get("confirmation")
+                == "WICK_THROUGH_CLOSE_BACK_INSIDE"
+            )
+        ]
 
-        result = {
-            "status": (
-                "ANALYZED"
-                if tolerance is not None
-                else "PARTIAL_CALIBRATION_REQUIRED"
-            ),
-            "instrument": instrument,
-            "tolerance": tolerance,
-            "liquidity_pools": pools,
-            "equal_levels": equal_levels,
-            "sweeps": sweeps,
-            "external_targets": targets,
-            "trade_authorized": False,
+        return {
+            "valid": bool(matching),
+            "trade_direction": direction,
+            "expected_sweep": expected,
+            "matching_sweeps": matching
         }
 
-        self.last_result = result
+    # ---------------------------------------------------------
+    # STATUS
+    # ---------------------------------------------------------
 
-        return result
+    def get_last_result(self) -> Dict[str, Any]:
+        return dict(self.last_result)
 
-    def get_status(self):
+    def get_status(self) -> Dict[str, Any]:
         return {
             "component": "SMC_LIQUIDITY_ENGINE",
-            "status": "ACTIVE",
             "version": self.VERSION,
-            "total_analyses": self.total_analyses,
-            "calibrated_instruments": list(
-                self.tolerance_by_instrument.keys()
-            ),
+            "status": "ACTIVE"
         }
 
 
