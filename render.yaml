@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: vrotex-bot-v1
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: BOT_MODE
+        value: DEMO
+      - key: ORDER_EXECUTION_ENABLED
+        value: "false"
+      - key: LOG_LEVEL
+        value: INFO
