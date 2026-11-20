@@ -619,3 +619,6 @@ class MarketScanner:
 
 
 market_scanner = MarketScanner()
+
+# Compatibility alias for engine.py
+scanner = market_scanner
