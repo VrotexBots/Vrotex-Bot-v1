@@ -1,351 +1,361 @@
 """
-Vrotex Bot V1
+VROTEX BOT V1
 SMC Inducement Engine
 
-Detects:
-- Potential inducement levels.
-- Equal highs and equal lows.
-- Liquidity resting around a protected level.
-- Wick sweeps and candle-body breaks.
-- Potential inducement status.
+Purpose:
+- Identify potential inducement liquidity around swing points.
+- Detect equal-high and equal-low liquidity clusters.
+- Detect wick sweeps followed by candle closes back inside.
+- Track whether inducement liquidity has been taken.
+- Produce structured evidence for the master SMC engine.
 
-This module provides evidence only.
-It does not independently authorize trades.
+Rules:
+- A wick through a level followed by a close back inside
+  is a sweep, not a confirmed structure break.
+- A full candle-body close beyond a level is not classified
+  as a liquidity sweep.
+- Inducement detection alone does not authorize an entry.
+- This module does not execute orders.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class InducementResult:
-    level_id: str
-    direction: str
-    price: float
-    status: str
-    touch_count: int
-    sweep_index: Optional[int]
-    break_index: Optional[int]
-    reason: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
 class SMCInducementEngine:
+    VERSION = "2.0"
 
     def __init__(
         self,
-        tolerance: float = 0.0001,
-        minimum_touches: int = 2,
+        equal_level_tolerance: float = 0.0001,
+        minimum_cluster_size: int = 2,
+        swing_strength: int = 2,
     ):
-        if tolerance <= 0:
-            raise ValueError("tolerance must be positive")
-
-        if minimum_touches < 2:
-            raise ValueError("minimum_touches must be at least 2")
-
-        self.tolerance = float(tolerance)
-        self.minimum_touches = minimum_touches
-        self.levels: Dict[str, Dict[str, Any]] = {}
+        self.equal_level_tolerance = max(
+            0.0, float(equal_level_tolerance)
+        )
+        self.minimum_cluster_size = max(
+            2, int(minimum_cluster_size)
+        )
+        self.swing_strength = max(1, int(swing_strength))
 
     @staticmethod
-    def _number(value: Any, field: str) -> float:
+    def _number(value: Any) -> Optional[float]:
         try:
             result = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"Invalid {field}")
 
-        if result != result or result in (
-            float("inf"),
-            float("-inf"),
-        ):
-            raise ValueError(f"Non-finite {field}")
+            if result != result or abs(result) == float("inf"):
+                return None
+
+            return result
+        except (TypeError, ValueError):
+            return None
+
+    def _normalise_candles(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, float]]:
+        result = []
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            values = {
+                key: self._number(candle.get(key))
+                for key in ("open", "high", "low", "close")
+            }
+
+            if any(value is None for value in values.values()):
+                continue
+
+            if values["high"] < values["low"]:
+                continue
+
+            if values["high"] < max(
+                values["open"], values["close"]
+            ):
+                continue
+
+            if values["low"] > min(
+                values["open"], values["close"]
+            ):
+                continue
+
+            result.append(values)
 
         return result
 
-    @staticmethod
-    def _validate_direction(direction: str) -> str:
-        direction = direction.upper()
-
-        if direction not in ("BUY_SIDE", "SELL_SIDE"):
-            raise ValueError("Direction must be BUY_SIDE or SELL_SIDE")
-
-        return direction
-
-    def register_level(
+    def _detect_swings(
         self,
-        level_id: str,
-        direction: str,
-        price: float,
-        protected_level: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        candles: List[Dict[str, float]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        highs = []
+        lows = []
+        strength = self.swing_strength
 
-        if not isinstance(level_id, str) or not level_id.strip():
-            raise ValueError("level_id must be a non-empty string")
+        for index in range(
+            strength,
+            len(candles) - strength,
+        ):
+            current = candles[index]
 
-        if level_id in self.levels:
-            raise ValueError(f"Level already exists: {level_id}")
+            left = candles[index - strength:index]
+            right = candles[index + 1:index + strength + 1]
 
-        direction = self._validate_direction(direction)
-        price = self._number(price, "price")
-
-        if price <= 0:
-            raise ValueError("price must be positive")
-
-        if protected_level is not None:
-            protected_level = self._number(
-                protected_level,
-                "protected_level",
+            is_high = all(
+                current["high"] > item["high"]
+                for item in left + right
             )
 
-        self.levels[level_id] = {
-            "level_id": level_id,
-            "direction": direction,
-            "price": price,
-            "protected_level": protected_level,
-            "status": "WATCHING",
-            "touch_count": 0,
-            "sweep_index": None,
-            "break_index": None,
-            "last_processed_index": None,
+            is_low = all(
+                current["low"] < item["low"]
+                for item in left + right
+            )
+
+            if is_high:
+                highs.append({
+                    "index": index,
+                    "price": current["high"],
+                    "type": "SWING_HIGH",
+                })
+
+            if is_low:
+                lows.append({
+                    "index": index,
+                    "price": current["low"],
+                    "type": "SWING_LOW",
+                })
+
+        return {
+            "highs": highs,
+            "lows": lows,
         }
 
-        return self.get_level(level_id)
-
-    def get_level(self, level_id: str) -> Dict[str, Any]:
-        if level_id not in self.levels:
-            raise KeyError(f"Unknown inducement level: {level_id}")
-
-        return dict(self.levels[level_id])
-
-    def _result(
+    def _cluster_levels(
         self,
-        level: Dict[str, Any],
-        reason: str,
-    ) -> Dict[str, Any]:
-
-        return InducementResult(
-            level_id=level["level_id"],
-            direction=level["direction"],
-            price=level["price"],
-            status=level["status"],
-            touch_count=level["touch_count"],
-            sweep_index=level["sweep_index"],
-            break_index=level["break_index"],
-            reason=reason,
-        ).to_dict()
-
-    def detect_equal_levels(
-        self,
-        candles: List[Dict[str, Any]],
-        direction: str,
+        swings: List[Dict[str, Any]],
+        level_type: str,
     ) -> List[Dict[str, Any]]:
-
-        direction = self._validate_direction(direction)
-
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
-
-        field = "high" if direction == "BUY_SIDE" else "low"
-
-        values = []
-
-        for index, raw in enumerate(candles):
-            if not isinstance(raw, dict):
-                raise ValueError("Invalid candle")
-
-            price = self._number(raw.get(field), field)
-
-            if price <= 0:
-                raise ValueError("Candle prices must be positive")
-
-            values.append((index, price))
-
         clusters = []
 
-        for index, price in values:
+        for swing in swings:
+            price = swing["price"]
             matched = None
 
             for cluster in clusters:
-                if abs(price - cluster["reference_price"]) <= self.tolerance:
+                average = cluster["level"]
+
+                if abs(price - average) <= self.equal_level_tolerance:
                     matched = cluster
                     break
 
             if matched is None:
                 clusters.append({
-                    "reference_price": price,
-                    "indices": [index],
-                    "prices": [price],
+                    "level": price,
+                    "members": [swing],
                 })
             else:
-                matched["indices"].append(index)
-                matched["prices"].append(price)
+                matched["members"].append(swing)
+                matched["level"] = sum(
+                    item["price"]
+                    for item in matched["members"]
+                ) / len(matched["members"])
 
-        results = []
+        result = []
 
         for cluster in clusters:
-            if len(cluster["indices"]) < self.minimum_touches:
+            if len(cluster["members"]) < self.minimum_cluster_size:
                 continue
 
-            results.append({
-                "direction": direction,
-                "level_price": sum(cluster["prices"]) / len(
-                    cluster["prices"]
-                ),
-                "touch_count": len(cluster["indices"]),
-                "indices": cluster["indices"],
+            result.append({
+                "level_type": level_type,
+                "level": cluster["level"],
+                "touch_count": len(cluster["members"]),
+                "swing_indices": [
+                    item["index"]
+                    for item in cluster["members"]
+                ],
+                "confirmed_cluster": True,
             })
 
-        return results
+        return result
 
-    def update_level(
-        self,
-        level_id: str,
-        candles: List[Dict[str, Any]],
-        start_index: int = 0,
-    ) -> Dict[str, Any]:
-
-        if level_id not in self.levels:
-            raise KeyError(f"Unknown inducement level: {level_id}")
-
-        if not isinstance(candles, list):
-            raise ValueError("candles must be a list")
-
-        if not isinstance(start_index, int) or start_index < 0:
-            raise ValueError("start_index must be non-negative")
-
-        level = self.levels[level_id]
-
-        if level["status"] in ("SWEPT", "BODY_BROKEN"):
-            return self._result(
-                level,
-                "LEVEL_ALREADY_RESOLVED",
-            )
-
-        for index in range(start_index, len(candles)):
+    @staticmethod
+    def _detect_sweep(
+        candles: List[Dict[str, float]],
+        level: float,
+        level_type: str,
+        start_index: int,
+    ) -> Optional[Dict[str, Any]]:
+        for index in range(
+            max(0, start_index),
+            len(candles),
+        ):
+            candle = candles[index]
 
             if (
-                level["last_processed_index"] is not None
-                and index <= level["last_processed_index"]
+                level_type == "BUY_SIDE"
+                and candle["high"] > level
+                and candle["close"] < level
             ):
-                continue
+                return {
+                    "detected": True,
+                    "direction": "BEARISH",
+                    "type": "BUY_SIDE_SWEEP",
+                    "level": level,
+                    "candle_index": index,
+                    "confirmation": "WICK_THROUGH_CLOSE_BACK_INSIDE",
+                }
 
-            raw = candles[index]
-
-            if not isinstance(raw, dict):
-                raise ValueError("Invalid candle")
-
-            candle = {
-                field: self._number(raw.get(field), field)
-                for field in ("open", "high", "low", "close")
-            }
-
-            if candle["high"] < candle["low"]:
-                raise ValueError("Candle high cannot be below low")
-
-            if not (
-                candle["low"] <= candle["open"] <= candle["high"]
-                and candle["low"] <= candle["close"] <= candle["high"]
+            if (
+                level_type == "SELL_SIDE"
+                and candle["low"] < level
+                and candle["close"] > level
             ):
-                raise ValueError("Invalid candle price range")
+                return {
+                    "detected": True,
+                    "direction": "BULLISH",
+                    "type": "SELL_SIDE_SWEEP",
+                    "level": level,
+                    "candle_index": index,
+                    "confirmation": "WICK_THROUGH_CLOSE_BACK_INSIDE",
+                }
 
-            price = level["price"]
+        return None
 
-            if level["direction"] == "BUY_SIDE":
-
-                touched = candle["high"] >= (
-                    price - self.tolerance
-                )
-
-                swept = (
-                    candle["high"] > price + self.tolerance
-                    and candle["close"] < price
-                )
-
-                body_broken = candle["close"] > price
-
-            else:
-
-                touched = candle["low"] <= (
-                    price + self.tolerance
-                )
-
-                swept = (
-                    candle["low"] < price - self.tolerance
-                    and candle["close"] > price
-                )
-
-                body_broken = candle["close"] < price
-
-            if touched:
-                level["touch_count"] += 1
-
-            level["last_processed_index"] = index
-
-            if swept:
-                level["status"] = "SWEPT"
-                level["sweep_index"] = index
-
-                return self._result(
-                    level,
-                    "LIQUIDITY_SWEEP_DETECTED",
-                )
-
-            if body_broken:
-                level["status"] = "BODY_BROKEN"
-                level["break_index"] = index
-
-                return self._result(
-                    level,
-                    "CANDLE_BODY_CLOSED_BEYOND_LEVEL",
-                )
-
-        return self._result(level, "UPDATE_COMPLETE")
-
-    def update_all(
+    def analyse(
         self,
         candles: List[Dict[str, Any]],
-    ) -> Dict[str, Dict[str, Any]]:
+        current_price: Optional[float] = None,
+        external_direction: str = "NEUTRAL",
+    ) -> Dict[str, Any]:
+        if not isinstance(candles, list):
+            return {
+                "status": "ERROR",
+                "reason": "INVALID_CANDLE_INPUT",
+            }
 
-        results = {}
+        normalised = self._normalise_candles(candles)
 
-        for level_id, level in list(self.levels.items()):
-            if level["status"] in ("SWEPT", "BODY_BROKEN"):
-                continue
+        minimum = (self.swing_strength * 2) + 3
 
-            results[level_id] = self.update_level(
-                level_id,
-                candles,
+        if len(normalised) < minimum:
+            return {
+                "status": "ERROR",
+                "reason": "INSUFFICIENT_CANDLES",
+                "candle_count": len(normalised),
+                "minimum_required": minimum,
+            }
+
+        price = self._number(current_price)
+
+        if price is None:
+            price = normalised[-1]["close"]
+
+        direction = str(external_direction or "NEUTRAL").upper()
+
+        if direction not in ("BULLISH", "BEARISH", "NEUTRAL"):
+            direction = "NEUTRAL"
+
+        swings = self._detect_swings(normalised)
+
+        equal_highs = self._cluster_levels(
+            swings["highs"],
+            "BUY_SIDE",
+        )
+
+        equal_lows = self._cluster_levels(
+            swings["lows"],
+            "SELL_SIDE",
+        )
+
+        inducements = []
+
+        for cluster in equal_highs:
+            level = cluster["level"]
+
+            if level >= price:
+                inducements.append({
+                    **cluster,
+                    "inducement_direction": "BEARISH",
+                    "position": "ABOVE_PRICE",
+                })
+
+        for cluster in equal_lows:
+            level = cluster["level"]
+
+            if level <= price:
+                inducements.append({
+                    **cluster,
+                    "inducement_direction": "BULLISH",
+                    "position": "BELOW_PRICE",
+                })
+
+        sweeps = []
+
+        for item in inducements:
+            if item["level_type"] == "BUY_SIDE":
+                sweep = self._detect_sweep(
+                    normalised,
+                    item["level"],
+                    "BUY_SIDE",
+                    max(item["swing_indices"]) + 1,
+                )
+            else:
+                sweep = self._detect_sweep(
+                    normalised,
+                    item["level"],
+                    "SELL_SIDE",
+                    max(item["swing_indices"]) + 1,
+                )
+
+            item["swept"] = sweep is not None
+            item["sweep_evidence"] = sweep
+
+            if sweep is not None:
+                sweeps.append(sweep)
+
+        relevant_sweeps = [
+            item for item in sweeps
+            if (
+                direction == "NEUTRAL"
+                or item["direction"] == direction
             )
-
-        return results
-
-    def get_active_levels(self) -> List[Dict[str, Any]]:
-        return [
-            dict(level)
-            for level in self.levels.values()
-            if level["status"] == "WATCHING"
         ]
 
-    def get_status(self) -> Dict[str, Any]:
-
-        counts = {
-            "WATCHING": 0,
-            "SWEPT": 0,
-            "BODY_BROKEN": 0,
-        }
-
-        for level in self.levels.values():
-            counts[level["status"]] += 1
-
         return {
-            "total_levels": len(self.levels),
-            "states": counts,
+            "status": "ANALYZED",
+            "version": self.VERSION,
+            "external_direction": direction,
+            "current_price": price,
+            "swing_highs": swings["highs"],
+            "swing_lows": swings["lows"],
+            "equal_highs": equal_highs,
+            "equal_lows": equal_lows,
+            "inducements": inducements,
+            "sweeps": sweeps,
+            "directional_sweeps": relevant_sweeps,
+            "inducement_detected": bool(inducements),
+            "sweep_detected": bool(sweeps),
+            "directional_sweep_detected": bool(relevant_sweeps),
+            "confirmation": (
+                "INDUCEMENT_SWEEP_CONFIRMED"
+                if relevant_sweeps
+                else "NO_DIRECTIONAL_INDUCEMENT_SWEEP"
+            ),
         }
 
+    def analyze(
+        self,
+        candles: List[Dict[str, Any]],
+        current_price: Optional[float] = None,
+        external_direction: str = "NEUTRAL",
+    ) -> Dict[str, Any]:
+        return self.analyse(
+            candles,
+            current_price,
+            external_direction,
+        )
 
-# Shared engine instance
+
 smc_inducement_engine = SMCInducementEngine()
