@@ -45,7 +45,7 @@ class ExnessConnection:
         self.last_successful_connection = None
 
     @staticmethod
-    def b64url(data: bytes) -> str:
+    def b64url(data: bytes):
 
         return base64.urlsafe_b64encode(
             data
@@ -570,7 +570,9 @@ class ExnessConnection:
                 "Exness connection verified successfully."
             )
 
+            # FIX: Explicit success field for connector.
             return {
+                "success": True,
                 "connected": True,
                 "account_id": self.account_id,
                 "access_point": self.access_point,
