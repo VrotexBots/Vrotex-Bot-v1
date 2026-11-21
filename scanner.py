@@ -1,55 +1,48 @@
 """
-VROTEX BOT V1
-Market Scanner
+Vrotex Bot V1 - Market Scanner
+Version: 3.0
 
-Version: 2.0
+Approved instruments:
+    EURUSD
+    GBPUSD
+    BTCUSD
 
-Purpose:
-- Continuously scan the approved pilot instruments.
-- Retrieve H1, M5 and M1 market candles.
-- Run technical analysis on each timeframe.
-- Obtain validated live Bid/Ask prices.
-- Submit collected market data to the master SMC engine.
-- Reject incomplete market data.
-- Keep order execution outside this module.
+Strategy timeframes:
+    H1 -> M5 -> M1
 
-Pilot:
-EURUSD, GBPUSD, BTCUSD
+Responsibilities:
+    - Continuous instrument scanning
+    - Market-data collection
+    - Technical analysis on H1/M5/M1
+    - Evidence collection
+    - Master SMC analysis
+    - Setup-state reporting
 
-Strategy:
-H1 = External narrative
-M5 = Confirmation
-M1 = Entry
+This module does NOT execute orders.
 """
 
-import asyncio
-import inspect
-import math
+import logging
+import threading
+import time
+import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict
-
-from config import settings
-from logging_config import get_logger
-
-from market_data_engine import market_data_engine
-from technical_analysis_engine import technical_analysis_engine
-from smc_engine import smc_engine
+from typing import Any, Dict, List, Optional
 
 
-logger = get_logger("market_scanner")
+logger = logging.getLogger("vrotex.market_scanner")
 
 
 class MarketScanner:
 
-    VERSION = "2.0"
+    VERSION = "3.0"
 
-    PILOT_INSTRUMENTS = (
+    INSTRUMENTS = (
         "EURUSD",
         "GBPUSD",
         "BTCUSD",
     )
 
-    STRATEGY_TIMEFRAMES = (
+    TIMEFRAMES = (
         "H1",
         "M5",
         "M1",
@@ -57,767 +50,1198 @@ class MarketScanner:
 
     CANDLE_COUNT = 1000
 
-    def __init__(self):
+    DEFAULT_SCAN_INTERVAL = 30
 
-        self.market_data = market_data_engine
-        self.technical_analysis = technical_analysis_engine
-        self.smc = smc_engine
+    def __init__(
+        self,
+        market_data_engine=None,
+        technical_analysis_engine=None,
+        smc_engine=None,
+        scan_interval=None,
+    ):
 
-        self.instruments = list(
-            self.PILOT_INSTRUMENTS
+        self.market_data_engine = market_data_engine
+        self.technical_analysis_engine = technical_analysis_engine
+        self.smc_engine = smc_engine
+
+        self.scan_interval = (
+            scan_interval
+            or self.DEFAULT_SCAN_INTERVAL
         )
 
         self.running = False
-        self.stop_event = asyncio.Event()
-        self.scan_lock = asyncio.Lock()
 
-        self.scan_interval = max(
-            5,
-            int(
-                getattr(
-                    settings,
-                    "SCAN_INTERVAL_SECONDS",
-                    15,
-                )
-            ),
-        )
+        self._stop_event = threading.Event()
+
+        self._lock = threading.RLock()
 
         self.last_scan_time = None
-        self.total_scans = 0
-        self.successful_scans = 0
-        self.failed_scans = 0
 
-        self.results: Dict[
-            str,
-            Dict[str, Any]
-        ] = {}
+        self.last_scan_results = {}
 
-        self.status = "INITIALIZED"
+        self.scan_count = 0
 
-    # --------------------------------------------------
-    # ASYNC COMPATIBILITY
-    # --------------------------------------------------
+        self.error_count = 0
 
-    @staticmethod
-    async def _resolve(value):
+        self.instrument_states = {
+            symbol: {
+                "symbol": symbol,
+                "status": "INITIALIZING",
+                "last_scan": None,
+                "last_price": None,
+                "last_error": None,
+                "setup_found": False,
+                "setup_direction": None,
+                "setup_type": None,
+                "a_plus_score": 0,
+            }
+            for symbol in self.INSTRUMENTS
+        }
 
-        if inspect.isawaitable(value):
-            return await value
+        self._initialize_engines()
 
-        return value
-
-    # --------------------------------------------------
-    # CANDLE VALIDATION
-    # --------------------------------------------------
-
-    @staticmethod
-    def _valid_candles(candles):
-
-        if not isinstance(candles, list):
-            return False
-
-        if len(candles) < 50:
-            return False
-
-        required = (
-            "open",
-            "high",
-            "low",
-            "close",
+        logger.info(
+            "Market Scanner V%s initialized | "
+            "Instruments=%s | Timeframes=%s",
+            self.VERSION,
+            self.INSTRUMENTS,
+            self.TIMEFRAMES,
         )
 
-        for candle in candles:
+    # =========================================================
+    # ENGINE INITIALIZATION
+    # =========================================================
 
-            if not isinstance(candle, dict):
-                return False
+    def _initialize_engines(self):
+
+        if self.market_data_engine is None:
+
+            try:
+                from market_data_engine import market_data_engine
+
+                self.market_data_engine = market_data_engine
+
+            except Exception as exc:
+
+                logger.error(
+                    "Market Data Engine unavailable: %s",
+                    exc,
+                )
+
+        if self.technical_analysis_engine is None:
+
+            try:
+                from technical_analysis_engine import (
+                    technical_analysis_engine,
+                )
+
+                self.technical_analysis_engine = (
+                    technical_analysis_engine
+                )
+
+            except Exception as exc:
+
+                logger.error(
+                    "Technical Analysis Engine unavailable: %s",
+                    exc,
+                )
+
+        if self.smc_engine is None:
+
+            try:
+                from smc_engine import smc_engine
+
+                self.smc_engine = smc_engine
+
+            except Exception as exc:
+
+                logger.error(
+                    "Master SMC Engine unavailable: %s",
+                    exc,
+                )
+
+    # =========================================================
+    # GENERAL HELPERS
+    # =========================================================
+
+    @staticmethod
+    def _utc_now():
+
+        return datetime.now(
+            timezone.utc
+        ).isoformat()
+
+    @staticmethod
+    def _safe_float(value, default=None):
+
+        try:
+
+            if value is None:
+                return default
+
+            return float(value)
+
+        except (ValueError, TypeError):
+
+            return default
+
+    @staticmethod
+    def _safe_dict(value):
+
+        if isinstance(value, dict):
+            return value
+
+        return {}
+
+    @staticmethod
+    def _safe_list(value):
+
+        if isinstance(value, list):
+            return value
+
+        if isinstance(value, tuple):
+            return list(value)
+
+        return []
+
+    # =========================================================
+    # MARKET DATA
+    # =========================================================
+
+    def _get_candles(
+        self,
+        symbol,
+        timeframe,
+        count=None,
+    ):
+
+        count = count or self.CANDLE_COUNT
+
+        engine = self.market_data_engine
+
+        if engine is None:
+
+            raise RuntimeError(
+                "Market Data Engine unavailable"
+            )
+
+        method = getattr(
+            engine,
+            "get_recent_candles",
+            None,
+        )
+
+        if not callable(method):
+
+            raise RuntimeError(
+                "get_recent_candles() unavailable"
+            )
+
+        try:
+
+            candles = method(
+                symbol,
+                timeframe,
+                count,
+                price_type="bid",
+            )
+
+        except TypeError:
+
+            candles = method(
+                symbol,
+                timeframe,
+                count,
+            )
+
+        if candles is None:
+
+            return []
+
+        if isinstance(candles, dict):
+
+            candles = candles.get(
+                "candles",
+                candles.get("data", []),
+            )
+
+        return self._safe_list(candles)
+
+    # =========================================================
+    # LIVE PRICE
+    # =========================================================
+
+    def _get_live_price(self, symbol):
+
+        engine = self.market_data_engine
+
+        if engine is None:
+            return None
+
+        possible_methods = (
+            "get_live_tick",
+            "get_latest_tick",
+            "get_tick",
+            "get_current_price",
+        )
+
+        for method_name in possible_methods:
+
+            method = getattr(
+                engine,
+                method_name,
+                None,
+            )
+
+            if not callable(method):
+                continue
 
             try:
 
-                values = [
-                    float(candle[key])
-                    for key in required
-                ]
+                tick = method(symbol)
 
-                if any(
-                    not math.isfinite(value)
-                    for value in values
-                ):
-                    return False
+                if tick is None:
+                    continue
 
-                open_price, high, low, close = values
+                if isinstance(tick, (int, float)):
 
-                if low <= 0 or high <= 0:
-                    return False
+                    return float(tick)
 
-                if high < low:
-                    return False
+                if isinstance(tick, dict):
 
-                if not (
-                    low <= open_price <= high
-                    and low <= close <= high
-                ):
-                    return False
+                    bid = self._safe_float(
+                        tick.get("bid")
+                    )
 
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
-                return False
+                    ask = self._safe_float(
+                        tick.get("ask")
+                    )
 
-        return True
+                    last = self._safe_float(
+                        tick.get("last")
+                    )
 
-    # --------------------------------------------------
-    # MARKET DATA COLLECTION
-    # --------------------------------------------------
+                    mid = self._safe_float(
+                        tick.get("mid")
+                    )
 
-    async def _collect_timeframe(
+                    if bid and ask:
+
+                        return (bid + ask) / 2.0
+
+                    if bid:
+                        return bid
+
+                    if ask:
+                        return ask
+
+                    if last:
+                        return last
+
+                    if mid:
+                        return mid
+
+            except Exception:
+
+                logger.debug(
+                    "Live price method failed: %s",
+                    method_name,
+                    exc_info=True,
+                )
+
+        return None
+
+    # =========================================================
+    # TECHNICAL ANALYSIS
+    # =========================================================
+
+    def _analyse_timeframe(
         self,
-        symbol: str,
-        timeframe: str,
-    ) -> Dict[str, Any]:
+        symbol,
+        timeframe,
+        candles,
+    ):
 
-        candles = await (
-            self.market_data.get_recent_candles(
-                symbol=symbol,
-                timeframe=timeframe,
-                count=self.CANDLE_COUNT,
-                price_type="bid",
+        engine = self.technical_analysis_engine
+
+        if engine is None:
+
+            raise RuntimeError(
+                "Technical Analysis Engine unavailable"
             )
-        )
 
-        if not self._valid_candles(candles):
+        if not candles:
 
             return {
-                "valid": False,
+                "status": "NO_DATA",
+                "symbol": symbol,
                 "timeframe": timeframe,
-                "candles": [],
-                "reason": (
-                    "INSUFFICIENT_OR_INVALID_CANDLES"
-                ),
+                "candles": 0,
             }
 
-        analysis = await self._resolve(
-            self.technical_analysis.analyze(
+        method = getattr(
+            engine,
+            "analyze",
+            None,
+        )
+
+        if not callable(method):
+
+            method = getattr(
+                engine,
+                "analyse",
+                None,
+            )
+
+        if not callable(method):
+
+            raise RuntimeError(
+                "Technical Analysis method unavailable"
+            )
+
+        try:
+
+            result = method(
                 candles,
                 symbol=symbol,
                 timeframe=timeframe,
             )
+
+        except TypeError:
+
+            result = method(candles)
+
+        if not isinstance(result, dict):
+
+            raise RuntimeError(
+                "Technical Analysis returned invalid result"
+            )
+
+        result.setdefault(
+            "symbol",
+            symbol,
         )
 
-        if not isinstance(analysis, dict):
+        result.setdefault(
+            "timeframe",
+            timeframe,
+        )
 
-            return {
-                "valid": False,
-                "timeframe": timeframe,
-                "candles": candles,
-                "reason": (
-                    "TECHNICAL_ANALYSIS_FAILED"
-                ),
-            }
+        result.setdefault(
+            "candles",
+            len(candles),
+        )
 
-        return {
-            "valid": True,
-            "timeframe": timeframe,
-            "candles": candles,
-            "technical": analysis,
-            "candle_count": len(candles),
-            "latest_candle": candles[-1],
-            "reason": "ANALYSIS_COMPLETED",
-        }
+        result.setdefault(
+            "status",
+            "ANALYZED",
+        )
 
-    # --------------------------------------------------
-    # LIVE PRICE VALIDATION
-    # --------------------------------------------------
+        return result
 
-    def _get_validated_live_tick(
+    # =========================================================
+    # EVIDENCE COLLECTION
+    # =========================================================
+
+    def _collect_market_data(
         self,
-        symbol: str,
+        symbol,
     ):
 
-        tick = self.market_data.get_live_tick(
-            symbol
-        )
+        result = {}
 
-        if not isinstance(tick, dict):
-            return None
+        for timeframe in self.TIMEFRAMES:
 
-        try:
-
-            bid = float(tick["bid"])
-            ask = float(tick["ask"])
-            mid = float(
-                tick.get(
-                    "mid",
-                    (bid + ask) / 2,
-                )
-            )
-            age = float(tick["age"])
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-            return None
-
-        if not all(
-            math.isfinite(value)
-            for value in (
-                bid,
-                ask,
-                mid,
-                age,
-            )
-        ):
-            return None
-
-        if bid <= 0 or ask < bid:
-            return None
-
-        if age < 0:
-            return None
-
-        max_age = float(
-            getattr(
-                settings,
-                "LIVE_TICK_MAX_AGE_SECONDS",
-                10,
-            )
-        )
-
-        if age > max_age:
-            return None
-
-        if tick.get("fresh") is not True:
-            return None
-
-        return {
-            "symbol": symbol,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread": ask - bid,
-            "timestamp": tick.get("timestamp"),
-            "age": age,
-            "fresh": True,
-        }
-
-    # --------------------------------------------------
-    # SCAN ONE INSTRUMENT
-    # --------------------------------------------------
-
-    async def scan_instrument(
-        self,
-        symbol: str,
-    ) -> Dict[str, Any]:
-
-        symbol = str(symbol).upper().strip()
-
-        result = {
-            "symbol": symbol,
-            "status": "SCANNING",
-            "setup_found": False,
-            "direction": None,
-            "timeframes": {},
-            "analysis": None,
-            "reason": None,
-            "execution_authorized": False,
-            "timestamp": datetime.now(
-                timezone.utc
-            ).isoformat(),
-        }
-
-        if symbol not in self.instruments:
-
-            result.update({
-                "status": "REJECTED",
-                "reason": "INSTRUMENT_NOT_APPROVED",
-            })
-
-            return self._store_result(
+            candles = self._get_candles(
                 symbol,
-                result,
+                timeframe,
+                self.CANDLE_COUNT,
             )
 
-        try:
-
-            # ------------------------------------------
-            # COLLECT H1, M5 AND M1
-            # ------------------------------------------
-
-            timeframe_results = await asyncio.gather(
-                *[
-                    self._collect_timeframe(
-                        symbol,
-                        timeframe,
-                    )
-                    for timeframe in self.STRATEGY_TIMEFRAMES
-                ],
-                return_exceptions=True,
-            )
-
-            market_data = {}
-            data_errors = []
-
-            for timeframe, item in zip(
-                self.STRATEGY_TIMEFRAMES,
-                timeframe_results,
-            ):
-
-                if isinstance(item, Exception):
-
-                    data_errors.append({
-                        "timeframe": timeframe,
-                        "error": str(item),
-                    })
-
-                    continue
-
-                result["timeframes"][timeframe] = item
-
-                if item.get("valid") is not True:
-
-                    data_errors.append({
-                        "timeframe": timeframe,
-                        "error": item.get("reason"),
-                    })
-
-                    continue
-
-                market_data[timeframe] = {
-                    "candles": item["candles"],
-                    "technical": item["technical"],
-                }
-
-            # ------------------------------------------
-            # REQUIRED TIMEFRAME VALIDATION
-            # ------------------------------------------
-
-            if (
-                data_errors
-                or len(market_data) != len(
-                    self.STRATEGY_TIMEFRAMES
-                )
-            ):
-
-                result.update({
-                    "status": "DATA_INCOMPLETE",
-                    "reason": (
-                        "REQUIRED_TIMEFRAME_DATA_UNAVAILABLE"
-                    ),
-                    "data_errors": data_errors,
-                })
-
-                return self._store_result(
-                    symbol,
-                    result,
-                )
-
-            # ------------------------------------------
-            # GET FRESH LIVE BID/ASK
-            # ------------------------------------------
-
-            live_tick = self._get_validated_live_tick(
-                symbol
-            )
-
-            if live_tick is None:
-
-                result.update({
-                    "status": "LIVE_TICK_UNAVAILABLE",
-                    "reason": (
-                        "NO_VALID_FRESH_LIVE_BID_ASK"
-                    ),
-                    "execution_authorized": False,
-                })
+            if len(candles) < 50:
 
                 logger.warning(
-                    "Live tick unavailable or stale | %s",
+                    "%s | %s | Insufficient candles: %s",
                     symbol,
+                    timeframe,
+                    len(candles),
                 )
 
-                return self._store_result(
-                    symbol,
-                    result,
-                )
+                result[timeframe] = {
+                    "candles": candles,
+                    "technical": {
+                        "status": "INSUFFICIENT_DATA",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "candles": len(candles),
+                    },
+                }
 
-            current_price = live_tick["mid"]
+                continue
 
-            if (
-                not math.isfinite(current_price)
-                or current_price <= 0
-            ):
-
-                result.update({
-                    "status": "INVALID_PRICE",
-                    "reason": "CURRENT_PRICE_INVALID",
-                })
-
-                return self._store_result(
-                    symbol,
-                    result,
-                )
-
-            # Make validated live market prices
-            # accessible to the SMC analysis input.
-            market_data["live_tick"] = dict(
-                live_tick
+            technical = self._analyse_timeframe(
+                symbol,
+                timeframe,
+                candles,
             )
 
-            result.update({
-                "current_price": current_price,
-                "bid": live_tick["bid"],
-                "ask": live_tick["ask"],
-                "spread": live_tick["spread"],
-                "tick_timestamp": live_tick["timestamp"],
-                "tick_age_seconds": live_tick["age"],
-                "live_tick_fresh": True,
-            })
+            result[timeframe] = {
+                "candles": candles,
+                "technical": technical,
+            }
 
-            # ------------------------------------------
-            # MASTER SMC ENGINE
-            # ------------------------------------------
+        return result
 
-            decision = await self._resolve(
-                self.smc.analyse(
-                    market_data=market_data,
-                    current_price=current_price,
-                    entry_evidence=None,
-                    poi_evidence=None,
-                    displacement_evidence=None,
-                    fvg_evidence=None,
-                    risk_checks=None,
-                    category_scores=None,
-                    fundamentals=None,
-                )
+    def _extract_entry_evidence(
+        self,
+        market_data,
+    ):
+
+        m1 = market_data.get(
+            "M1",
+            {},
+        )
+
+        technical = self._safe_dict(
+            m1.get("technical")
+        )
+
+        candidates = (
+            technical.get("entry_models"),
+            technical.get("entry_evidence"),
+            technical.get("confirmed_entry_models"),
+            technical.get("signals"),
+        )
+
+        for candidate in candidates:
+
+            if candidate:
+
+                return candidate
+
+        # Do not invent entry confirmations.
+        return None
+
+    def _extract_poi_evidence(
+        self,
+        market_data,
+    ):
+
+        evidence = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            tf_data = market_data.get(
+                timeframe,
+                {},
+            )
+
+            technical = self._safe_dict(
+                tf_data.get("technical")
+            )
+
+            candidates = (
+                technical.get("poi_evidence"),
+                technical.get("points_of_interest"),
+                technical.get("order_blocks"),
+                technical.get("ob_candidates"),
+                technical.get("fvg"),
+                technical.get("fvgs"),
+                technical.get("fair_value_gaps"),
+            )
+
+            found = []
+
+            for candidate in candidates:
+
+                if candidate:
+
+                    if isinstance(candidate, list):
+
+                        found.extend(candidate)
+
+                    elif isinstance(candidate, dict):
+
+                        found.append(candidate)
+
+            evidence[timeframe] = found
+
+        if not any(evidence.values()):
+
+            return None
+
+        return evidence
+
+    def _extract_displacement_evidence(
+        self,
+        market_data,
+    ):
+
+        evidence = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            tf_data = market_data.get(
+                timeframe,
+                {},
+            )
+
+            technical = self._safe_dict(
+                tf_data.get("technical")
+            )
+
+            displacement = technical.get(
+                "displacement",
+                technical.get(
+                    "displacement_evidence"
+                ),
+            )
+
+            if displacement:
+
+                evidence[timeframe] = displacement
+
+        if not evidence:
+
+            return None
+
+        return evidence
+
+    def _extract_fvg_evidence(
+        self,
+        market_data,
+    ):
+
+        evidence = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            tf_data = market_data.get(
+                timeframe,
+                {},
+            )
+
+            technical = self._safe_dict(
+                tf_data.get("technical")
+            )
+
+            fvg = technical.get(
+                "fvg",
+                technical.get(
+                    "fvgs",
+                    technical.get(
+                        "fair_value_gaps"
+                    ),
+                ),
+            )
+
+            if fvg:
+
+                evidence[timeframe] = fvg
+
+        if not evidence:
+
+            return None
+
+        return evidence
+
+    # =========================================================
+    # RISK CHECK INPUT
+    # =========================================================
+
+    def _collect_risk_checks(
+        self,
+        symbol,
+        market_data,
+        current_price,
+    ):
+
+        # Scanner does not manufacture successful risk checks.
+        # Actual risk validation must be supplied by the
+        # integrated risk-management component.
+
+        return None
+
+    # =========================================================
+    # MASTER SMC ANALYSIS
+    # =========================================================
+
+    def _run_smc_analysis(
+        self,
+        symbol,
+        market_data,
+        current_price,
+    ):
+
+        engine = self.smc_engine
+
+        if engine is None:
+
+            return {
+                "status": "SMC_ENGINE_UNAVAILABLE",
+                "a_plus": False,
+                "execution_authorized": False,
+            }
+
+        method = getattr(
+            engine,
+            "analyse",
+            None,
+        )
+
+        if not callable(method):
+
+            method = getattr(
+                engine,
+                "analyze",
+                None,
+            )
+
+        if not callable(method):
+
+            return {
+                "status": "SMC_METHOD_UNAVAILABLE",
+                "a_plus": False,
+                "execution_authorized": False,
+            }
+
+        entry_evidence = (
+            self._extract_entry_evidence(
+                market_data
+            )
+        )
+
+        poi_evidence = (
+            self._extract_poi_evidence(
+                market_data
+            )
+        )
+
+        displacement_evidence = (
+            self._extract_displacement_evidence(
+                market_data
+            )
+        )
+
+        fvg_evidence = (
+            self._extract_fvg_evidence(
+                market_data
+            )
+        )
+
+        risk_checks = (
+            self._collect_risk_checks(
+                symbol,
+                market_data,
+                current_price,
+            )
+        )
+
+        try:
+
+            decision = method(
+                market_data=market_data,
+                current_price=current_price,
+                entry_evidence=entry_evidence,
+                poi_evidence=poi_evidence,
+                displacement_evidence=(
+                    displacement_evidence
+                ),
+                fvg_evidence=fvg_evidence,
+                risk_checks=risk_checks,
+                category_scores=None,
+                fundamentals=None,
             )
 
             if not isinstance(decision, dict):
 
-                result.update({
-                    "status": "ANALYSIS_ERROR",
-                    "reason": (
-                        "MASTER_SMC_RETURNED_INVALID_RESULT"
-                    ),
-                })
+                return {
+                    "status": "INVALID_SMC_RESPONSE",
+                    "a_plus": False,
+                    "execution_authorized": False,
+                }
 
-                return self._store_result(
+            return decision
+
+        except Exception as exc:
+
+            logger.error(
+                "%s | SMC analysis failed: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+
+            return {
+                "status": "SMC_ANALYSIS_ERROR",
+                "error": str(exc),
+                "a_plus": False,
+                "execution_authorized": False,
+            }
+
+    # =========================================================
+    # SCAN ONE INSTRUMENT
+    # =========================================================
+
+    def scan_instrument(
+        self,
+        symbol,
+    ):
+
+        if symbol not in self.INSTRUMENTS:
+
+            raise ValueError(
+                "Instrument not approved for V1: "
+                + str(symbol)
+            )
+
+        scan_started = time.time()
+
+        logger.info(
+            "Scanning %s",
+            symbol,
+        )
+
+        try:
+
+            current_price = self._get_live_price(
+                symbol
+            )
+
+            market_data = (
+                self._collect_market_data(
+                    symbol
+                )
+            )
+
+            valid_timeframes = []
+
+            for timeframe in self.TIMEFRAMES:
+
+                tf_data = market_data.get(
+                    timeframe,
+                    {},
+                )
+
+                candles = tf_data.get(
+                    "candles",
+                    [],
+                )
+
+                technical = self._safe_dict(
+                    tf_data.get("technical")
+                )
+
+                if (
+                    len(candles) >= 50
+                    and technical.get("status")
+                    != "INSUFFICIENT_DATA"
+                ):
+
+                    valid_timeframes.append(
+                        timeframe
+                    )
+
+            if len(valid_timeframes) != 3:
+
+                result = {
+                    "symbol": symbol,
+                    "status": "INSUFFICIENT_MARKET_DATA",
+                    "timestamp": self._utc_now(),
+                    "current_price": current_price,
+                    "valid_timeframes": (
+                        valid_timeframes
+                    ),
+                    "market_data": market_data,
+                    "setup_found": False,
+                    "a_plus": False,
+                    "execution_authorized": False,
+                }
+
+                self._update_instrument_state(
                     symbol,
                     result,
                 )
 
-            result["analysis"] = decision
+                return result
 
-            setup_found = (
-                decision.get("status") == "A_PLUS_SETUP"
-                and decision.get("a_plus") is True
-                and decision.get(
-                    "execution_authorized"
-                ) is True
-            )
+            if current_price is None:
 
-            result.update({
-                "status": (
-                    "SETUP_CANDIDATE"
-                    if setup_found
-                    else "NO_CONFIRMED_SETUP"
-                ),
-                "setup_found": setup_found,
-                "direction": decision.get("direction"),
-                "reason": decision.get("reason"),
-                "execution_authorized": False,
-            })
+                result = {
+                    "symbol": symbol,
+                    "status": "LIVE_PRICE_UNAVAILABLE",
+                    "timestamp": self._utc_now(),
+                    "market_data": market_data,
+                    "setup_found": False,
+                    "a_plus": False,
+                    "execution_authorized": False,
+                }
 
-            logger.info(
-                "Analysis complete | %s | "
-                "Bid: %s | Ask: %s | Mid: %s | "
-                "Tick age: %.2fs | Status: %s | "
-                "Direction: %s",
+                self._update_instrument_state(
+                    symbol,
+                    result,
+                )
+
+                return result
+
+            decision = self._run_smc_analysis(
                 symbol,
-                live_tick["bid"],
-                live_tick["ask"],
+                market_data,
                 current_price,
-                live_tick["age"],
-                result["status"],
-                result["direction"],
             )
 
-            return self._store_result(
+            status = decision.get(
+                "status",
+                "UNKNOWN",
+            )
+
+            # Master SMC setup detection.
+            a_plus = (
+                status == "A_PLUS_SETUP"
+                and decision.get("a_plus") is True
+            )
+
+            # Authorization must be explicitly returned
+            # by a verified authorization component.
+            execution_authorized = (
+                decision.get(
+                    "execution_authorized",
+                    False,
+                )
+                is True
+            )
+
+            result = {
+                "symbol": symbol,
+                "status": status,
+                "timestamp": self._utc_now(),
+                "scan_duration": (
+                    time.time() - scan_started
+                ),
+                "current_price": current_price,
+                "market_data": market_data,
+                "smc_decision": decision,
+                "setup_found": a_plus,
+                "a_plus": a_plus,
+                "a_plus_score": decision.get(
+                    "a_plus_score",
+                    decision.get(
+                        "score",
+                        0,
+                    ),
+                ),
+                "setup_direction": decision.get(
+                    "direction"
+                ),
+                "setup_type": decision.get(
+                    "pathway",
+                    decision.get(
+                        "setup_type"
+                    ),
+                ),
+                "execution_authorized": (
+                    execution_authorized
+                ),
+            }
+
+            self._update_instrument_state(
                 symbol,
                 result,
             )
+
+            if a_plus:
+
+                logger.warning(
+                    "A+ SETUP | %s | Direction=%s "
+                    "| Pathway=%s | Score=%s "
+                    "| ExecutionAuthorized=%s",
+                    symbol,
+                    result["setup_direction"],
+                    result["setup_type"],
+                    result["a_plus_score"],
+                    execution_authorized,
+                )
+
+            else:
+
+                logger.info(
+                    "%s | Status=%s | No A+ setup",
+                    symbol,
+                    status,
+                )
+
+            return result
 
         except Exception as exc:
 
-            logger.exception(
-                "Instrument scan failed: %s",
+            self.error_count += 1
+
+            logger.error(
+                "Scan failed for %s: %s",
                 symbol,
+                exc,
+                exc_info=True,
             )
 
-            result.update({
-                "status": "ERROR",
-                "reason": str(exc),
-            })
+            result = {
+                "symbol": symbol,
+                "status": "SCAN_ERROR",
+                "timestamp": self._utc_now(),
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "setup_found": False,
+                "a_plus": False,
+                "execution_authorized": False,
+            }
 
-            return self._store_result(
+            self._update_instrument_state(
                 symbol,
                 result,
             )
 
-    # --------------------------------------------------
-    # STORE RESULTS
-    # --------------------------------------------------
+            return result
 
-    def _store_result(
+    # =========================================================
+    # STATE MANAGEMENT
+    # =========================================================
+
+    def _update_instrument_state(
         self,
-        symbol: str,
-        result: Dict[str, Any],
+        symbol,
+        result,
     ):
 
-        self.results[symbol] = result
+        with self._lock:
 
-        if result["status"] in (
-            "ERROR",
-            "ANALYSIS_ERROR",
-        ):
+            self.instrument_states[symbol].update(
+                {
+                    "status": result.get(
+                        "status"
+                    ),
+                    "last_scan": result.get(
+                        "timestamp"
+                    ),
+                    "last_price": result.get(
+                        "current_price"
+                    ),
+                    "last_error": result.get(
+                        "error"
+                    ),
+                    "setup_found": result.get(
+                        "setup_found",
+                        False,
+                    ),
+                    "setup_direction": result.get(
+                        "setup_direction"
+                    ),
+                    "setup_type": result.get(
+                        "setup_type"
+                    ),
+                    "a_plus_score": result.get(
+                        "a_plus_score",
+                        0,
+                    ),
+                    "execution_authorized": (
+                        result.get(
+                            "execution_authorized",
+                            False,
+                        )
+                    ),
+                }
+            )
 
-            self.failed_scans += 1
+            self.last_scan_results[symbol] = (
+                result
+            )
 
-        else:
+    # =========================================================
+    # SCAN ALL APPROVED INSTRUMENTS
+    # =========================================================
 
-            self.successful_scans += 1
+    def scan_all(self):
 
-        return result
+        scan_started = time.time()
 
-    # --------------------------------------------------
-    # SCAN PILOT
-    # --------------------------------------------------
+        results = {}
 
-    async def scan_all(self):
+        logger.info(
+            "Starting Vrotex V1 full scan"
+        )
 
-        async with self.scan_lock:
+        # Sequential scanning is intentional:
+        # avoids unnecessary resource pressure
+        # on the phone/cloud runtime.
 
-            self.total_scans += 1
+        for symbol in self.INSTRUMENTS:
+
+            if self._stop_event.is_set():
+
+                break
+
+            results[symbol] = (
+                self.scan_instrument(
+                    symbol
+                )
+            )
+
+        with self._lock:
+
+            self.scan_count += 1
 
             self.last_scan_time = (
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
+                self._utc_now()
             )
 
-            logger.info(
-                "Starting V1 market scan | "
-                "%s instruments | %s",
-                len(self.instruments),
-                ", ".join(self.instruments),
-            )
+        duration = (
+            time.time() - scan_started
+        )
 
-            tasks = [
-                self.scan_instrument(symbol)
-                for symbol in self.instruments
-            ]
+        logger.info(
+            "Full scan completed | "
+            "Instruments=%s | Duration=%.2fs",
+            len(results),
+            duration,
+        )
 
-            results = await asyncio.gather(
-                *tasks,
-                return_exceptions=True,
-            )
+        return {
+            "timestamp": self._utc_now(),
+            "scan_number": self.scan_count,
+            "duration": duration,
+            "instruments_scanned": len(
+                results
+            ),
+            "results": results,
+        }
 
-            completed = {}
+    # =========================================================
+    # CONTINUOUS SCANNER
+    # =========================================================
 
-            for symbol, scan_result in zip(
-                self.instruments,
-                results,
-            ):
-
-                if isinstance(scan_result, Exception):
-
-                    logger.error(
-                        "Scan task failed | %s | %s",
-                        symbol,
-                        scan_result,
-                    )
-
-                    completed[symbol] = {
-                        "symbol": symbol,
-                        "status": "ERROR",
-                        "setup_found": False,
-                        "reason": str(scan_result),
-                        "execution_authorized": False,
-                    }
-
-                    self.failed_scans += 1
-
-                else:
-
-                    completed[symbol] = scan_result
-
-            self.status = "RUNNING"
-
-            setup_count = sum(
-                1
-                for item in completed.values()
-                if item.get("setup_found") is True
-            )
-
-            logger.info(
-                "V1 scan complete | "
-                "%s instruments | "
-                "%s setup candidates",
-                len(completed),
-                setup_count,
-            )
-
-            return {
-                "status": "COMPLETED",
-                "timestamp": self.last_scan_time,
-                "total_instruments": len(completed),
-                "setup_candidates": setup_count,
-                "results": completed,
-                "execution_authorized": False,
-            }
-
-    # --------------------------------------------------
-    # CONTINUOUS SCANNING
-    # --------------------------------------------------
-
-    async def run(self):
+    def run(self):
 
         if self.running:
 
             logger.warning(
-                "Market scanner is already running"
+                "Scanner is already running"
             )
 
             return
 
         self.running = True
-        self.stop_event.clear()
-        self.status = "RUNNING"
+
+        self._stop_event.clear()
 
         logger.info(
-            "Vrotex V1 market scanner started"
-        )
-
-        logger.info(
-            "Pilot instruments: %s",
-            ", ".join(self.instruments),
-        )
-
-        logger.info(
-            "Strategy timeframes: H1 -> M5 -> M1"
-        )
-
-        logger.info(
-            "Candles per strategy timeframe: %s",
-            self.CANDLE_COUNT,
+            "Market Scanner started | "
+            "Interval=%ss",
+            self.scan_interval,
         )
 
         try:
 
-            while self.running:
+            while not self._stop_event.is_set():
 
-                started = (
-                    asyncio.get_running_loop().time()
-                )
-
-                await self.scan_all()
-
-                elapsed = (
-                    asyncio.get_running_loop().time()
-                    - started
-                )
-
-                delay = max(
-                    1,
-                    self.scan_interval - elapsed,
-                )
+                scan_started = time.time()
 
                 try:
 
-                    await asyncio.wait_for(
-                        self.stop_event.wait(),
-                        timeout=delay,
+                    self.scan_all()
+
+                except Exception:
+
+                    self.error_count += 1
+
+                    logger.error(
+                        "Full scan cycle failed",
+                        exc_info=True,
                     )
 
-                    break
+                elapsed = (
+                    time.time() - scan_started
+                )
 
-                except asyncio.TimeoutError:
+                remaining = max(
+                    0,
+                    self.scan_interval - elapsed,
+                )
 
-                    continue
+                if remaining > 0:
 
-        except asyncio.CancelledError:
-
-            logger.info(
-                "Market scanner task cancelled"
-            )
-
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "Market scanner loop failed"
-            )
-
-            self.status = "ERROR"
+                    self._stop_event.wait(
+                        remaining
+                    )
 
         finally:
 
             self.running = False
 
-            if self.status != "ERROR":
-                self.status = "STOPPED"
-
             logger.info(
-                "Vrotex V1 market scanner stopped"
+                "Market Scanner stopped"
             )
 
-    # --------------------------------------------------
+    # =========================================================
     # STOP
-    # --------------------------------------------------
+    # =========================================================
 
-    async def stop(self):
-
-        self.running = False
-        self.stop_event.set()
+    def stop(self):
 
         logger.info(
-            "Market scanner stop requested"
+            "Stopping Market Scanner"
         )
 
-    # --------------------------------------------------
+        self._stop_event.set()
+
+        self.running = False
+
+    # =========================================================
     # STATUS
-    # --------------------------------------------------
+    # =========================================================
 
     def get_status(self):
 
-        live_ticks = self.market_data.get_live_ticks()
+        with self._lock:
 
-        return {
-            "module": "MarketScanner",
-            "version": self.VERSION,
-            "status": self.status,
-            "running": self.running,
-            "instruments": list(self.instruments),
-            "strategy_timeframes": list(
-                self.STRATEGY_TIMEFRAMES
-            ),
-            "candles_per_timeframe": self.CANDLE_COUNT,
-            "scan_interval_seconds": self.scan_interval,
-            "total_scans": self.total_scans,
-            "successful_scans": self.successful_scans,
-            "failed_scans": self.failed_scans,
-            "last_scan_time": self.last_scan_time,
-            "live_tick_count": len(live_ticks),
-            "live_tick_instruments": list(
-                live_ticks.keys()
-            ),
-            "execution_authorized": False,
-        }
+            return {
+                "version": self.VERSION,
+                "running": self.running,
+                "scan_interval": (
+                    self.scan_interval
+                ),
+                "instruments": (
+                    self.INSTRUMENTS
+                ),
+                "timeframes": (
+                    self.TIMEFRAMES
+                ),
+                "scan_count": (
+                    self.scan_count
+                ),
+                "error_count": (
+                    self.error_count
+                ),
+                "last_scan_time": (
+                    self.last_scan_time
+                ),
+                "instrument_states": (
+                    self.instrument_states.copy()
+                ),
+            }
 
+    # =========================================================
+    # LAST RESULTS
+    # =========================================================
+
+    def get_last_scan_results(self):
+
+        with self._lock:
+
+            return (
+                self.last_scan_results.copy()
+            )
+
+
+# =============================================================
+# SINGLETON
+# =============================================================
 
 market_scanner = MarketScanner()
-
-# Compatibility alias for engine.py
-scanner = market_scanner
