@@ -1,68 +1,85 @@
+
 """
-VROTEX BOT V1
-SMC Displacement Engine
+Vrotex Bot V1
+SMC Displacement Engine V3.0
 
 Purpose:
-- Detect bullish and bearish displacement candles.
-- Measure candle-body strength and range expansion.
-- Compare displacement against preceding ATR.
-- Identify consecutive directional displacement.
-- Return structured evidence for the master SMC engine.
+- Detect confirmed bullish and bearish displacement.
+- Calculate ATR using preceding candles only.
+- Detect consecutive displacement sequences.
+- Preserve timestamps and optional symbol/timeframe context.
+- Produce structured evidence for the Master SMC engine.
+- Support automatic trade authorization through the Master SMC
+  and execution architecture.
 
-Strategy:
-- Displacement must be supported by a strong candle body.
-- Candle direction must agree with the detected displacement.
-- Wick-only movement is not displacement confirmation.
-- This module does not authorize trade execution.
+IMPORTANT:
+This is an evidence producer. It does not independently authorize
+or execute orders. The Master SMC engine evaluates the complete
+setup, and the execution engine acts on its authorization.
 """
 
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class SMCDisplacementEngine:
-    VERSION = "2.0"
-
-    DEFAULT_ATR_PERIOD = 14
-    DEFAULT_MIN_BODY_RATIO = 0.60
-    DEFAULT_MIN_RANGE_ATR = 1.20
-    DEFAULT_MIN_BODY_ATR = 0.70
+    VERSION = "3.0"
 
     def __init__(
         self,
-        atr_period: int = DEFAULT_ATR_PERIOD,
-        min_body_ratio: float = DEFAULT_MIN_BODY_RATIO,
-        min_range_atr: float = DEFAULT_MIN_RANGE_ATR,
-        min_body_atr: float = DEFAULT_MIN_BODY_ATR,
+        atr_period: int = 14,
+        lookback: int = 10,
+        min_body_ratio: float = 0.60,
+        min_range_atr: float = 1.20,
+        min_body_atr: float = 0.70,
+        consecutive_minimum: int = 2,
     ):
         self.atr_period = max(2, int(atr_period))
+        self.lookback = max(1, int(lookback))
+
         self.min_body_ratio = float(min_body_ratio)
         self.min_range_atr = float(min_range_atr)
         self.min_body_atr = float(min_body_atr)
 
+        self.consecutive_minimum = max(
+            2, int(consecutive_minimum)
+        )
+
+        self.last_result: Dict[str, Any] = {}
+
+    # ---------------------------------------------------------
+    # NORMALIZATION
+    # ---------------------------------------------------------
+
     @staticmethod
     def _number(value: Any) -> Optional[float]:
         try:
-            result = float(value)
-            if result != result or abs(result) == float("inf"):
+            number = float(value)
+            if number != number:
                 return None
-            return result
-        except (TypeError, ValueError):
+            return number
+        except (TypeError, ValueError, OverflowError):
             return None
 
-    def _normalise_candles(
+    def _normalize_candles(
         self,
-        candles: List[Dict[str, Any]],
-    ) -> List[Dict[str, float]]:
-        normalised = []
+        candles: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized = []
 
-        for candle in candles:
-            if not isinstance(candle, dict):
+        if not isinstance(candles, (list, tuple)):
+            return normalized
+
+        for original_index, source in enumerate(candles):
+            if not isinstance(source, dict):
                 continue
 
-            open_price = self._number(candle.get("open"))
-            high = self._number(candle.get("high"))
-            low = self._number(candle.get("low"))
-            close = self._number(candle.get("close"))
+            open_price = self._number(source.get("open"))
+            high = self._number(source.get("high"))
+            low = self._number(source.get("low"))
+            close = self._number(source.get("close"))
 
             if None in (open_price, high, low, close):
                 continue
@@ -76,22 +93,32 @@ class SMCDisplacementEngine:
             if low > min(open_price, close):
                 continue
 
-            normalised.append({
+            normalized.append({
                 "open": open_price,
                 "high": high,
                 "low": low,
                 "close": close,
+                "timestamp": (
+                    source.get("timestamp")
+                    or source.get("time")
+                    or source.get("datetime")
+                ),
+                "original_index": original_index,
             })
 
-        return normalised
+        return normalized
+
+    # ---------------------------------------------------------
+    # ATR
+    # ---------------------------------------------------------
 
     @staticmethod
     def _true_range(
-        current: Dict[str, float],
+        candle: Dict[str, Any],
         previous_close: Optional[float],
     ) -> float:
-        high = current["high"]
-        low = current["low"]
+        high = candle["high"]
+        low = candle["low"]
 
         if previous_close is None:
             return high - low
@@ -104,46 +131,54 @@ class SMCDisplacementEngine:
 
     def _calculate_atr(
         self,
-        candles: List[Dict[str, float]],
-        end_index: int,
+        candles: List[Dict[str, Any]],
+        candidate_index: int,
     ) -> Optional[float]:
         """
-        Calculate ATR using candles BEFORE the candidate candle.
-
-        Excluding the candidate prevents its own expansion from
-        inflating the baseline used to validate displacement.
+        ATR is calculated from candles before the candidate.
+        The candidate displacement candle is excluded.
         """
-        start_index = max(0, end_index - self.atr_period)
 
-        if end_index - start_index < self.atr_period:
+        start = candidate_index - self.atr_period
+
+        if start < 0:
             return None
 
-        true_ranges = []
+        ranges = []
 
-        for index in range(start_index, end_index):
+        for position in range(start, candidate_index):
             previous_close = (
-                candles[index - 1]["close"]
-                if index > 0
+                candles[position - 1]["close"]
+                if position > 0
                 else None
             )
 
-            true_ranges.append(
+            ranges.append(
                 self._true_range(
-                    candles[index],
+                    candles[position],
                     previous_close,
                 )
             )
 
-        if not true_ranges:
+        if len(ranges) != self.atr_period:
             return None
 
-        return sum(true_ranges) / len(true_ranges)
+        atr = sum(ranges) / len(ranges)
+
+        return atr if atr > 0 else None
+
+    # ---------------------------------------------------------
+    # SINGLE CANDLE EVALUATION
+    # ---------------------------------------------------------
 
     def _evaluate_candle(
         self,
-        candles: List[Dict[str, float]],
+        candles: List[Dict[str, Any]],
         index: int,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
+
         candle = candles[index]
 
         open_price = candle["open"]
@@ -156,12 +191,19 @@ class SMCDisplacementEngine:
 
         if candle_range <= 0:
             return {
-                "detected": False,
-                "reason": "ZERO_CANDLE_RANGE",
+                "confirmed": False,
+                "reason": "ZERO_RANGE",
                 "index": index,
             }
 
-        body_ratio = body / candle_range
+        atr = self._calculate_atr(candles, index)
+
+        if atr is None:
+            return {
+                "confirmed": False,
+                "reason": "INSUFFICIENT_PRECEDING_ATR_DATA",
+                "index": index,
+            }
 
         if close > open_price:
             direction = "BULLISH"
@@ -170,180 +212,430 @@ class SMCDisplacementEngine:
         else:
             direction = "NEUTRAL"
 
-        atr = self._calculate_atr(candles, index)
-
-        if atr is None or atr <= 0:
-            return {
-                "detected": False,
-                "reason": "INSUFFICIENT_ATR_HISTORY",
-                "index": index,
-                "direction": direction,
-                "body_ratio": round(body_ratio, 4),
-                "range": candle_range,
-                "body": body,
-            }
-
+        body_ratio = body / candle_range
         range_atr = candle_range / atr
         body_atr = body / atr
 
-        checks = {
-            "directional_candle": direction != "NEUTRAL",
-            "strong_body": body_ratio >= self.min_body_ratio,
-            "range_expansion": range_atr >= self.min_range_atr,
-            "body_expansion": body_atr >= self.min_body_atr,
-        }
+        body_confirmed = (
+            body_ratio >= self.min_body_ratio
+        )
 
-        detected = all(checks.values())
+        range_confirmed = (
+            range_atr >= self.min_range_atr
+        )
+
+        body_size_confirmed = (
+            body_atr >= self.min_body_atr
+        )
+
+        directional = direction in ("BULLISH", "BEARISH")
+
+        confirmed = (
+            directional
+            and body_confirmed
+            and range_confirmed
+            and body_size_confirmed
+        )
+
+        reasons = []
+
+        if not directional:
+            reasons.append("NO_DIRECTIONAL_BODY")
+
+        if not body_confirmed:
+            reasons.append("BODY_RATIO_BELOW_THRESHOLD")
+
+        if not range_confirmed:
+            reasons.append("RANGE_BELOW_ATR_THRESHOLD")
+
+        if not body_size_confirmed:
+            reasons.append("BODY_BELOW_ATR_THRESHOLD")
 
         return {
-            "detected": detected,
-            "confirmed": detected,
+            "confirmed": confirmed,
             "direction": direction,
             "index": index,
+            "candle_index": index,
+            "original_index": candle["original_index"],
+            "timestamp": candle.get("timestamp"),
+            "symbol": symbol,
+            "timeframe": timeframe,
             "open": open_price,
             "high": high,
             "low": low,
             "close": close,
-            "range": round(candle_range, 8),
-            "body": round(body, 8),
-            "body_ratio": round(body_ratio, 4),
-            "atr": round(atr, 8),
-            "range_atr": round(range_atr, 4),
-            "body_atr": round(body_atr, 4),
-            "checks": checks,
-            "confirmation": (
-                "BODY_DISPLACEMENT"
-                if detected
-                else "DISPLACEMENT_NOT_CONFIRMED"
-            ),
+            "body_size": body,
+            "candle_range": candle_range,
+            "atr": atr,
+            "body_ratio": round(body_ratio, 6),
+            "range_atr": round(range_atr, 6),
+            "body_atr": round(body_atr, 6),
+            "body_confirmed": body_confirmed,
+            "range_confirmed": range_confirmed,
+            "body_size_confirmed": body_size_confirmed,
+            "reasons": reasons,
+            "invalidated": False,
         }
+
+    # ---------------------------------------------------------
+    # CONSECUTIVE DISPLACEMENT
+    # ---------------------------------------------------------
+
+    def _detect_sequences(
+        self,
+        events: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+
+        sequences = []
+        current = []
+
+        for event in events:
+            if not event.get("confirmed"):
+                if len(current) >= self.consecutive_minimum:
+                    sequences.append(self._build_sequence(current))
+                current = []
+                continue
+
+            if not current:
+                current = [event]
+                continue
+
+            previous = current[-1]
+
+            consecutive_index = (
+                event["index"] == previous["index"] + 1
+            )
+
+            same_direction = (
+                event["direction"] == previous["direction"]
+            )
+
+            if consecutive_index and same_direction:
+                current.append(event)
+            else:
+                if len(current) >= self.consecutive_minimum:
+                    sequences.append(self._build_sequence(current))
+
+                current = [event]
+
+        if len(current) >= self.consecutive_minimum:
+            sequences.append(self._build_sequence(current))
+
+        return sequences
+
+    @staticmethod
+    def _build_sequence(
+        events: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+
+        first = events[0]
+        last = events[-1]
+
+        return {
+            "confirmed": True,
+            "direction": first["direction"],
+            "start_index": first["index"],
+            "end_index": last["index"],
+            "start_timestamp": first.get("timestamp"),
+            "end_timestamp": last.get("timestamp"),
+            "count": len(events),
+            "events": deepcopy(events),
+        }
+
+    # ---------------------------------------------------------
+    # MAIN ANALYSIS
+    # ---------------------------------------------------------
 
     def analyse(
         self,
-        candles: List[Dict[str, Any]],
-        lookback: int = 10,
+        candles: Sequence[Dict[str, Any]],
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not isinstance(candles, list):
-            return self._error("INVALID_CANDLE_INPUT")
 
-        normalised = self._normalise_candles(candles)
+        normalized = self._normalize_candles(candles)
 
-        minimum_required = self.atr_period + 1
-
-        if len(normalised) < minimum_required:
-            return self._error(
+        if len(normalized) <= self.atr_period:
+            result = self._error(
                 "INSUFFICIENT_CANDLES",
-                candle_count=len(normalised),
-                minimum_required=minimum_required,
+                len(normalized),
             )
+            self.last_result = deepcopy(result)
+            return result
 
-        lookback = max(1, int(lookback))
-        start_index = max(0, len(normalised) - lookback)
+        first_index = max(
+            self.atr_period,
+            len(normalized) - self.lookback,
+        )
 
         events = []
 
-        for index in range(start_index, len(normalised)):
-            result = self._evaluate_candle(normalised, index)
+        for index in range(first_index, len(normalized)):
+            event = self._evaluate_candle(
+                normalized,
+                index,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            events.append(event)
 
-            if result.get("detected"):
-                events.append(result)
+        confirmed_events = [
+            event for event in events
+            if event.get("confirmed")
+        ]
 
         bullish = [
-            event for event in events
+            event for event in confirmed_events
             if event["direction"] == "BULLISH"
         ]
 
         bearish = [
-            event for event in events
+            event for event in confirmed_events
             if event["direction"] == "BEARISH"
         ]
 
+        sequences = self._detect_sequences(events)
+
+        bullish_sequences = [
+            sequence for sequence in sequences
+            if sequence["direction"] == "BULLISH"
+        ]
+
+        bearish_sequences = [
+            sequence for sequence in sequences
+            if sequence["direction"] == "BEARISH"
+        ]
+
         latest = (
-            events[-1]
-            if events
+            confirmed_events[-1]
+            if confirmed_events
             else None
         )
 
-        return {
-            "status": "ANALYZED",
+        latest_is_current = bool(
+            latest
+            and latest["index"] == len(normalized) - 1
+        )
+
+        latest_evidence = None
+
+        if latest:
+            latest_evidence = deepcopy(latest)
+            latest_evidence["fresh"] = latest_is_current
+            latest_evidence["candle_index"] = latest["index"]
+            latest_evidence["invalidated"] = False
+            latest_evidence["confirmation"] = (
+                "BODY_DISPLACEMENT"
+            )
+
+        result = {
+            "success": True,
             "version": self.VERSION,
-            "candle_count": len(normalised),
-            "lookback": lookback,
-            "detected": bool(events),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles_analyzed": len(normalized),
+            "lookback": self.lookback,
+            "atr_period": self.atr_period,
+
+            "detected": bool(confirmed_events),
             "confirmed": bool(latest),
             "direction": (
-                latest["direction"]
-                if latest
-                else "NEUTRAL"
+                latest["direction"] if latest else None
             ),
-            "latest_displacement": latest,
-            "displacements": events,
-            "bullish_displacements": bullish,
-            "bearish_displacements": bearish,
-            "count": len(events),
+
+            "index": (
+                latest["index"] if latest else None
+            ),
+            "candle_index": (
+                latest["index"] if latest else None
+            ),
+
+            "fresh": latest_is_current,
             "confirmation": (
-                "BODY_DISPLACEMENT"
+                "BODY_DISPLACEMENT" if latest else None
+            ),
+            "invalidated": False,
+
+            "latest_displacement": latest_evidence,
+            "displacements": deepcopy(confirmed_events),
+            "bullish_displacements": deepcopy(bullish),
+            "bearish_displacements": deepcopy(bearish),
+
+            "sequences": deepcopy(sequences),
+            "bullish_sequences": deepcopy(bullish_sequences),
+            "bearish_sequences": deepcopy(bearish_sequences),
+
+            "sequence_detected": bool(sequences),
+            "evidence_only": True,
+            "trade_authorization": False,
+            "execution_authorized": False,
+            "reason": (
+                "DISPLACEMENT_CONFIRMED"
                 if latest
                 else "NO_CONFIRMED_DISPLACEMENT"
             ),
         }
 
+        self.last_result = deepcopy(result)
+        return result
+
+    # ---------------------------------------------------------
+    # AMERICAN SPELLING COMPATIBILITY
+    # ---------------------------------------------------------
+
     def analyze(
         self,
-        candles: List[Dict[str, Any]],
-        lookback: int = 10,
+        candles: Sequence[Dict[str, Any]],
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self.analyse(candles, lookback)
+
+        return self.analyse(
+            candles=candles,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+    # ---------------------------------------------------------
+    # DIRECTIONAL VALIDATION
+    # ---------------------------------------------------------
 
     def validate_displacement(
         self,
-        candles: List[Dict[str, Any]],
-        direction: str,
-        lookback: int = 10,
+        analysis: Dict[str, Any],
+        expected_direction: str,
+        require_fresh: bool = False,
     ) -> Dict[str, Any]:
-        result = self.analyse(candles, lookback)
 
-        expected = str(direction).upper()
+        expected = str(
+            expected_direction or ""
+        ).upper()
 
         if expected not in ("BULLISH", "BEARISH"):
             return {
                 "valid": False,
-                "reason": "INVALID_DIRECTION",
-                "expected_direction": expected,
+                "confirmed": False,
+                "reason": "INVALID_EXPECTED_DIRECTION",
+                "direction": expected,
             }
 
+        if not isinstance(analysis, dict):
+            return {
+                "valid": False,
+                "confirmed": False,
+                "reason": "INVALID_ANALYSIS",
+                "direction": expected,
+            }
+
+        events = analysis.get("displacements", [])
+
+        if not isinstance(events, list):
+            events = []
+
         matching = [
-            event for event in result.get("displacements", [])
-            if event["direction"] == expected
+            event for event in events
+            if (
+                isinstance(event, dict)
+                and event.get("confirmed") is True
+                and event.get("direction") == expected
+                and event.get("invalidated") is not True
+            )
         ]
 
+        latest = matching[-1] if matching else None
+
+        if latest is None:
+            return {
+                "valid": False,
+                "confirmed": False,
+                "reason": "NO_MATCHING_DIRECTIONAL_DISPLACEMENT",
+                "direction": expected,
+                "matching_events": [],
+            }
+
+        latest_index = latest.get(
+            "index",
+            latest.get("candle_index"),
+        )
+
+        analysis_current_index = (
+            analysis.get("candles_analyzed", 0) - 1
+        )
+
+        fresh = (
+            latest_index == analysis_current_index
+        )
+
+        if require_fresh and not fresh:
+            return {
+                "valid": False,
+                "confirmed": False,
+                "reason": "DISPLACEMENT_NOT_FRESH",
+                "direction": expected,
+                "fresh": False,
+                "latest": deepcopy(latest),
+                "matching_events": deepcopy(matching),
+            }
+
+        evidence = deepcopy(latest)
+        evidence["fresh"] = fresh
+        evidence["candle_index"] = latest_index
+        evidence["confirmation"] = "BODY_DISPLACEMENT"
+        evidence["invalidated"] = False
+
         return {
-            "valid": bool(matching),
-            "detected": bool(matching),
+            "valid": True,
+            "confirmed": True,
             "direction": expected,
-            "matching_displacements": matching,
-            "latest": matching[-1] if matching else None,
-            "reason": (
-                "DIRECTIONAL_DISPLACEMENT_CONFIRMED"
-                if matching
-                else "NO_MATCHING_DISPLACEMENT"
-            ),
+            "index": latest_index,
+            "candle_index": latest_index,
+            "fresh": fresh,
+            "confirmation": "BODY_DISPLACEMENT",
+            "invalidated": False,
+            "latest": evidence,
+            "matching_events": deepcopy(matching),
+            "reason": "DIRECTIONAL_DISPLACEMENT_VALIDATED",
         }
+
+    # ---------------------------------------------------------
+    # ERROR RESPONSE
+    # ---------------------------------------------------------
 
     @staticmethod
     def _error(
         reason: str,
-        **extra: Any,
+        candle_count: int = 0,
     ) -> Dict[str, Any]:
+
         return {
-            "status": "ERROR",
+            "success": False,
+            "version": SMCDisplacementEngine.VERSION,
             "detected": False,
             "confirmed": False,
-            "direction": "NEUTRAL",
+            "direction": None,
+            "index": None,
+            "candle_index": None,
+            "fresh": False,
+            "confirmation": None,
+            "invalidated": False,
+            "latest_displacement": None,
             "displacements": [],
-            "confirmation": reason,
-            **extra,
+            "bullish_displacements": [],
+            "bearish_displacements": [],
+            "sequences": [],
+            "bullish_sequences": [],
+            "bearish_sequences": [],
+            "sequence_detected": False,
+            "candles_analyzed": candle_count,
+            "evidence_only": True,
+            "trade_authorization": False,
+            "execution_authorized": False,
+            "reason": reason,
         }
 
+
+# -------------------------------------------------------------
+# SHARED ENGINE INSTANCE
+# -------------------------------------------------------------
 
 smc_displacement_engine = SMCDisplacementEngine()
