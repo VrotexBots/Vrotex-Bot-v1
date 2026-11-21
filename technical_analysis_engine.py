@@ -1,287 +1,402 @@
-from logging_config import get_logger
 
-logger = get_logger("technical_analysis_engine")
+"""
+Vrotex Bot V1
+Technical Analysis Engine V3.0
+
+Purpose:
+- Produce technical market evidence for the SMC system.
+- Identify market structure and body-close breaks.
+- Identify liquidity sweeps and equal highs/lows.
+- Detect fair value gaps and order-block candidates.
+- Calculate premium/discount and technical indicators.
+
+This module does not authorize or execute trades.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 class TechnicalAnalysisEngine:
+    VERSION = "3.0"
 
     def __init__(
         self,
-        swing_window=3,
-        atr_period=14,
-        rsi_period=14,
-        ema_periods=None,
-        structure_lookback=50,
-        displacement_multiplier=1.5,
+        swing_strength: int = 3,
+        atr_period: int = 14,
+        rsi_period: int = 14,
+        ema_periods: Optional[List[int]] = None,
+        equal_level_tolerance: float = 0.0002,
+        displacement_atr_multiple: float = 1.0,
     ):
+        self.swing_strength = max(1, int(swing_strength))
+        self.atr_period = max(2, int(atr_period))
+        self.rsi_period = max(2, int(rsi_period))
 
-        self.swing_window = max(1, int(swing_window))
-        self.atr_period = max(1, int(atr_period))
-        self.rsi_period = max(1, int(rsi_period))
+        self.ema_periods = ema_periods or [
+            20, 50, 100, 200
+        ]
 
-        self.ema_periods = (
-            ema_periods or [9, 20, 50, 200]
+        self.equal_level_tolerance = float(
+            equal_level_tolerance
         )
 
-        self.structure_lookback = max(
-            10,
-            int(structure_lookback),
+        self.displacement_atr_multiple = float(
+            displacement_atr_multiple
         )
 
-        self.displacement_multiplier = max(
-            1.0,
-            float(displacement_multiplier),
-        )
+        self.last_result: Dict[str, Any] = {}
 
-    # ==================================================
-    # CANDLE NORMALIZATION
-    # ==================================================
+    # ---------------------------------------------------------
+    # NORMALIZATION
+    # ---------------------------------------------------------
 
     @staticmethod
-    def normalize_candles(candles):
+    def _number(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+            if result != result:
+                return None
+            return result
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _normalize_candles(
+        self,
+        candles: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
 
         normalized = []
 
-        if not candles:
+        if not isinstance(candles, (list, tuple)):
             return normalized
 
-        for candle in candles:
+        for original_index, source in enumerate(candles):
+            if not isinstance(source, dict):
+                continue
 
-            try:
+            open_price = self._number(source.get("open"))
+            high = self._number(source.get("high"))
+            low = self._number(source.get("low"))
+            close = self._number(source.get("close"))
 
-                if not isinstance(candle, dict):
-                    continue
-
-                # Explicitly exclude unfinished candles.
-                if candle.get("is_closed") is False:
-                    continue
-
-                if candle.get("closed") is False:
-                    continue
-
-                if candle.get("complete") is False:
-                    continue
-
-                if candle.get("is_complete") is False:
-                    continue
-
-                item = {
-                    "time": candle.get("time"),
-                    "open": float(candle["open"]),
-                    "high": float(candle["high"]),
-                    "low": float(candle["low"]),
-                    "close": float(candle["close"]),
-                    "volume": float(
-                        candle.get("volume", 0) or 0
-                    ),
-                }
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-                OverflowError,
+            if None in (
+                open_price,
+                high,
+                low,
+                close,
             ):
                 continue
 
-            values = [
-                item["open"],
-                item["high"],
-                item["low"],
-                item["close"],
-                item["volume"],
-            ]
-
-            if any(
-                not isinstance(value, (int, float))
-                for value in values
-            ):
+            if high < low:
                 continue
 
-            if item["high"] < item["low"]:
+            if high < max(open_price, close):
                 continue
 
-            if item["high"] < max(
-                item["open"],
-                item["close"],
-            ):
+            if low > min(open_price, close):
                 continue
 
-            if item["low"] > min(
-                item["open"],
-                item["close"],
-            ):
-                continue
-
-            if (
-                item["open"] <= 0
-                or item["close"] <= 0
-                or item["high"] <= 0
-                or item["low"] <= 0
-            ):
-                continue
-
-            if item["volume"] < 0:
-                continue
-
-            normalized.append(item)
+            normalized.append({
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "timestamp": (
+                    source.get("timestamp")
+                    or source.get("time")
+                    or source.get("datetime")
+                ),
+                "volume": self._number(
+                    source.get("volume")
+                ),
+                "original_index": original_index,
+            })
 
         return normalized
 
-    # ==================================================
-    # SWING DETECTION
-    # ==================================================
+    # ---------------------------------------------------------
+    # TRUE RANGE AND ATR
+    # ---------------------------------------------------------
 
-    def find_swings(self, candles):
+    @staticmethod
+    def _true_range(
+        candle: Dict[str, Any],
+        previous_close: Optional[float],
+    ) -> float:
 
-        window = self.swing_window
+        if previous_close is None:
+            return candle["high"] - candle["low"]
 
-        swing_highs = []
-        swing_lows = []
+        return max(
+            candle["high"] - candle["low"],
+            abs(candle["high"] - previous_close),
+            abs(candle["low"] - previous_close),
+        )
 
-        if len(candles) < (window * 2 + 1):
-            return swing_highs, swing_lows
+    def calculate_atr(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> Optional[float]:
 
-        for i in range(
-            window,
-            len(candles) - window,
+        if len(candles) < self.atr_period + 1:
+            return None
+
+        ranges = []
+
+        start = len(candles) - self.atr_period
+
+        for index in range(start, len(candles)):
+            previous_close = candles[index - 1]["close"]
+
+            ranges.append(
+                self._true_range(
+                    candles[index],
+                    previous_close,
+                )
+            )
+
+        if not ranges:
+            return None
+
+        return sum(ranges) / len(ranges)
+
+    # ---------------------------------------------------------
+    # EMA
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def calculate_ema(
+        values: List[float],
+        period: int,
+    ) -> Optional[float]:
+
+        if period <= 0 or len(values) < period:
+            return None
+
+        multiplier = 2 / (period + 1)
+
+        ema = sum(values[:period]) / period
+
+        for value in values[period:]:
+            ema = (
+                value * multiplier
+                + ema * (1 - multiplier)
+            )
+
+        return ema
+
+    # ---------------------------------------------------------
+    # RSI
+    # ---------------------------------------------------------
+
+    def calculate_rsi(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> Optional[float]:
+
+        if len(candles) <= self.rsi_period:
+            return None
+
+        closes = [
+            candle["close"] for candle in candles
+        ]
+
+        gains = []
+        losses = []
+
+        for index in range(1, len(closes)):
+            change = closes[index] - closes[index - 1]
+
+            gains.append(max(change, 0))
+            losses.append(max(-change, 0))
+
+        average_gain = (
+            sum(gains[:self.rsi_period])
+            / self.rsi_period
+        )
+
+        average_loss = (
+            sum(losses[:self.rsi_period])
+            / self.rsi_period
+        )
+
+        for index in range(
+            self.rsi_period,
+            len(gains),
         ):
+            average_gain = (
+                average_gain * (self.rsi_period - 1)
+                + gains[index]
+            ) / self.rsi_period
 
-            current = candles[i]
+            average_loss = (
+                average_loss * (self.rsi_period - 1)
+                + losses[index]
+            ) / self.rsi_period
 
-            left = candles[i - window:i]
+        if average_loss == 0:
+            return 100.0 if average_gain > 0 else 50.0
 
-            right = candles[
-                i + 1:i + window + 1
-            ]
+        relative_strength = (
+            average_gain / average_loss
+        )
 
-            surrounding = left + right
+        return 100 - (
+            100 / (1 + relative_strength)
+        )
+
+    # ---------------------------------------------------------
+    # SWING DETECTION
+    # ---------------------------------------------------------
+
+    def detect_swings(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+
+        highs = []
+        lows = []
+
+        strength = self.swing_strength
+
+        for index in range(
+            strength,
+            len(candles) - strength,
+        ):
+            current = candles[index]
+
+            left = candles[index - strength:index]
+            right = candles[index + 1:index + strength + 1]
 
             is_high = all(
-                current["high"] > candle["high"]
-                for candle in surrounding
+                current["high"] > item["high"]
+                for item in left + right
             )
 
             is_low = all(
-                current["low"] < candle["low"]
-                for candle in surrounding
+                current["low"] < item["low"]
+                for item in left + right
             )
 
             if is_high:
-
-                swing_highs.append({
-                    "index": i,
+                highs.append({
                     "price": current["high"],
-                    "time": current["time"],
+                    "index": index,
+                    "timestamp": current.get("timestamp"),
+                    "type": "SWING_HIGH",
+                    "confirmed": True,
                 })
 
             if is_low:
-
-                swing_lows.append({
-                    "index": i,
+                lows.append({
                     "price": current["low"],
-                    "time": current["time"],
+                    "index": index,
+                    "timestamp": current.get("timestamp"),
+                    "type": "SWING_LOW",
+                    "confirmed": True,
                 })
 
-        return swing_highs, swing_lows
+        return {
+            "highs": highs,
+            "lows": lows,
+        }
 
-    # ==================================================
+    # ---------------------------------------------------------
     # MARKET STRUCTURE
-    # ==================================================
+    # ---------------------------------------------------------
 
-    @staticmethod
-    def determine_structure(
-        swing_highs,
-        swing_lows,
-    ):
+    def classify_structure(
+        self,
+        swings: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
 
-        if (
-            len(swing_highs) < 2
-            or len(swing_lows) < 2
-        ):
+        highs = swings["highs"]
+        lows = swings["lows"]
 
-            return {
-                "bias": "UNKNOWN",
-                "structure": [],
-                "reason": "Insufficient swing points",
-            }
+        high_labels = []
+        low_labels = []
 
-        highs = swing_highs[-2:]
-        lows = swing_lows[-2:]
+        for index in range(1, len(highs)):
+            current = highs[index]
+            previous = highs[index - 1]
 
-        higher_high = (
-            highs[-1]["price"]
-            > highs[-2]["price"]
+            label = (
+                "HH"
+                if current["price"] > previous["price"]
+                else "LH"
+            )
+
+            high_labels.append({
+                **current,
+                "label": label,
+            })
+
+        for index in range(1, len(lows)):
+            current = lows[index]
+            previous = lows[index - 1]
+
+            label = (
+                "HL"
+                if current["price"] > previous["price"]
+                else "LL"
+            )
+
+            low_labels.append({
+                **current,
+                "label": label,
+            })
+
+        bullish = (
+            len(high_labels) >= 2
+            and len(low_labels) >= 2
+            and high_labels[-1]["label"] == "HH"
+            and high_labels[-2]["label"] == "HH"
+            and low_labels[-1]["label"] == "HL"
+            and low_labels[-2]["label"] == "HL"
         )
 
-        higher_low = (
-            lows[-1]["price"]
-            > lows[-2]["price"]
+        bearish = (
+            len(high_labels) >= 2
+            and len(low_labels) >= 2
+            and high_labels[-1]["label"] == "LH"
+            and high_labels[-2]["label"] == "LH"
+            and low_labels[-1]["label"] == "LL"
+            and low_labels[-2]["label"] == "LL"
         )
 
-        lower_high = (
-            highs[-1]["price"]
-            < highs[-2]["price"]
-        )
-
-        lower_low = (
-            lows[-1]["price"]
-            < lows[-2]["price"]
-        )
-
-        if higher_high and higher_low:
-
+        if bullish:
             bias = "BULLISH"
-            structure = ["HH", "HL"]
-
-        elif lower_high and lower_low:
-
+        elif bearish:
             bias = "BEARISH"
-            structure = ["LH", "LL"]
-
         else:
-
             bias = "RANGING"
-            structure = []
-
-            if higher_high:
-                structure.append("HH")
-
-            elif lower_high:
-                structure.append("LH")
-
-            else:
-                structure.append("EQH")
-
-            if higher_low:
-                structure.append("HL")
-
-            elif lower_low:
-                structure.append("LL")
-
-            else:
-                structure.append("EQL")
 
         return {
             "bias": bias,
-            "structure": structure,
-            "latest_swing_high": highs[-1],
-            "previous_swing_high": highs[-2],
-            "latest_swing_low": lows[-1],
-            "previous_swing_low": lows[-2],
+            "direction": bias,
+            "highs": high_labels,
+            "lows": low_labels,
+            "latest_swing_high": (
+                highs[-1] if highs else None
+            ),
+            "latest_swing_low": (
+                lows[-1] if lows else None
+            ),
         }
 
-    # ==================================================
-    # BOS / CHoCH
-    # ==================================================
+    # ---------------------------------------------------------
+    # BOS AND CHoCH
+    # ---------------------------------------------------------
 
-    @staticmethod
     def detect_breaks(
-        candles,
-        swing_highs,
-        swing_lows,
-        previous_bias="UNKNOWN",
-    ):
+        self,
+        candles: List[Dict[str, Any]],
+        swings: Dict[str, List[Dict[str, Any]]],
+        previous_bias: str = "UNKNOWN",
+    ) -> List[Dict[str, Any]]:
 
         if len(candles) < 2:
             return []
@@ -289,1251 +404,866 @@ class TechnicalAnalysisEngine:
         current = candles[-1]
         previous = candles[-2]
 
+        previous_bias = str(
+            previous_bias or "UNKNOWN"
+        ).upper()
+
         events = []
 
-        # Bullish break requires a close crossing
-        # from below the swing level to above it.
+        highs = swings["highs"]
+        lows = swings["lows"]
 
-        if swing_highs:
+        latest_high = (
+            highs[-1] if highs else None
+        )
 
-            level = swing_highs[-1]["price"]
+        latest_low = (
+            lows[-1] if lows else None
+        )
 
-            crossed_up = (
+        if latest_high:
+            level = latest_high["price"]
+
+            # A wick above the level is not a break.
+            # The previous and current candle closes must
+            # establish a full close beyond the level.
+
+            if (
                 previous["close"] <= level
                 and current["close"] > level
-            )
-
-            if crossed_up:
-
+            ):
                 event_type = (
                     "CHoCH"
                     if previous_bias == "BEARISH"
-                    else "BOS"
+                    else (
+                        "BOS"
+                        if previous_bias == "BULLISH"
+                        else "BULLISH_BREAK"
+                    )
                 )
 
                 events.append({
                     "type": event_type,
                     "direction": "BULLISH",
                     "level": level,
+                    "index": len(candles) - 1,
+                    "timestamp": current.get("timestamp"),
                     "previous_close": previous["close"],
-                    "close": current["close"],
-                    "time": current["time"],
+                    "current_close": current["close"],
                     "confirmation": "BODY_CLOSE",
+                    "body_close_confirmed": True,
                     "confirmed": True,
                 })
 
-        # Bearish break requires a close crossing
-        # from above the swing level to below it.
+        if latest_low:
+            level = latest_low["price"]
 
-        if swing_lows:
-
-            level = swing_lows[-1]["price"]
-
-            crossed_down = (
+            if (
                 previous["close"] >= level
                 and current["close"] < level
-            )
-
-            if crossed_down:
-
+            ):
                 event_type = (
                     "CHoCH"
                     if previous_bias == "BULLISH"
-                    else "BOS"
+                    else (
+                        "BOS"
+                        if previous_bias == "BEARISH"
+                        else "BEARISH_BREAK"
+                    )
                 )
 
                 events.append({
                     "type": event_type,
                     "direction": "BEARISH",
                     "level": level,
+                    "index": len(candles) - 1,
+                    "timestamp": current.get("timestamp"),
                     "previous_close": previous["close"],
-                    "close": current["close"],
-                    "time": current["time"],
+                    "current_close": current["close"],
                     "confirmation": "BODY_CLOSE",
+                    "body_close_confirmed": True,
                     "confirmed": True,
                 })
 
         return events
 
-    # ==================================================
+    # ---------------------------------------------------------
     # LIQUIDITY SWEEPS
-    # ==================================================
+    # ---------------------------------------------------------
 
-    @staticmethod
     def detect_liquidity_sweeps(
-        candles,
-        swing_highs,
-        swing_lows,
-    ):
+        self,
+        candles: List[Dict[str, Any]],
+        swings: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
 
         if not candles:
             return []
 
-        candle = candles[-1]
-        sweeps = []
+        current = candles[-1]
+        events = []
 
-        if swing_highs:
-
-            level = swing_highs[-1]["price"]
+        for swing in swings["highs"]:
+            level = swing["price"]
 
             if (
-                candle["high"] > level
-                and candle["close"] < level
+                current["high"] > level
+                and current["close"] < level
             ):
-
-                sweeps.append({
+                events.append({
                     "type": "HIGH_SWEEP",
-                    "level": level,
                     "direction": "BEARISH",
-                    "wick_beyond_level": (
-                        candle["high"] - level
+                    "level": level,
+                    "index": len(candles) - 1,
+                    "timestamp": current.get("timestamp"),
+                    "confirmation": (
+                        "WICK_THROUGH_CLOSE_BACK_INSIDE"
                     ),
-                    "close_back_inside": True,
-                    "time": candle["time"],
+                    "confirmed": True,
+                    "invalidated": False,
                 })
 
-        if swing_lows:
-
-            level = swing_lows[-1]["price"]
+        for swing in swings["lows"]:
+            level = swing["price"]
 
             if (
-                candle["low"] < level
-                and candle["close"] > level
+                current["low"] < level
+                and current["close"] > level
             ):
-
-                sweeps.append({
+                events.append({
                     "type": "LOW_SWEEP",
-                    "level": level,
                     "direction": "BULLISH",
-                    "wick_beyond_level": (
-                        level - candle["low"]
+                    "level": level,
+                    "index": len(candles) - 1,
+                    "timestamp": current.get("timestamp"),
+                    "confirmation": (
+                        "WICK_THROUGH_CLOSE_BACK_INSIDE"
                     ),
-                    "close_back_inside": True,
-                    "time": candle["time"],
+                    "confirmed": True,
+                    "invalidated": False,
                 })
 
-        return sweeps
+        return events
 
-    # ==================================================
-    # EQUAL HIGH / EQUAL LOW DETECTION
-    # ==================================================
+    # ---------------------------------------------------------
+    # EQUAL HIGHS AND LOWS
+    # ---------------------------------------------------------
 
-    @staticmethod
     def detect_equal_levels(
-        swing_points,
-        tolerance,
-    ):
+        self,
+        swings: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
 
-        groups = []
+        tolerance = self.equal_level_tolerance
 
-        tolerance = max(
-            0.0,
-            float(tolerance),
-        )
+        def cluster_levels(
+            levels: List[Dict[str, Any]],
+            level_type: str,
+        ) -> List[Dict[str, Any]]:
 
-        for point in swing_points:
+            clusters = []
 
-            matched = False
+            for level in levels:
+                matched = None
 
-            for group in groups:
+                for cluster in clusters:
+                    if abs(
+                        level["price"] - cluster["price"]
+                    ) <= tolerance:
+                        matched = cluster
+                        break
 
-                average = (
-                    sum(
+                if matched is None:
+                    clusters.append({
+                        "price": level["price"],
+                        "levels": [level],
+                    })
+                else:
+                    matched["levels"].append(level)
+                    matched["price"] = sum(
                         item["price"]
-                        for item in group
-                    )
-                    / len(group)
-                )
+                        for item in matched["levels"]
+                    ) / len(matched["levels"])
 
-                if abs(
-                    point["price"] - average
-                ) <= tolerance:
+            results = []
 
-                    group.append(point)
-                    matched = True
-                    break
+            for cluster in clusters:
+                if len(cluster["levels"]) < 2:
+                    continue
 
-            if not matched:
-                groups.append([point])
+                results.append({
+                    "type": level_type,
+                    "price": cluster["price"],
+                    "touches": len(cluster["levels"]),
+                    "indices": [
+                        item["index"]
+                        for item in cluster["levels"]
+                    ],
+                    "confirmed": True,
+                })
 
-        results = []
+            return results
 
-        for group in groups:
+        return {
+            "equal_highs": cluster_levels(
+                swings["highs"],
+                "EQUAL_HIGHS",
+            ),
+            "equal_lows": cluster_levels(
+                swings["lows"],
+                "EQUAL_LOWS",
+            ),
+        }
 
-            if len(group) < 2:
-                continue
+    # ---------------------------------------------------------
+    # FAIR VALUE GAPS
+    # ---------------------------------------------------------
 
-            average_price = (
-                sum(
-                    item["price"]
-                    for item in group
-                )
-                / len(group)
-            )
+    def detect_fvgs(
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
 
-            results.append({
-                "price": round(
-                    average_price,
-                    8,
-                ),
-                "touches": len(group),
-                "points": group,
-                "liquidity_type": (
-                    "EQUAL_HIGH"
-                    if all(
-                        item in swing_points
-                        for item in group
-                    )
-                    else "EQUAL_LEVEL"
-                ),
-            })
+        fvgs = []
 
-        return results
-
-    # ==================================================
-    # FAIR VALUE GAP DETECTION
-    # ==================================================
-
-    @staticmethod
-    def detect_fvg(candles):
-
-        gaps = []
-
-        for i in range(2, len(candles)):
-
-            first = candles[i - 2]
-            middle = candles[i - 1]
-            third = candles[i]
-
-            # Bullish FVG
+        for index in range(2, len(candles)):
+            first = candles[index - 2]
+            middle = candles[index - 1]
+            third = candles[index]
 
             if third["low"] > first["high"]:
-
                 lower = first["high"]
                 upper = third["low"]
 
-                subsequent = candles[i + 1:]
-
-                mitigation = (
-                    TechnicalAnalysisEngine
-                    ._calculate_fvg_mitigation(
-                        "BULLISH",
-                        lower,
-                        upper,
-                        subsequent,
-                    )
-                )
-
-                gaps.append({
+                fvgs.append({
                     "type": "BULLISH_FVG",
+                    "direction": "BULLISH",
                     "lower": lower,
                     "upper": upper,
-                    "midpoint": (
-                        lower + upper
-                    ) / 2,
-                    "index": i,
-                    "time": third["time"],
-                    "middle_candle": middle,
-                    **mitigation,
+                    "midpoint": (lower + upper) / 2,
+                    "gap_size": upper - lower,
+                    "formation_index": index,
+                    "index": index,
+                    "timestamp": third.get("timestamp"),
+                    "clean": True,
+                    "unmitigated": True,
+                    "mitigation": "NONE",
+                    "confirmed": True,
                 })
 
-            # Bearish FVG
-
-            elif third["high"] < first["low"]:
-
+            if third["high"] < first["low"]:
                 lower = third["high"]
                 upper = first["low"]
 
-                subsequent = candles[i + 1:]
-
-                mitigation = (
-                    TechnicalAnalysisEngine
-                    ._calculate_fvg_mitigation(
-                        "BEARISH",
-                        lower,
-                        upper,
-                        subsequent,
-                    )
-                )
-
-                gaps.append({
+                fvgs.append({
                     "type": "BEARISH_FVG",
+                    "direction": "BEARISH",
                     "lower": lower,
                     "upper": upper,
-                    "midpoint": (
-                        lower + upper
-                    ) / 2,
-                    "index": i,
-                    "time": third["time"],
-                    "middle_candle": middle,
-                    **mitigation,
+                    "midpoint": (lower + upper) / 2,
+                    "gap_size": upper - lower,
+                    "formation_index": index,
+                    "index": index,
+                    "timestamp": third.get("timestamp"),
+                    "clean": True,
+                    "unmitigated": True,
+                    "mitigation": "NONE",
+                    "confirmed": True,
                 })
 
-        return gaps
+        self._track_fvg_mitigation(fvgs, candles)
+
+        return fvgs
 
     @staticmethod
-    def _calculate_fvg_mitigation(
-        direction,
-        lower,
-        upper,
-        subsequent_candles,
-    ):
+    def _track_fvg_mitigation(
+        fvgs: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+    ) -> None:
 
-        touched = False
-        partially_mitigated = False
-        fully_mitigated = False
+        for fvg in fvgs:
+            lower = fvg["lower"]
+            upper = fvg["upper"]
 
-        mitigation_time = None
+            for index in range(
+                fvg["formation_index"] + 1,
+                len(candles),
+            ):
+                candle = candles[index]
 
-        for candle in subsequent_candles:
+                if (
+                    candle["low"] <= upper
+                    and candle["high"] >= lower
+                ):
+                    fvg["clean"] = False
+                    fvg["unmitigated"] = False
 
-            if direction == "BULLISH":
+                    if (
+                        candle["low"] <= lower
+                        and candle["high"] >= upper
+                    ):
+                        fvg["mitigation"] = "FULL"
+                    elif (
+                        candle["low"] <= fvg["midpoint"]
+                        if fvg["direction"] == "BULLISH"
+                        else candle["high"] >= fvg["midpoint"]
+                    ):
+                        fvg["mitigation"] = "MIDPOINT"
+                    else:
+                        fvg["mitigation"] = "PARTIAL"
 
-                if candle["low"] <= upper:
-                    touched = True
+                    fvg["mitigated_at_index"] = index
+                    fvg["mitigated_at_timestamp"] = (
+                        candle.get("timestamp")
+                    )
+                    break
 
-                if candle["low"] < upper:
-                    partially_mitigated = True
+    # ---------------------------------------------------------
+    # ORDER-BLOCK CANDIDATES
+    # ---------------------------------------------------------
 
-                if candle["low"] <= lower:
-
-                    fully_mitigated = True
-
-                    if mitigation_time is None:
-                        mitigation_time = candle["time"]
-
-            else:
-
-                if candle["high"] >= lower:
-                    touched = True
-
-                if candle["high"] > lower:
-                    partially_mitigated = True
-
-                if candle["high"] >= upper:
-
-                    fully_mitigated = True
-
-                    if mitigation_time is None:
-                        mitigation_time = candle["time"]
-
-        if fully_mitigated:
-            status = "FULLY_MITIGATED"
-
-        elif partially_mitigated:
-            status = "PARTIALLY_MITIGATED"
-
-        elif touched:
-            status = "TOUCHED"
-
-        else:
-            status = "UNMITIGATED"
-
-        return {
-            "touched": touched,
-            "partially_mitigated": (
-                partially_mitigated
-            ),
-            "fully_mitigated": fully_mitigated,
-            "mitigation_status": status,
-            "mitigation_time": mitigation_time,
-            "fresh": not touched,
-        }
-
-    # ==================================================
-    # ORDER BLOCK CANDIDATES
-    # ==================================================
-
-    @staticmethod
     def detect_order_block_candidates(
-        candles,
-        displacement_multiplier=1.5,
-    ):
+        self,
+        candles: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
 
         candidates = []
 
-        if len(candles) < 3:
-            return candidates
+        for index in range(
+            self.atr_period + 1,
+            len(candles),
+        ):
+            displacement_candle = candles[index]
+            origin = candles[index - 1]
 
-        bodies = [
-            abs(
-                candle["close"]
-                - candle["open"]
-            )
-            for candle in candles
-        ]
-
-        for i in range(1, len(candles) - 1):
-
-            current = candles[i]
-            following = candles[i + 1]
-
-            current_bearish = (
-                current["close"]
-                < current["open"]
+            atr = self._calculate_historical_atr(
+                candles,
+                index,
             )
 
-            current_bullish = (
-                current["close"]
-                > current["open"]
+            if atr is None:
+                continue
+
+            body = abs(
+                displacement_candle["close"]
+                - displacement_candle["open"]
             )
 
-            following_bullish = (
-                following["close"]
-                > following["open"]
-            )
-
-            following_bearish = (
-                following["close"]
-                < following["open"]
-            )
-
-            average_body = (
-                sum(bodies[max(0, i - 10):i])
-                / max(
-                    1,
-                    len(bodies[max(0, i - 10):i]),
-                )
-            )
-
-            following_body = abs(
-                following["close"]
-                - following["open"]
-            )
-
-            displacement = (
-                average_body > 0
-                and following_body
-                >= (
-                    average_body
-                    * displacement_multiplier
-                )
-            )
-
-            # Bullish OB candidate:
-            # Last bearish candle before bullish move.
+            if body < (
+                atr * self.displacement_atr_multiple
+            ):
+                continue
 
             if (
-                current_bearish
-                and following_bullish
+                displacement_candle["close"]
+                > displacement_candle["open"]
+                and origin["close"] < origin["open"]
             ):
-
-                close_above_ob = (
-                    following["close"]
-                    > current["high"]
-                )
-
-                candidates.append({
-                    "type": "BULLISH_OB_CANDIDATE",
-                    "high": current["high"],
-                    "low": current["low"],
-                    "index": i,
-                    "time": current["time"],
-                    "confirmation_time": (
-                        following["time"]
-                    ),
-                    "displacement": displacement,
-                    "displacement_body": (
-                        following_body
-                    ),
-                    "average_body": average_body,
-                    "close_beyond_ob": (
-                        close_above_ob
-                    ),
-                    "validated": (
-                        displacement
-                        and close_above_ob
-                    ),
-                })
-
-            # Bearish OB candidate:
-            # Last bullish candle before bearish move.
-
+                direction = "BULLISH"
             elif (
-                current_bullish
-                and following_bearish
+                displacement_candle["close"]
+                < displacement_candle["open"]
+                and origin["close"] > origin["open"]
             ):
+                direction = "BEARISH"
+            else:
+                continue
 
-                close_below_ob = (
-                    following["close"]
-                    < current["low"]
-                )
+            lower = origin["low"]
+            upper = origin["high"]
 
-                candidates.append({
-                    "type": "BEARISH_OB_CANDIDATE",
-                    "high": current["high"],
-                    "low": current["low"],
-                    "index": i,
-                    "time": current["time"],
-                    "confirmation_time": (
-                        following["time"]
-                    ),
-                    "displacement": displacement,
-                    "displacement_body": (
-                        following_body
-                    ),
-                    "average_body": average_body,
-                    "close_beyond_ob": (
-                        close_below_ob
-                    ),
-                    "validated": (
-                        displacement
-                        and close_below_ob
-                    ),
-                })
+            candidates.append({
+                "type": f"{direction}_ORDER_BLOCK",
+                "direction": direction,
+                "lower": lower,
+                "upper": upper,
+                "midpoint": (lower + upper) / 2,
+                "formation_index": index - 1,
+                "displacement_index": index,
+                "timestamp": origin.get("timestamp"),
+                "displacement_timestamp": (
+                    displacement_candle.get("timestamp")
+                ),
+                "origin_open": origin["open"],
+                "origin_close": origin["close"],
+                "displacement_body": body,
+                "atr": atr,
+                "confirmed": True,
+                "valid_candidate": True,
+            })
+
+        self._track_ob_mitigation(candidates, candles)
 
         return candidates
 
-    # ==================================================
+    def _calculate_historical_atr(
+        self,
+        candles: List[Dict[str, Any]],
+        candidate_index: int,
+    ) -> Optional[float]:
+
+        start = candidate_index - self.atr_period
+
+        if start < 1:
+            return None
+
+        ranges = []
+
+        for index in range(start, candidate_index):
+            ranges.append(
+                self._true_range(
+                    candles[index],
+                    candles[index - 1]["close"],
+                )
+            )
+
+        if len(ranges) != self.atr_period:
+            return None
+
+        atr = sum(ranges) / len(ranges)
+
+        return atr if atr > 0 else None
+
+    @staticmethod
+    def _track_ob_mitigation(
+        blocks: List[Dict[str, Any]],
+        candles: List[Dict[str, Any]],
+    ) -> None:
+
+        for block in blocks:
+            lower = block["lower"]
+            upper = block["upper"]
+
+            block["clean"] = True
+            block["unmitigated"] = True
+            block["mitigation"] = "NONE"
+
+            for index in range(
+                block["displacement_index"] + 1,
+                len(candles),
+            ):
+                candle = candles[index]
+
+                if (
+                    candle["low"] <= upper
+                    and candle["high"] >= lower
+                ):
+                    block["clean"] = False
+                    block["unmitigated"] = False
+
+                    if (
+                        candle["low"] <= lower
+                        and candle["high"] >= upper
+                    ):
+                        block["mitigation"] = "FULL"
+                    elif (
+                        candle["low"] <= block["midpoint"]
+                        if block["direction"] == "BULLISH"
+                        else candle["high"] >= block["midpoint"]
+                    ):
+                        block["mitigation"] = "MIDPOINT"
+                    else:
+                        block["mitigation"] = "PARTIAL"
+
+                    block["mitigated_at_index"] = index
+                    block["mitigated_at_timestamp"] = (
+                        candle.get("timestamp")
+                    )
+                    break
+
+    # ---------------------------------------------------------
     # PREMIUM / DISCOUNT
-    # ==================================================
+    # ---------------------------------------------------------
 
     @staticmethod
     def calculate_premium_discount(
-        candles,
-        swing_highs=None,
-        swing_lows=None,
-    ):
+        candles: List[Dict[str, Any]],
+        swings: Dict[str, List[Dict[str, Any]]],
+        current_price: float,
+    ) -> Dict[str, Any]:
 
-        if not candles:
-            return None
+        highs = swings["highs"]
+        lows = swings["lows"]
 
-        range_high = None
-        range_low = None
+        if not highs or not lows:
+            return {
+                "valid": False,
+                "zone": "UNKNOWN",
+                "equilibrium": None,
+                "range_high": None,
+                "range_low": None,
+            }
 
-        # Use the latest structural swing range
-        # when valid swing points are available.
-
-        if (
-            swing_highs
-            and swing_lows
-        ):
-
-            latest_high = swing_highs[-1]
-            latest_low = swing_lows[-1]
-
-            if latest_high["index"] > latest_low["index"]:
-
-                range_high = latest_high["price"]
-                range_low = latest_low["price"]
-
-            elif latest_low["index"] > latest_high["index"]:
-
-                range_high = latest_high["price"]
-                range_low = latest_low["price"]
-
-        # Fallback: recent candle range.
-
-        if (
-            range_high is None
-            or range_low is None
-        ):
-
-            lookback = min(
-                50,
-                len(candles),
-            )
-
-            recent = candles[-lookback:]
-
-            range_high = max(
-                candle["high"]
-                for candle in recent
-            )
-
-            range_low = min(
-                candle["low"]
-                for candle in recent
-            )
+        range_high = highs[-1]["price"]
+        range_low = lows[-1]["price"]
 
         if range_high <= range_low:
-            return None
+            return {
+                "valid": False,
+                "zone": "UNKNOWN",
+                "equilibrium": None,
+                "range_high": range_high,
+                "range_low": range_low,
+            }
 
-        midpoint = (
+        equilibrium = (
             range_high + range_low
         ) / 2
 
-        current_price = candles[-1]["close"]
-
-        if current_price > midpoint:
+        if current_price > equilibrium:
             zone = "PREMIUM"
-
-        elif current_price < midpoint:
+        elif current_price < equilibrium:
             zone = "DISCOUNT"
-
         else:
             zone = "EQUILIBRIUM"
 
-        range_size = (
-            range_high - range_low
-        )
-
-        position_percent = (
-            (current_price - range_low)
-            / range_size
-            * 100
-        )
-
         return {
+            "valid": True,
+            "zone": zone,
+            "equilibrium": equilibrium,
             "range_high": range_high,
             "range_low": range_low,
-            "equilibrium": midpoint,
             "current_price": current_price,
-            "zone": zone,
-            "position_percent": round(
-                position_percent,
-                2,
-            ),
+            "range_size": range_high - range_low,
         }
 
-    # ==================================================
-    # CANDLE ANALYSIS
-    # ==================================================
+    # ---------------------------------------------------------
+    # SUPPORT AND RESISTANCE
+    # ---------------------------------------------------------
 
     @staticmethod
-    def analyze_candle(candle):
+    def calculate_support_resistance(
+        swings: Dict[str, List[Dict[str, Any]]],
+        current_price: float,
+    ) -> Dict[str, Any]:
 
-        candle_range = (
-            candle["high"]
-            - candle["low"]
-        )
+        supports = [
+            item["price"]
+            for item in swings["lows"]
+            if item["price"] <= current_price
+        ]
 
-        body = abs(
-            candle["close"]
-            - candle["open"]
-        )
+        resistances = [
+            item["price"]
+            for item in swings["highs"]
+            if item["price"] >= current_price
+        ]
 
-        upper_wick = (
-            candle["high"]
-            - max(
-                candle["open"],
-                candle["close"],
-            )
-        )
+        return {
+            "support": (
+                max(supports) if supports else None
+            ),
+            "resistance": (
+                min(resistances) if resistances else None
+            ),
+            "supports": supports,
+            "resistances": resistances,
+        }
 
-        lower_wick = (
-            min(
-                candle["open"],
-                candle["close"],
-            )
-            - candle["low"]
-        )
+    # ---------------------------------------------------------
+    # MOMENTUM
+    # ---------------------------------------------------------
 
-        if candle_range <= 0:
+    @staticmethod
+    def calculate_momentum(
+        candles: List[Dict[str, Any]],
+        period: int = 5,
+    ) -> Dict[str, Any]:
 
+        if len(candles) <= period:
             return {
-                "direction": "NEUTRAL",
-                "body": body,
-                "range": candle_range,
-                "body_percent": 0,
-                "upper_wick": upper_wick,
-                "lower_wick": lower_wick,
+                "direction": "UNKNOWN",
+                "change": None,
+                "strength": None,
             }
 
-        if candle["close"] > candle["open"]:
+        current = candles[-1]["close"]
+        previous = candles[-period - 1]["close"]
+
+        change = current - previous
+
+        if change > 0:
             direction = "BULLISH"
-
-        elif candle["close"] < candle["open"]:
+        elif change < 0:
             direction = "BEARISH"
-
         else:
             direction = "NEUTRAL"
 
+        percentage = (
+            (change / previous) * 100
+            if previous != 0
+            else None
+        )
+
         return {
             "direction": direction,
-            "body": body,
-            "range": candle_range,
-            "body_percent": round(
-                body / candle_range * 100,
-                2,
-            ),
-            "upper_wick": upper_wick,
-            "lower_wick": lower_wick,
-            "upper_wick_percent": round(
-                upper_wick / candle_range * 100,
-                2,
-            ),
-            "lower_wick_percent": round(
-                lower_wick / candle_range * 100,
-                2,
-            ),
-            "close_position_percent": round(
-                (
-                    candle["close"]
-                    - candle["low"]
-                )
-                / candle_range
-                * 100,
-                2,
-            ),
+            "change": change,
+            "percentage": percentage,
+            "strength": abs(percentage) if percentage is not None else None,
         }
 
-    # ==================================================
-    # EMA
-    # ==================================================
-
-    @staticmethod
-    def calculate_ema(
-        candles,
-        period,
-    ):
-
-        if not candles or period <= 0:
-            return None
-
-        closes = [
-            candle["close"]
-            for candle in candles
-        ]
-
-        if len(closes) < period:
-            return None
-
-        multiplier = (
-            2 / (period + 1)
-        )
-
-        ema = sum(
-            closes[:period]
-        ) / period
-
-        for price in closes[period:]:
-
-            ema = (
-                price * multiplier
-                + ema * (1 - multiplier)
-            )
-
-        return ema
-
-    # ==================================================
-    # RSI
-    # ==================================================
-
-    @staticmethod
-    def calculate_rsi(
-        candles,
-        period=14,
-    ):
-
-        if len(candles) <= period:
-            return None
-
-        closes = [
-            candle["close"]
-            for candle in candles
-        ]
-
-        gains = []
-        losses = []
-
-        for i in range(1, len(closes)):
-
-            change = (
-                closes[i] - closes[i - 1]
-            )
-
-            gains.append(
-                max(change, 0)
-            )
-
-            losses.append(
-                abs(min(change, 0))
-            )
-
-        average_gain = (
-            sum(gains[:period])
-            / period
-        )
-
-        average_loss = (
-            sum(losses[:period])
-            / period
-        )
-
-        for i in range(period, len(gains)):
-
-            average_gain = (
-                (
-                    average_gain
-                    * (period - 1)
-                )
-                + gains[i]
-            ) / period
-
-            average_loss = (
-                (
-                    average_loss
-                    * (period - 1)
-                )
-                + losses[i]
-            ) / period
-
-        if average_loss == 0:
-
-            if average_gain == 0:
-                return 50.0
-
-            return 100.0
-
-        relative_strength = (
-            average_gain
-            / average_loss
-        )
-
-        rsi = (
-            100
-            - (
-                100
-                / (
-                    1 + relative_strength
-                )
-            )
-        )
-
-        return round(rsi, 2)
-
-    # ==================================================
-    # ATR
-    # ==================================================
-
-    @staticmethod
-    def calculate_atr(
-        candles,
-        period=14,
-    ):
-
-        if len(candles) <= period:
-            return None
-
-        true_ranges = []
-
-        for i in range(1, len(candles)):
-
-            current = candles[i]
-            previous = candles[i - 1]
-
-            true_range = max(
-                current["high"]
-                - current["low"],
-
-                abs(
-                    current["high"]
-                    - previous["close"]
-                ),
-
-                abs(
-                    current["low"]
-                    - previous["close"]
-                ),
-            )
-
-            true_ranges.append(
-                true_range
-            )
-
-        if len(true_ranges) < period:
-            return None
-
-        atr = (
-            sum(true_ranges[:period])
-            / period
-        )
-
-        for value in true_ranges[period:]:
-
-            atr = (
-                (
-                    atr * (period - 1)
-                )
-                + value
-            ) / period
-
-        return atr
-
-    # ==================================================
-    # SUPPORT / RESISTANCE
-    # ==================================================
-
-    @staticmethod
-    def detect_support_resistance(
-        swing_highs,
-        swing_lows,
-        tolerance,
-    ):
-
-        resistance = (
-            TechnicalAnalysisEngine
-            .detect_equal_levels(
-                swing_highs,
-                tolerance,
-            )
-        )
-
-        support = (
-            TechnicalAnalysisEngine
-            .detect_equal_levels(
-                swing_lows,
-                tolerance,
-            )
-        )
-
-        return {
-            "support": support,
-            "resistance": resistance,
-        }
-
-    # ==================================================
-    # MOMENTUM
-    # ==================================================
-
-    @staticmethod
-    def determine_momentum(
-        candles,
-        rsi=None,
-    ):
-
-        if len(candles) < 3:
-
-            return {
-                "momentum": "UNKNOWN",
-                "reason": "Insufficient candles",
-            }
-
-        latest = candles[-1]
-        previous = candles[-2]
-
-        current_body = abs(
-            latest["close"]
-            - latest["open"]
-        )
-
-        previous_body = abs(
-            previous["close"]
-            - previous["open"]
-        )
-
-        if (
-            latest["close"]
-            > previous["close"]
-            and latest["close"]
-            > latest["open"]
-        ):
-
-            momentum = "BULLISH"
-
-        elif (
-            latest["close"]
-            < previous["close"]
-            and latest["close"]
-            < latest["open"]
-        ):
-
-            momentum = "BEARISH"
-
-        else:
-
-            momentum = "NEUTRAL"
-
-        strength = "NORMAL"
-
-        if (
-            previous_body > 0
-            and current_body
-            >= previous_body * 1.5
-        ):
-
-            strength = "STRONG"
-
-        if (
-            rsi is not None
-            and rsi >= 70
-        ):
-
-            rsi_condition = "OVERBOUGHT"
-
-        elif (
-            rsi is not None
-            and rsi <= 30
-        ):
-
-            rsi_condition = "OVERSOLD"
-
-        else:
-
-            rsi_condition = "NEUTRAL"
-
-        return {
-            "momentum": momentum,
-            "strength": strength,
-            "current_body": current_body,
-            "previous_body": previous_body,
-            "rsi_condition": rsi_condition,
-            "rsi": rsi,
-        }
-
-    # ==================================================
+    # ---------------------------------------------------------
     # MAIN ANALYSIS
-    # ==================================================
+    # ---------------------------------------------------------
 
     def analyze(
         self,
-        candles,
-        symbol=None,
-        timeframe=None,
-        previous_bias="UNKNOWN",
-        liquidity_tolerance=None,
-    ):
+        candles: Sequence[Dict[str, Any]],
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        previous_bias: str = "UNKNOWN",
+    ) -> Dict[str, Any]:
 
-        candles = self.normalize_candles(
-            candles
-        )
+        normalized = self._normalize_candles(candles)
 
-        minimum_candles = (
-            self.swing_window * 2 + 5
-        )
-
-        if len(candles) < minimum_candles:
-
-            return {
-                "success": False,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "reason": (
-                    "Insufficient candle history"
-                ),
-                "candles_analyzed": len(candles),
-                "required_candles": (
-                    minimum_candles
-                ),
-            }
-
-        swing_highs, swing_lows = (
-            self.find_swings(candles)
-        )
-
-        structure = (
-            self.determine_structure(
-                swing_highs,
-                swing_lows,
+        if len(normalized) < max(
+            self.atr_period + 1,
+            self.swing_strength * 2 + 3,
+        ):
+            result = self._error(
+                "INSUFFICIENT_VALID_CANDLES",
+                len(normalized),
+                symbol,
+                timeframe,
             )
+            self.last_result = deepcopy(result)
+            return result
+
+        current_price = normalized[-1]["close"]
+
+        swings = self.detect_swings(normalized)
+
+        structure = self.classify_structure(swings)
+
+        breaks = self.detect_breaks(
+            normalized,
+            swings,
+            previous_bias=previous_bias,
         )
 
-        breaks = (
-            self.detect_breaks(
-                candles,
-                swing_highs,
-                swing_lows,
-                previous_bias,
-            )
-        )
-
-        sweeps = (
+        liquidity_sweeps = (
             self.detect_liquidity_sweeps(
-                candles,
-                swing_highs,
-                swing_lows,
+                normalized,
+                swings,
             )
         )
 
-        fvgs = self.detect_fvg(
-            candles
+        equal_levels = self.detect_equal_levels(
+            swings
         )
+
+        fvgs = self.detect_fvgs(normalized)
 
         order_blocks = (
             self.detect_order_block_candidates(
-                candles,
-                self.displacement_multiplier,
+                normalized
             )
         )
 
         premium_discount = (
             self.calculate_premium_discount(
-                candles,
-                swing_highs,
-                swing_lows,
+                normalized,
+                swings,
+                current_price,
             )
         )
 
-        if liquidity_tolerance is None:
+        atr = self.calculate_atr(normalized)
 
-            liquidity_tolerance = (
-                candles[-1]["close"]
-                * 0.0001
-            )
+        rsi = self.calculate_rsi(normalized)
 
-        equal_highs = (
-            self.detect_equal_levels(
-                swing_highs,
-                liquidity_tolerance,
-            )
-        )
+        closes = [
+            candle["close"] for candle in normalized
+        ]
 
-        equal_lows = (
-            self.detect_equal_levels(
-                swing_lows,
-                liquidity_tolerance,
-            )
-        )
-
-        candle_analysis = (
-            self.analyze_candle(
-                candles[-1]
-            )
-        )
-
-        rsi = (
-            self.calculate_rsi(
-                candles,
-                self.rsi_period,
-            )
-        )
-
-        atr = (
-            self.calculate_atr(
-                candles,
-                self.atr_period,
-            )
-        )
-
-        ema_values = {}
-
-        for period in self.ema_periods:
-
-            ema_values[
-                f"EMA_{period}"
-            ] = self.calculate_ema(
-                candles,
+        emas = {
+            f"ema_{period}": self.calculate_ema(
+                closes,
                 period,
             )
+            for period in self.ema_periods
+        }
 
-        momentum = (
-            self.determine_momentum(
-                candles,
-                rsi,
-            )
+        momentum = self.calculate_momentum(
+            normalized
         )
 
         support_resistance = (
-            self.detect_support_resistance(
-                swing_highs,
-                swing_lows,
-                liquidity_tolerance,
+            self.calculate_support_resistance(
+                swings,
+                current_price,
             )
         )
 
-        current_price = (
-            candles[-1]["close"]
-        )
+        bullish_fvgs = [
+            item for item in fvgs
+            if item["direction"] == "BULLISH"
+        ]
 
-        # Current trend relationship to EMAs.
+        bearish_fvgs = [
+            item for item in fvgs
+            if item["direction"] == "BEARISH"
+        ]
 
-        ema_trend = {}
+        clean_order_blocks = [
+            item for item in order_blocks
+            if (
+                item.get("clean") is True
+                and item.get("unmitigated") is True
+            )
+        ]
 
-        for name, value in ema_values.items():
+        bullish_order_blocks = [
+            item for item in clean_order_blocks
+            if item["direction"] == "BULLISH"
+        ]
 
-            if value is None:
-                ema_trend[name] = "UNKNOWN"
-
-            elif current_price > value:
-                ema_trend[name] = "ABOVE"
-
-            elif current_price < value:
-                ema_trend[name] = "BELOW"
-
-            else:
-                ema_trend[name] = "AT"
-
-        # Evidence-only output.
-        # This engine does not authorize trades.
+        bearish_order_blocks = [
+            item for item in clean_order_blocks
+            if item["direction"] == "BEARISH"
+        ]
 
         result = {
-
             "success": True,
-
+            "version": self.VERSION,
             "symbol": symbol,
-
             "timeframe": timeframe,
 
-            "candles_analyzed": len(candles),
-
+            "candles_analyzed": len(normalized),
             "current_price": current_price,
-
-            "latest_candle_time": (
-                candles[-1]["time"]
+            "latest_timestamp": normalized[-1].get(
+                "timestamp"
             ),
 
             "bias": structure["bias"],
+            "direction": structure["direction"],
 
             "structure": structure,
-
-            "swing_highs": swing_highs,
-
-            "swing_lows": swing_lows,
-
+            "swings": swings,
             "breaks": breaks,
 
-            "liquidity_sweeps": sweeps,
-
-            "equal_highs": equal_highs,
-
-            "equal_lows": equal_lows,
+            "liquidity_sweeps": liquidity_sweeps,
+            "equal_highs": equal_levels["equal_highs"],
+            "equal_lows": equal_levels["equal_lows"],
 
             "fvgs": fvgs,
+            "bullish_fvgs": bullish_fvgs,
+            "bearish_fvgs": bearish_fvgs,
 
-            "order_block_candidates": (
-                order_blocks
-            ),
+            "order_block_candidates": order_blocks,
+            "clean_order_blocks": clean_order_blocks,
+            "bullish_order_blocks": bullish_order_blocks,
+            "bearish_order_blocks": bearish_order_blocks,
 
-            "premium_discount": (
-                premium_discount
-            ),
-
-            "candle_analysis": (
-                candle_analysis
-            ),
-
-            "momentum": momentum,
-
-            "rsi": rsi,
+            "premium_discount": premium_discount,
 
             "atr": atr,
+            "rsi": rsi,
+            "emas": emas,
+            "momentum": momentum,
+            "support_resistance": support_resistance,
 
-            "ema": ema_values,
-
-            "ema_relationship": ema_trend,
-
-            "support_resistance": (
-                support_resistance
-            ),
+            "candle_metrics": {
+                "open": normalized[-1]["open"],
+                "high": normalized[-1]["high"],
+                "low": normalized[-1]["low"],
+                "close": normalized[-1]["close"],
+                "body": abs(
+                    normalized[-1]["close"]
+                    - normalized[-1]["open"]
+                ),
+                "range": (
+                    normalized[-1]["high"]
+                    - normalized[-1]["low"]
+                ),
+                "timestamp": normalized[-1].get(
+                    "timestamp"
+                ),
+            },
 
             "evidence_only": True,
-
             "trade_authorization": False,
+            "execution_authorized": False,
         }
 
-        logger.info(
-            (
-                "Technical analysis complete | "
-                "%s | %s | Bias: %s | "
-                "Candles: %s | Breaks: %s | "
-                "Sweeps: %s"
-            ),
-            symbol,
-            timeframe,
-            structure["bias"],
-            len(candles),
-            len(breaks),
-            len(sweeps),
-        )
-
+        self.last_result = deepcopy(result)
         return result
 
+    # ---------------------------------------------------------
+    # COMPATIBILITY ALIAS
+    # ---------------------------------------------------------
 
-# ==================================================
-# ENGINE INSTANCE
-# ==================================================
+    def analyse(
+        self,
+        candles: Sequence[Dict[str, Any]],
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        previous_bias: str = "UNKNOWN",
+    ) -> Dict[str, Any]:
 
-technical_analysis_engine = (
-    TechnicalAnalysisEngine()
-)
+        return self.analyze(
+            candles=candles,
+            symbol=symbol,
+            timeframe=timeframe,
+            previous_bias=previous_bias,
+        )
+
+    # ---------------------------------------------------------
+    # ERROR RESPONSE
+    # ---------------------------------------------------------
+
+    def _error(
+        self,
+        reason: str,
+        candle_count: int,
+        symbol: Optional[str],
+        timeframe: Optional[str],
+    ) -> Dict[str, Any]:
+
+        return {
+            "success": False,
+            "version": self.VERSION,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "reason": reason,
+            "candles_analyzed": candle_count,
+            "bias": "UNKNOWN",
+            "direction": "UNKNOWN",
+            "structure": {},
+            "swings": {
+                "highs": [],
+                "lows": [],
+            },
+            "breaks": [],
+            "liquidity_sweeps": [],
+            "equal_highs": [],
+            "equal_lows": [],
+            "fvgs": [],
+            "bullish_fvgs": [],
+            "bearish_fvgs": [],
+            "order_block_candidates": [],
+            "clean_order_blocks": [],
+            "bullish_order_blocks": [],
+            "bearish_order_blocks": [],
+            "premium_discount": {
+                "valid": False,
+                "zone": "UNKNOWN",
+            },
+            "atr": None,
+            "rsi": None,
+            "emas": {},
+            "momentum": {
+                "direction": "UNKNOWN",
+            },
+            "support_resistance": {},
+            "evidence_only": True,
+            "trade_authorization": False,
+            "execution_authorized": False,
+        }
+
+
+# -------------------------------------------------------------
+# SHARED ENGINE INSTANCE
+# -------------------------------------------------------------
+
+technical_analysis_engine = TechnicalAnalysisEngine()
