@@ -1,97 +1,78 @@
 
 """
-VROTEX BOT V1
-SMC Entry Model Engine
+Vrotex Bot V1
+SMC Entry Model Engine V3.0
 
-Purpose:
-- Validate the five approved M1 entry models.
-- Require directional confirmation.
-- Check candle-body confirmation where required.
-- Reject incomplete or contradictory entry evidence.
-- Return confirmed entry-model evidence to the master SMC engine.
-
-Approved entry models:
+Five approved M1 entry models:
 1. CHoCH + FVG
-2. Liquidity sweep + engulfing candle
-3. Breaker retest
-4. MSS + sweep + displacement
-5. Supply-to-demand / demand-to-supply flip
+2. Sweep + Engulfing
+3. Breaker Retest
+4. MSS + Sweep + Displacement
+5. Supply-Demand Flip
 
-This module does not calculate the A+ score.
-This module does not authorize order execution.
+Evidence producer only.
+The Master SMC engine evaluates the complete setup.
+The execution engine handles authorized orders.
 """
 
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class SMCEntryModelEngine:
-    VERSION = "2.0"
+    VERSION = "3.0"
 
-    VALID_DIRECTIONS = ("BULLISH", "BEARISH")
+    APPROVED_MODELS = (
+        "CHOCH_FVG",
+        "SWEEP_ENGULFING",
+        "BREAKER_RETEST",
+        "MSS_SWEEP_DISPLACEMENT",
+        "SUPPLY_DEMAND_FLIP",
+    )
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        require_fresh_evidence: bool = True,
+    ):
+        self.require_fresh_evidence = bool(
+            require_fresh_evidence
+        )
+        self.last_result: Dict[str, Any] = {}
 
-    @staticmethod
-    def _as_dict(value: Any) -> Dict[str, Any]:
-        return value if isinstance(value, dict) else {}
-
-    @staticmethod
-    def _as_list(value: Any) -> List[Any]:
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            return [value]
-        return []
-
-    @staticmethod
-    def _direction(value: Any) -> Optional[str]:
-        value = str(value or "").strip().upper()
-
-        if value in ("BULLISH", "BULL", "BUY"):
-            return "BULLISH"
-
-        if value in ("BEARISH", "BEAR", "SELL"):
-            return "BEARISH"
-
-        return None
+    # ---------------------------------------------------------
+    # NORMALIZATION
+    # ---------------------------------------------------------
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
         try:
             number = float(value)
-
             if number != number:
                 return None
-
-            if number in (float("inf"), float("-inf")):
-                return None
-
             return number
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
-    def _normalise_candles(
+    def _normalize_candles(
         self,
-        candles: Any,
+        candles: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        result = []
 
-        for candle in self._as_list(candles):
-            item = self._as_dict(candle)
+        normalized = []
 
-            open_price = self._number(
-                item.get("open", item.get("OPEN"))
-            )
-            high = self._number(
-                item.get("high", item.get("HIGH"))
-            )
-            low = self._number(
-                item.get("low", item.get("LOW"))
-            )
-            close = self._number(
-                item.get("close", item.get("CLOSE"))
-            )
+        if not isinstance(candles, (list, tuple)):
+            return normalized
+
+        for original_index, source in enumerate(candles):
+            if not isinstance(source, dict):
+                continue
+
+            open_price = self._number(source.get("open"))
+            high = self._number(source.get("high"))
+            low = self._number(source.get("low"))
+            close = self._number(source.get("close"))
 
             if None in (open_price, high, low, close):
                 continue
@@ -105,107 +86,236 @@ class SMCEntryModelEngine:
             if low > min(open_price, close):
                 continue
 
-            result.append({
+            normalized.append({
                 "open": open_price,
                 "high": high,
                 "low": low,
                 "close": close,
+                "timestamp": (
+                    source.get("timestamp")
+                    or source.get("time")
+                    or source.get("datetime")
+                ),
+                "original_index": original_index,
             })
 
-        return result
+        return normalized
 
-    def _validate_choch_fvg(
+    @staticmethod
+    def _direction(value: Any) -> Optional[str]:
+        direction = str(value or "").upper()
+
+        if direction in ("BULLISH", "BULL", "BUY"):
+            return "BULLISH"
+
+        if direction in ("BEARISH", "BEAR", "SELL"):
+            return "BEARISH"
+
+        return None
+
+    @staticmethod
+    def _opposite(direction: str) -> str:
+        return (
+            "BEARISH"
+            if direction == "BULLISH"
+            else "BULLISH"
+        )
+
+    @staticmethod
+    def _zone_contains(
+        price: float,
+        zone: Dict[str, Any],
+    ) -> bool:
+
+        lower = SMCEntryModelEngine._number(
+            zone.get("lower", zone.get("low"))
+        )
+        upper = SMCEntryModelEngine._number(
+            zone.get("upper", zone.get("high"))
+        )
+
+        if lower is None or upper is None:
+            return False
+
+        if lower > upper:
+            return False
+
+        return lower <= price <= upper
+
+    def _event_fresh(
         self,
-        evidence: Dict[str, Any],
+        event: Dict[str, Any],
+        latest_index: int,
+    ) -> bool:
+
+        if event.get("fresh") is True:
+            return True
+
+        event_index = event.get(
+            "candle_index",
+            event.get("index"),
+        )
+
+        if event_index is None:
+            return False
+
+        try:
+            return int(event_index) == latest_index
+        except (TypeError, ValueError):
+            return False
+
+    def _validate_event(
+        self,
+        event: Any,
         direction: str,
-    ) -> Dict[str, Any]:
-        structure = self._as_dict(
-            evidence.get("structure")
+        latest_index: int,
+    ) -> bool:
+
+        if not isinstance(event, dict):
+            return False
+
+        event_direction = self._direction(
+            event.get("direction")
         )
 
-        choch = self._as_dict(
-            evidence.get("choch")
-        )
+        if event_direction != direction:
+            return False
 
-        fvg = self._as_dict(
-            evidence.get("fvg")
-        )
-
-        structure_breaks = self._as_list(
-            structure.get("breaks")
-        )
-
-        choch_events = [
-            event
-            for event in structure_breaks
-            if str(
-                self._as_dict(event).get("type", "")
-            ).upper() == "CHOCH"
-        ]
-
-        if choch:
-            choch_events.append(choch)
-
-        confirmed_choch = any(
-            self._direction(
-                self._as_dict(event).get("direction")
-            ) == direction
-            and (
-                self._as_dict(event).get(
-                    "confirmation"
-                ) == "BODY_CLOSE"
-                or self._as_dict(event).get(
-                    "body_close_confirmed"
-                ) is True
-            )
-            for event in choch_events
-        )
-
-        fvg_direction = self._direction(
-            fvg.get("direction")
-        )
-
-        fvg_clean = (
-            fvg.get("clean") is True
-            or fvg.get("unmitigated") is True
-        )
-
-        fvg_valid = (
-            fvg.get("invalidated") is not True
-            and fvg.get("valid") is not False
-        )
+        if event.get("invalidated") is True:
+            return False
 
         confirmed = (
-            confirmed_choch
-            and fvg_direction == direction
-            and fvg_clean
-            and fvg_valid
+            event.get("confirmed") is True
+            or event.get("valid") is True
         )
 
-        return {
-            "model": "CHOCH_FVG",
-            "confirmed": confirmed,
-            "direction": direction,
-            "choch_confirmed": confirmed_choch,
-            "fvg_confirmed": (
-                fvg_direction == direction
-                and fvg_clean
-                and fvg_valid
-            ),
-        }
+        if not confirmed:
+            return False
 
-    def _validate_sweep_engulfing(
+        if (
+            self.require_fresh_evidence
+            and not self._event_fresh(event, latest_index)
+        ):
+            return False
+
+        return True
+
+    # ---------------------------------------------------------
+    # MODEL 1: CHoCH + FVG
+    # ---------------------------------------------------------
+
+    def _choch_fvg(
         self,
-        evidence: Dict[str, Any],
         direction: str,
+        evidence: Dict[str, Any],
+        latest_index: int,
     ) -> Dict[str, Any]:
-        sweep = self._as_dict(
-            evidence.get("sweep")
+
+        structure = evidence.get("choch")
+        fvg = evidence.get("fvg")
+
+        if structure is None:
+            structure = evidence.get("structure_break")
+
+        if not self._validate_event(
+            structure,
+            direction,
+            latest_index,
+        ):
+            return self._failed(
+                "CHOCH_FVG",
+                "VALID_DIRECTIONAL_CHOCH_REQUIRED",
+            )
+
+        break_type = str(
+            structure.get("type", structure.get("event", ""))
+        ).upper()
+
+        if break_type and "CHOCH" not in break_type:
+            return self._failed(
+                "CHOCH_FVG",
+                "EVENT_IS_NOT_CHOCH",
+            )
+
+        body_close = (
+            structure.get("body_close_confirmed") is True
+            or structure.get("confirmation") == "BODY_CLOSE"
         )
 
-        candles = self._normalise_candles(
-            evidence.get("candles")
+        if not body_close:
+            return self._failed(
+                "CHOCH_FVG",
+                "BODY_CLOSE_CONFIRMATION_REQUIRED",
+            )
+
+        if not isinstance(fvg, dict):
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_EVIDENCE_MISSING",
+            )
+
+        if self._direction(fvg.get("direction")) != direction:
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_DIRECTION_MISMATCH",
+            )
+
+        if fvg.get("clean") is not True:
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_NOT_CLEAN",
+            )
+
+        if fvg.get("unmitigated") is not True:
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_NOT_UNMITIGATED",
+            )
+
+        if fvg.get("invalidated") is True:
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_INVALIDATED",
+            )
+
+        if not self._zone_contains(
+            self._number(fvg.get("midpoint"))
+            if fvg.get("midpoint") is not None
+            else self._number(fvg.get("lower")),
+            fvg,
+        ):
+            return self._failed(
+                "CHOCH_FVG",
+                "FVG_ZONE_INVALID",
+            )
+
+        return self._passed(
+            "CHOCH_FVG",
+            direction,
+            {
+                "choch": deepcopy(structure),
+                "fvg": deepcopy(fvg),
+            },
         )
+
+    # ---------------------------------------------------------
+    # MODEL 2: SWEEP + ENGULFING
+    # ---------------------------------------------------------
+
+    def _sweep_engulfing(
+        self,
+        direction: str,
+        candles: List[Dict[str, Any]],
+        evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        sweep = evidence.get("sweep")
+
+        if not isinstance(sweep, dict):
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "SWEEP_EVIDENCE_MISSING",
+            )
 
         expected_sweep = (
             "SELL_SIDE_SWEEP"
@@ -214,130 +324,182 @@ class SMCEntryModelEngine:
         )
 
         sweep_type = str(
-            sweep.get("type", "")
+            sweep.get("type", sweep.get("sweep_type", ""))
         ).upper()
 
-        sweep_confirmed = (
-            sweep_type == expected_sweep
-            and sweep.get("confirmation")
-            == "WICK_THROUGH_CLOSE_BACK_INSIDE"
+        if sweep_type != expected_sweep:
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "WRONG_LIQUIDITY_SIDE",
+            )
+
+        confirmation = str(
+            sweep.get("confirmation", "")
+        ).upper()
+
+        if confirmation != "WICK_THROUGH_CLOSE_BACK_INSIDE":
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "SWEEP_CLOSE_BACK_INSIDE_REQUIRED",
+            )
+
+        if sweep.get("invalidated") is True:
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "SWEEP_INVALIDATED",
+            )
+
+        if len(candles) < 2:
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "INSUFFICIENT_CANDLES",
+            )
+
+        previous = candles[-2]
+        current = candles[-1]
+
+        if direction == "BULLISH":
+            engulfing = (
+                previous["close"] < previous["open"]
+                and current["close"] > current["open"]
+                and current["open"] <= previous["close"]
+                and current["close"] >= previous["open"]
+            )
+        else:
+            engulfing = (
+                previous["close"] > previous["open"]
+                and current["close"] < current["open"]
+                and current["open"] >= previous["close"]
+                and current["close"] <= previous["open"]
+            )
+
+        if not engulfing:
+            return self._failed(
+                "SWEEP_ENGULFING",
+                "ENGULFING_CONFIRMATION_MISSING",
+            )
+
+        return self._passed(
+            "SWEEP_ENGULFING",
+            direction,
+            {
+                "sweep": deepcopy(sweep),
+                "engulfing_confirmed": True,
+                "candle_index": len(candles) - 1,
+                "timestamp": current.get("timestamp"),
+            },
         )
 
-        engulfing = False
+    # ---------------------------------------------------------
+    # MODEL 3: BREAKER RETEST
+    # ---------------------------------------------------------
 
-        if len(candles) >= 2:
-            previous = candles[-2]
-            current = candles[-1]
-
-            if direction == "BULLISH":
-                previous_bearish = (
-                    previous["close"] < previous["open"]
-                )
-                current_bullish = (
-                    current["close"] > current["open"]
-                )
-
-                engulfing = (
-                    previous_bearish
-                    and current_bullish
-                    and current["open"] <= previous["close"]
-                    and current["close"] >= previous["open"]
-                )
-
-            else:
-                previous_bullish = (
-                    previous["close"] > previous["open"]
-                )
-                current_bearish = (
-                    current["close"] < current["open"]
-                )
-
-                engulfing = (
-                    previous_bullish
-                    and current_bearish
-                    and current["open"] >= previous["close"]
-                    and current["close"] <= previous["open"]
-                )
-
-        confirmed = sweep_confirmed and engulfing
-
-        return {
-            "model": "SWEEP_ENGULFING",
-            "confirmed": confirmed,
-            "direction": direction,
-            "sweep_confirmed": sweep_confirmed,
-            "engulfing_confirmed": engulfing,
-        }
-
-    def _validate_breaker_retest(
+    def _breaker_retest(
         self,
-        evidence: Dict[str, Any],
         direction: str,
+        evidence: Dict[str, Any],
     ) -> Dict[str, Any]:
-        breaker = self._as_dict(
-            evidence.get("breaker")
-        )
 
-        breaker_direction = self._direction(
+        breaker = evidence.get("breaker")
+
+        if not isinstance(breaker, dict):
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_EVIDENCE_MISSING",
+            )
+
+        if self._direction(
             breaker.get("direction")
-        )
+        ) != direction:
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_DIRECTION_MISMATCH",
+            )
 
-        lower = self._number(
-            breaker.get("lower")
-        )
+        if breaker.get("broken") is not True:
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_NOT_CONFIRMED",
+            )
 
-        upper = self._number(
-            breaker.get("upper")
-        )
+        if breaker.get("active") is not True:
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_NOT_ACTIVE",
+            )
+
+        if breaker.get("retest_confirmed") is not True:
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_RETEST_NOT_CONFIRMED",
+            )
+
+        if breaker.get("invalidated") is True:
+            return self._failed(
+                "BREAKER_RETEST",
+                "BREAKER_INVALIDATED",
+            )
 
         retest_price = self._number(
-            evidence.get("retest_price")
+            breaker.get("retest_price")
         )
 
-        valid_zone = (
-            lower is not None
-            and upper is not None
-            and lower < upper
+        if retest_price is None:
+            return self._failed(
+                "BREAKER_RETEST",
+                "RETEST_PRICE_MISSING",
+            )
+
+        if not self._zone_contains(
+            retest_price,
+            breaker,
+        ):
+            return self._failed(
+                "BREAKER_RETEST",
+                "RETEST_OUTSIDE_BREAKER_ZONE",
+            )
+
+        return self._passed(
+            "BREAKER_RETEST",
+            direction,
+            {"breaker": deepcopy(breaker)},
         )
 
-        retest_inside = (
-            valid_zone
-            and retest_price is not None
-            and lower <= retest_price <= upper
-        )
+    # ---------------------------------------------------------
+    # MODEL 4: MSS + SWEEP + DISPLACEMENT
+    # ---------------------------------------------------------
 
-        confirmed = (
-            breaker_direction == direction
-            and breaker.get("broken") is True
-            and breaker.get("confirmed") is True
-            and breaker.get("active") is True
-            and breaker.get("retest_confirmed") is True
-            and retest_inside
-        )
-
-        return {
-            "model": "BREAKER_RETEST",
-            "confirmed": confirmed,
-            "direction": direction,
-            "retest_inside_zone": retest_inside,
-        }
-
-    def _validate_mss_sweep_displacement(
+    def _mss_sweep_displacement(
         self,
-        evidence: Dict[str, Any],
         direction: str,
+        evidence: Dict[str, Any],
+        latest_index: int,
     ) -> Dict[str, Any]:
-        sweep = self._as_dict(
-            evidence.get("sweep")
+
+        mss = evidence.get("mss")
+        sweep = evidence.get("sweep")
+        displacement = evidence.get("displacement")
+
+        if not self._validate_event(
+            mss,
+            direction,
+            latest_index,
+        ):
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "VALID_MSS_REQUIRED",
+            )
+
+        body_close = (
+            mss.get("body_close_confirmed") is True
+            or mss.get("confirmation") == "BODY_CLOSE"
         )
 
-        mss = self._as_dict(
-            evidence.get("mss")
-        )
-
-        displacement = self._as_dict(
-            evidence.get("displacement")
-        )
+        if not body_close:
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "MSS_BODY_CLOSE_REQUIRED",
+            )
 
         expected_sweep = (
             "SELL_SIDE_SWEEP"
@@ -345,184 +507,368 @@ class SMCEntryModelEngine:
             else "BUY_SIDE_SWEEP"
         )
 
-        sweep_confirmed = (
-            str(sweep.get("type", "")).upper()
-            == expected_sweep
-            and sweep.get("confirmation")
-            == "WICK_THROUGH_CLOSE_BACK_INSIDE"
-        )
-
-        mss_confirmed = (
-            mss.get("confirmed") is True
-            and self._direction(
-                mss.get("direction")
-            ) == direction
-            and (
-                mss.get("body_close_confirmed") is True
-                or mss.get("confirmation") == "BODY_CLOSE"
+        if not isinstance(sweep, dict):
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "SWEEP_EVIDENCE_MISSING",
             )
+
+        sweep_type = str(
+            sweep.get("type", sweep.get("sweep_type", ""))
+        ).upper()
+
+        if sweep_type != expected_sweep:
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "WRONG_LIQUIDITY_SIDE",
+            )
+
+        if (
+            sweep.get("confirmation")
+            != "WICK_THROUGH_CLOSE_BACK_INSIDE"
+        ):
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "SWEEP_CONFIRMATION_INVALID",
+            )
+
+        if not self._validate_event(
+            displacement,
+            direction,
+            latest_index,
+        ):
+            return self._failed(
+                "MSS_SWEEP_DISPLACEMENT",
+                "VALID_DISPLACEMENT_REQUIRED",
+            )
+
+        return self._passed(
+            "MSS_SWEEP_DISPLACEMENT",
+            direction,
+            {
+                "mss": deepcopy(mss),
+                "sweep": deepcopy(sweep),
+                "displacement": deepcopy(displacement),
+            },
         )
 
-        displacement_confirmed = (
-            displacement.get("confirmed") is True
-            and self._direction(
-                displacement.get("direction")
-            ) == direction
-        )
+    # ---------------------------------------------------------
+    # MODEL 5: SUPPLY-DEMAND FLIP
+    # ---------------------------------------------------------
 
-        confirmed = (
-            sweep_confirmed
-            and mss_confirmed
-            and displacement_confirmed
-        )
-
-        return {
-            "model": "MSS_SWEEP_DISPLACEMENT",
-            "confirmed": confirmed,
-            "direction": direction,
-            "sweep_confirmed": sweep_confirmed,
-            "mss_confirmed": mss_confirmed,
-            "displacement_confirmed": (
-                displacement_confirmed
-            ),
-        }
-
-    def _validate_supply_demand_flip(
+    def _supply_demand_flip(
         self,
-        evidence: Dict[str, Any],
         direction: str,
+        evidence: Dict[str, Any],
     ) -> Dict[str, Any]:
-        flip = self._as_dict(
-            evidence.get("flip")
-        )
 
-        zone = self._as_dict(
-            flip.get("zone")
-        )
+        flip = evidence.get("flip")
 
-        flip_direction = self._direction(
+        if not isinstance(flip, dict):
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_EVIDENCE_MISSING",
+            )
+
+        if self._direction(
             flip.get("direction")
+        ) != direction:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_DIRECTION_MISMATCH",
+            )
+
+        if flip.get("flip_confirmed") is not True:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_NOT_CONFIRMED",
+            )
+
+        if flip.get("body_close_confirmed") is not True:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "BODY_CLOSE_REQUIRED",
+            )
+
+        if flip.get("active") is not True:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_ZONE_NOT_ACTIVE",
+            )
+
+        if flip.get("invalidated") is True:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_INVALIDATED",
+            )
+
+        if flip.get("retest_confirmed") is not True:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "FLIP_RETEST_REQUIRED",
+            )
+
+        retest_price = self._number(
+            flip.get("retest_price")
         )
 
-        lower = self._number(
-            zone.get("lower")
+        if retest_price is None:
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "RETEST_PRICE_MISSING",
+            )
+
+        if not self._zone_contains(
+            retest_price,
+            flip,
+        ):
+            return self._failed(
+                "SUPPLY_DEMAND_FLIP",
+                "RETEST_OUTSIDE_FLIP_ZONE",
+            )
+
+        return self._passed(
+            "SUPPLY_DEMAND_FLIP",
+            direction,
+            {"flip": deepcopy(flip)},
         )
 
-        upper = self._number(
-            zone.get("upper")
-        )
+    # ---------------------------------------------------------
+    # RESULT HELPERS
+    # ---------------------------------------------------------
 
-        valid_zone = (
-            lower is not None
-            and upper is not None
-            and lower < upper
-        )
-
-        confirmed = (
-            flip_direction == direction
-            and flip.get("flip_confirmed") is True
-            and flip.get("body_close_confirmed") is True
-            and flip.get("active") is True
-            and valid_zone
-        )
+    @staticmethod
+    def _failed(
+        model: str,
+        reason: str,
+    ) -> Dict[str, Any]:
 
         return {
-            "model": "SUPPLY_DEMAND_FLIP",
-            "confirmed": confirmed,
-            "direction": direction,
-            "valid_zone": valid_zone,
+            "model": model,
+            "confirmed": False,
+            "valid": False,
+            "direction": None,
+            "reason": reason,
+            "evidence": {},
         }
+
+    @staticmethod
+    def _passed(
+        model: str,
+        direction: str,
+        evidence: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        return {
+            "model": model,
+            "confirmed": True,
+            "valid": True,
+            "direction": direction,
+            "reason": "ENTRY_MODEL_CONFIRMED",
+            "evidence": evidence,
+        }
+
+    # ---------------------------------------------------------
+    # EVALUATE ALL FIVE MODELS INDEPENDENTLY
+    # ---------------------------------------------------------
 
     def evaluate_all(
         self,
-        evidence: Dict[str, Any],
+        candles: Sequence[Dict[str, Any]],
         direction: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        symbol: Optional[str] = None,
+        timeframe: str = "M1",
     ) -> Dict[str, Any]:
-        if not isinstance(evidence, dict):
-            return {
-                "status": "ERROR",
-                "valid": False,
-                "reason": "INVALID_EVIDENCE",
-                "execution_authorized": False,
-            }
 
-        direction = self._direction(direction)
+        normalized_direction = self._direction(direction)
 
-        if direction not in self.VALID_DIRECTIONS:
-            return {
-                "status": "REJECTED",
+        if normalized_direction is None:
+            result = {
+                "success": False,
+                "version": self.VERSION,
+                "confirmed": False,
                 "valid": False,
                 "reason": "INVALID_DIRECTION",
+                "models": {},
+                "confirmed_models": [],
+                "evidence_only": True,
+                "trade_authorization": False,
                 "execution_authorized": False,
             }
+            self.last_result = deepcopy(result)
+            return result
+
+        normalized_timeframe = str(
+            timeframe or ""
+        ).upper()
+
+        if normalized_timeframe != "M1":
+            result = {
+                "success": False,
+                "version": self.VERSION,
+                "confirmed": False,
+                "valid": False,
+                "direction": normalized_direction,
+                "symbol": symbol,
+                "timeframe": normalized_timeframe,
+                "reason": "ENTRY_MODELS_REQUIRE_M1",
+                "models": {},
+                "confirmed_models": [],
+                "evidence_only": True,
+                "trade_authorization": False,
+                "execution_authorized": False,
+            }
+            self.last_result = deepcopy(result)
+            return result
+
+        normalized_candles = self._normalize_candles(
+            candles
+        )
+
+        if len(normalized_candles) < 2:
+            result = {
+                "success": False,
+                "version": self.VERSION,
+                "confirmed": False,
+                "valid": False,
+                "direction": normalized_direction,
+                "symbol": symbol,
+                "timeframe": normalized_timeframe,
+                "reason": "INSUFFICIENT_M1_CANDLES",
+                "models": {},
+                "confirmed_models": [],
+                "evidence_only": True,
+                "trade_authorization": False,
+                "execution_authorized": False,
+            }
+            self.last_result = deepcopy(result)
+            return result
+
+        evidence = evidence or {}
+
+        if not isinstance(evidence, dict):
+            evidence = {}
+
+        latest_index = len(normalized_candles) - 1
+
+        # Each model is evaluated independently.
+        # A failed model does not stop the other models.
 
         models = {
-            "choch_fvg": self._validate_choch_fvg(
-                self._as_dict(
-                    evidence.get("choch_fvg")
-                ),
-                direction,
+            "CHOCH_FVG": self._choch_fvg(
+                normalized_direction,
+                evidence,
+                latest_index,
             ),
-            "sweep_engulfing": self._validate_sweep_engulfing(
-                self._as_dict(
-                    evidence.get("sweep_engulfing")
-                ),
-                direction,
+
+            "SWEEP_ENGULFING": self._sweep_engulfing(
+                normalized_direction,
+                normalized_candles,
+                evidence,
             ),
-            "breaker_retest": self._validate_breaker_retest(
-                self._as_dict(
-                    evidence.get("breaker_retest")
-                ),
-                direction,
+
+            "BREAKER_RETEST": self._breaker_retest(
+                normalized_direction,
+                evidence,
             ),
-            "mss_sweep_displacement": (
-                self._validate_mss_sweep_displacement(
-                    self._as_dict(
-                        evidence.get("mss_sweep_displacement")
-                    ),
-                    direction,
+
+            "MSS_SWEEP_DISPLACEMENT": (
+                self._mss_sweep_displacement(
+                    normalized_direction,
+                    evidence,
+                    latest_index,
                 )
             ),
-            "supply_demand_flip": (
-                self._validate_supply_demand_flip(
-                    self._as_dict(
-                        evidence.get("supply_demand_flip")
-                    ),
-                    direction,
+
+            "SUPPLY_DEMAND_FLIP": (
+                self._supply_demand_flip(
+                    normalized_direction,
+                    evidence,
                 )
             ),
         }
 
         confirmed_models = [
-            result
-            for result in models.values()
-            if result["confirmed"]
+            name
+            for name, result in models.items()
+            if result.get("confirmed") is True
         ]
 
-        return {
-            "status": (
-                "ENTRY_MODEL_CONFIRMED"
-                if confirmed_models
-                else "NO_CONFIRMED_ENTRY_MODEL"
-            ),
+        result = {
+            "success": True,
             "version": self.VERSION,
-            "valid": bool(confirmed_models),
+            "symbol": symbol,
+            "timeframe": normalized_timeframe,
+            "direction": normalized_direction,
+            "candles_analyzed": len(normalized_candles),
+            "latest_candle_index": latest_index,
+            "latest_timestamp": normalized_candles[-1].get(
+                "timestamp"
+            ),
+
             "confirmed": bool(confirmed_models),
-            "direction": direction,
+            "valid": bool(confirmed_models),
+
             "models": models,
             "confirmed_models": confirmed_models,
-            "confirmed_model_count": len(
-                confirmed_models
+            "confirmed_model_count": len(confirmed_models),
+
+            "reason": (
+                "ENTRY_MODEL_CONFIRMED"
+                if confirmed_models
+                else "NO_ENTRY_MODEL_CONFIRMED"
             ),
+
+            "evidence_only": True,
+            "trade_authorization": False,
             "execution_authorized": False,
         }
 
+        self.last_result = deepcopy(result)
+        return result
+
+    # ---------------------------------------------------------
+    # COMPATIBILITY ALIASES
+    # ---------------------------------------------------------
+
+    def analyse(
+        self,
+        candles: Sequence[Dict[str, Any]],
+        direction: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        symbol: Optional[str] = None,
+        timeframe: str = "M1",
+    ) -> Dict[str, Any]:
+
+        return self.evaluate_all(
+            candles=candles,
+            direction=direction,
+            evidence=evidence,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
     def analyze(
         self,
-        evidence: Dict[str, Any],
+        candles: Sequence[Dict[str, Any]],
         direction: str,
+        evidence: Optional[Dict[str, Any]] = None,
+        symbol: Optional[str] = None,
+        timeframe: str = "M1",
     ) -> Dict[str, Any]:
-        return self.evaluate_all(evidence, direction)
 
+        return self.evaluate_all(
+            candles=candles,
+            direction=direction,
+            evidence=evidence,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+
+# -------------------------------------------------------------
+# SHARED ENGINE INSTANCE
+# -------------------------------------------------------------
 
 smc_entry_model_engine = SMCEntryModelEngine()
