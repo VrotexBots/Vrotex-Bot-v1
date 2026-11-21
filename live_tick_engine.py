@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import math
@@ -41,6 +40,7 @@ class LiveTickEngine:
 
         self.latest_ticks = {}
         self.last_tick_time = {}
+        self.tick_counts = {}
 
         self.connected = False
         self.running = False
@@ -56,8 +56,13 @@ class LiveTickEngine:
 
         self._loop = None
         self._ready_event = None
+        self._connected_event = None
 
         self.reconnect_attempts = 0
+
+    # --------------------------------------------------
+    # TIMESTAMP HANDLING
+    # --------------------------------------------------
 
     @staticmethod
     def _parse_timestamp(value):
@@ -69,6 +74,7 @@ class LiveTickEngine:
             if not math.isfinite(timestamp):
                 return None
 
+            # Milliseconds -> seconds
             if timestamp > 100000000000:
                 timestamp /= 1000.0
 
@@ -91,9 +97,26 @@ class LiveTickEngine:
                 return parsed.timestamp()
 
             except ValueError:
-                return None
+                pass
+
+            try:
+
+                timestamp = float(value)
+
+                if timestamp > 100000000000:
+                    timestamp /= 1000.0
+
+                if math.isfinite(timestamp):
+                    return timestamp
+
+            except (ValueError, TypeError):
+                pass
 
         return None
+
+    # --------------------------------------------------
+    # WEBSOCKET URL
+    # --------------------------------------------------
 
     def build_websocket_url(self):
 
@@ -143,10 +166,15 @@ class LiveTickEngine:
             f"{account_id}/ws/ticks"
         )
 
-        return (
-            f"{scheme}://{parsed.netloc}{path}",
-            path,
+        url = (
+            f"{scheme}://{parsed.netloc}{path}"
         )
+
+        return url, path
+
+    # --------------------------------------------------
+    # AUTHENTICATION
+    # --------------------------------------------------
 
     def build_headers(self, path):
 
@@ -169,6 +197,40 @@ class LiveTickEngine:
             f"{key}: {value}"
             for key, value in headers.items()
         ]
+
+    # --------------------------------------------------
+    # CONNECTION SIGNALS
+    # --------------------------------------------------
+
+    def _signal_connected(self):
+
+        if self._loop and self._connected_event:
+
+            try:
+
+                self._loop.call_soon_threadsafe(
+                    self._connected_event.set
+                )
+
+            except RuntimeError:
+                pass
+
+    def _signal_tick_ready(self):
+
+        if self._loop and self._ready_event:
+
+            try:
+
+                self._loop.call_soon_threadsafe(
+                    self._ready_event.set
+                )
+
+            except RuntimeError:
+                pass
+
+    # --------------------------------------------------
+    # WEBSOCKET OPEN
+    # --------------------------------------------------
 
     def on_open(self, ws):
 
@@ -195,9 +257,17 @@ class LiveTickEngine:
                 self.connected = True
                 self.last_error = None
 
+            # Connection readiness is separate from
+            # market tick readiness.
+            self._signal_connected()
+
             logger.info(
-                "Subscribed to live instruments: %s",
+                "Tick subscription sent successfully: %s",
                 self.instruments,
+            )
+
+            logger.info(
+                "Waiting for Exness to push new ticks."
             )
 
         except Exception as exc:
@@ -210,89 +280,174 @@ class LiveTickEngine:
 
             ws.close()
 
-    def on_message(self, ws, message):
+    # --------------------------------------------------
+    # MESSAGE EXTRACTION
+    # --------------------------------------------------
 
-        try:
+    def _extract_tick_messages(self, data):
 
-            data = json.loads(message)
+        """
+        Extract tick objects from common JSON message
+        wrappers without assuming every message is a tick.
+        """
 
-        except (json.JSONDecodeError, TypeError):
+        if isinstance(data, list):
 
-            logger.warning(
-                "Invalid WebSocket message received."
-            )
+            for item in data:
+
+                yield from self._extract_tick_messages(
+                    item
+                )
 
             return
 
         if not isinstance(data, dict):
             return
 
-        if "error_message" in data:
+        # Direct tick message
+        if (
+            "instrument" in data
+            or "symbol" in data
+            or "instrument_name" in data
+        ):
 
-            self.last_error = str(
-                data.get("error_message")
-            )
-
-            logger.error(
-                "Exness stream error: %s",
-                self.last_error,
-            )
-
+            yield data
             return
+
+        # Common message containers
+        for key in (
+            "data",
+            "tick",
+            "ticks",
+            "payload",
+            "result",
+        ):
+
+            nested = data.get(key)
+
+            if isinstance(nested, (dict, list)):
+
+                yield from self._extract_tick_messages(
+                    nested
+                )
+
+    # --------------------------------------------------
+    # TICK PROCESSING
+    # --------------------------------------------------
+
+    def _process_tick(self, data):
 
         instrument = str(
-            data.get("instrument", "")
-        ).upper()
+            data.get(
+                "instrument",
+                data.get(
+                    "symbol",
+                    data.get(
+                        "instrument_name",
+                        data.get(
+                            "instrumentName",
+                            "",
+                        ),
+                    ),
+                ),
+            )
+        ).upper().strip()
 
         if instrument not in self.instruments:
-            return
 
+            logger.debug(
+                "Ignoring tick for unconfigured instrument: %s",
+                instrument,
+            )
+
+            return False
+
+        # Bid/Ask are required.
         try:
 
             bid = float(data["bid"])
             ask = float(data["ask"])
 
-        except (KeyError, TypeError, ValueError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
 
-            return
-
-        if not math.isfinite(bid):
-            return
-
-        if not math.isfinite(ask):
-            return
-
-        if bid <= 0 or ask < bid:
-            return
-
-        source_timestamp = self._parse_timestamp(
-            data.get("timestamp")
-        )
-
-        if source_timestamp is None:
-
-            logger.warning(
-                "Tick rejected: missing or invalid source timestamp."
+            logger.debug(
+                "Tick ignored: missing Bid/Ask for %s",
+                instrument,
             )
 
-            return
+            return False
+
+        if not math.isfinite(bid):
+            return False
+
+        if not math.isfinite(ask):
+            return False
+
+        if bid <= 0 or ask < bid:
+
+            logger.warning(
+                "Invalid Bid/Ask rejected: %s | Bid=%s | Ask=%s",
+                instrument,
+                bid,
+                ask,
+            )
+
+            return False
+
+        # Accept supported timestamp fields.
+        source_timestamp = None
+
+        for timestamp_key in (
+            "timestamp",
+            "time",
+            "ts",
+            "server_time",
+        ):
+
+            if timestamp_key in data:
+
+                source_timestamp = self._parse_timestamp(
+                    data.get(timestamp_key)
+                )
+
+                if source_timestamp is not None:
+                    break
 
         received_at = time.time()
 
+        # If the provider message does not contain a
+        # timestamp, use reception time. The tick is still
+        # a new WebSocket event, not a polled price.
+        timestamp_source = (
+            "exness"
+            if source_timestamp is not None
+            else "received"
+        )
+
+        if source_timestamp is None:
+            source_timestamp = received_at
+
         age = received_at - source_timestamp
 
-        if (
-            age < -5
-            or age > self.DEFAULT_MAX_TICK_AGE
-        ):
+        # Reject clearly invalid timestamps.
+        if age < -5:
 
             logger.warning(
-                "Stale or future tick rejected: %s age=%s",
+                "Future tick rejected: %s | Age=%s",
                 instrument,
                 age,
             )
 
-            return
+            return False
+
+        # Do not reject a tick merely because the
+        # provider's timestamp is old. Reception itself
+        # is recorded separately. Freshness is checked
+        # using received_at by the strategy.
 
         tick = {
             "instrument": instrument,
@@ -301,6 +456,7 @@ class LiveTickEngine:
             "mid": (bid + ask) / 2.0,
             "spread": ask - bid,
             "timestamp": source_timestamp,
+            "timestamp_source": timestamp_source,
             "received_at": received_at,
             "age_seconds": max(0.0, age),
             "valid": True,
@@ -312,6 +468,15 @@ class LiveTickEngine:
 
             self.last_tick_time[instrument] = received_at
 
+            self.tick_counts[instrument] = (
+                self.tick_counts.get(
+                    instrument,
+                    0,
+                ) + 1
+            )
+
+            # All instruments being fresh is the
+            # market-data readiness condition.
             self.ready = all(
                 self._is_fresh_locked(symbol)
                 for symbol in self.instruments
@@ -319,23 +484,94 @@ class LiveTickEngine:
 
             ready = self.ready
 
-        if ready and self._loop and self._ready_event:
-
-            try:
-
-                self._loop.call_soon_threadsafe(
-                    self._ready_event.set
-                )
-
-            except RuntimeError:
-                pass
+        if ready:
+            self._signal_tick_ready()
 
         logger.debug(
-            "Tick | %s | Bid=%s | Ask=%s",
+            "LIVE TICK | %s | Bid=%s | Ask=%s | Count=%s",
             instrument,
             bid,
             ask,
+            self.tick_counts.get(instrument, 0),
         )
+
+        return True
+
+    # --------------------------------------------------
+    # WEBSOCKET MESSAGE
+    # --------------------------------------------------
+
+    def on_message(self, ws, message):
+
+        try:
+
+            data = json.loads(message)
+
+        except (
+            json.JSONDecodeError,
+            TypeError,
+        ):
+
+            logger.warning(
+                "Non-JSON WebSocket message received."
+            )
+
+            return
+
+        if isinstance(data, dict):
+
+            # Provider error
+            if (
+                "error_message" in data
+                or "error" in data
+            ):
+
+                self.last_error = str(
+                    data.get(
+                        "error_message",
+                        data.get("error"),
+                    )
+                )
+
+                logger.error(
+                    "Exness WebSocket message error: %s",
+                    self.last_error,
+                )
+
+                return
+
+            # Subscription acknowledgement or
+            # informational event.
+            if (
+                "id" in data
+                and "subscribe" not in data
+            ):
+
+                logger.info(
+                    "WebSocket response received: %s",
+                    data.get("id"),
+                )
+
+        messages_processed = 0
+
+        for tick_data in self._extract_tick_messages(
+            data
+        ):
+
+            if self._process_tick(tick_data):
+                messages_processed += 1
+
+        # Diagnostics for messages which are valid JSON
+        # but contain no recognized tick.
+        if messages_processed == 0:
+
+            logger.debug(
+                "WebSocket message received but no recognized tick found."
+            )
+
+    # --------------------------------------------------
+    # WEBSOCKET ERROR
+    # --------------------------------------------------
 
     def on_error(self, ws, error):
 
@@ -345,6 +581,10 @@ class LiveTickEngine:
             "Live tick WebSocket error: %s",
             error,
         )
+
+    # --------------------------------------------------
+    # WEBSOCKET CLOSE
+    # --------------------------------------------------
 
     def on_close(
         self,
@@ -364,6 +604,10 @@ class LiveTickEngine:
             close_message,
         )
 
+    # --------------------------------------------------
+    # RECONNECT LOOP
+    # --------------------------------------------------
+
     def connection_loop(self):
 
         delay = self.INITIAL_RECONNECT_DELAY
@@ -376,17 +620,19 @@ class LiveTickEngine:
 
                 headers = self.build_headers(path)
 
-                self.websocket_app = websocket.WebSocketApp(
-                    url,
-                    header=headers,
-                    on_open=self.on_open,
-                    on_message=self.on_message,
-                    on_error=self.on_error,
-                    on_close=self.on_close,
+                self.websocket_app = (
+                    websocket.WebSocketApp(
+                        url,
+                        header=headers,
+                        on_open=self.on_open,
+                        on_message=self.on_message,
+                        on_error=self.on_error,
+                        on_close=self.on_close,
+                    )
                 )
 
                 logger.info(
-                    "Connecting live tick stream."
+                    "Connecting to Exness live tick stream."
                 )
 
                 self.websocket_app.run_forever(
@@ -437,9 +683,14 @@ class LiveTickEngine:
             "Live tick engine thread stopped."
         )
 
+    # --------------------------------------------------
+    # START
+    # --------------------------------------------------
+
     async def start(self):
 
         if self.running:
+
             return self.get_status()
 
         if not self.connector.connected:
@@ -459,7 +710,10 @@ class LiveTickEngine:
             )
 
         self._loop = asyncio.get_running_loop()
+
         self._ready_event = asyncio.Event()
+
+        self._connected_event = asyncio.Event()
 
         self._stop_event.clear()
 
@@ -484,21 +738,32 @@ class LiveTickEngine:
             len(self.instruments),
         )
 
+        logger.info(
+            "Waiting for WebSocket connection, not polling prices."
+        )
+
         try:
 
+            # Startup waits for the WebSocket connection,
+            # NOT for every market to produce a tick.
             await asyncio.wait_for(
-                self._ready_event.wait(),
+                self._connected_event.wait(),
                 timeout=self.STARTUP_TIMEOUT,
             )
 
-            if not self.is_ready():
+            if not self.connected:
 
                 raise ConnectionError(
-                    "Live tick feed lost readiness during startup"
+                    "WebSocket connection lost during startup"
                 )
 
             logger.info(
-                "Live Bid/Ask feed ready for all instruments."
+                "Live tick WebSocket connection established."
+            )
+
+            logger.info(
+                "Tick reception is event-driven. "
+                "Waiting for Exness market updates."
             )
 
             return self.get_status()
@@ -508,6 +773,10 @@ class LiveTickEngine:
             await self.stop()
 
             raise
+
+    # --------------------------------------------------
+    # STOP
+    # --------------------------------------------------
 
     async def stop(self):
 
@@ -530,7 +799,10 @@ class LiveTickEngine:
 
         thread = self.thread
 
-        if thread is not None and thread.is_alive():
+        if (
+            thread is not None
+            and thread.is_alive()
+        ):
 
             await asyncio.to_thread(
                 thread.join,
@@ -550,13 +822,19 @@ class LiveTickEngine:
             "Live tick engine stopped."
         )
 
+    # --------------------------------------------------
+    # FRESHNESS
+    # --------------------------------------------------
+
     def _is_fresh_locked(
         self,
         instrument,
         max_age_seconds=None,
     ):
 
-        tick = self.latest_ticks.get(instrument)
+        tick = self.latest_ticks.get(
+            instrument
+        )
 
         if tick is None:
             return False
@@ -567,13 +845,21 @@ class LiveTickEngine:
             else self.DEFAULT_MAX_TICK_AGE
         )
 
-        age = time.time() - tick["timestamp"]
+        # Freshness is measured from reception time.
+        age = (
+            time.time()
+            - tick["received_at"]
+        )
 
         return (
-            -5 <= age <= max_age
+            0 <= age <= max_age
             and tick["bid"] > 0
             and tick["ask"] >= tick["bid"]
         )
+
+    # --------------------------------------------------
+    # GET TICK
+    # --------------------------------------------------
 
     def get_tick(
         self,
@@ -581,7 +867,9 @@ class LiveTickEngine:
         max_age_seconds=None,
     ):
 
-        instrument = str(instrument).upper()
+        instrument = str(
+            instrument
+        ).upper()
 
         with self._lock:
 
@@ -592,9 +880,19 @@ class LiveTickEngine:
 
                 return None
 
-            tick = self.latest_ticks.get(instrument)
+            tick = self.latest_ticks.get(
+                instrument
+            )
 
-            return dict(tick) if tick else None
+            return (
+                dict(tick)
+                if tick
+                else None
+            )
+
+    # --------------------------------------------------
+    # GET ALL FRESH TICKS
+    # --------------------------------------------------
 
     def get_all_ticks(self):
 
@@ -602,12 +900,19 @@ class LiveTickEngine:
 
         for instrument in self.instruments:
 
-            tick = self.get_tick(instrument)
+            tick = self.get_tick(
+                instrument
+            )
 
             if tick is not None:
+
                 result[instrument] = tick
 
         return result
+
+    # --------------------------------------------------
+    # PER-INSTRUMENT FRESHNESS
+    # --------------------------------------------------
 
     def is_tick_fresh(
         self,
@@ -615,7 +920,9 @@ class LiveTickEngine:
         max_age_seconds=10,
     ):
 
-        instrument = str(instrument).upper()
+        instrument = str(
+            instrument
+        ).upper()
 
         with self._lock:
 
@@ -623,6 +930,10 @@ class LiveTickEngine:
                 instrument,
                 max_age_seconds,
             )
+
+    # --------------------------------------------------
+    # MARKET DATA READINESS
+    # --------------------------------------------------
 
     def is_ready(self):
 
@@ -632,10 +943,16 @@ class LiveTickEngine:
                 self.running
                 and self.connected
                 and all(
-                    self._is_fresh_locked(symbol)
+                    self._is_fresh_locked(
+                        symbol
+                    )
                     for symbol in self.instruments
                 )
             )
+
+    # --------------------------------------------------
+    # STATUS
+    # --------------------------------------------------
 
     def get_status(self):
 
@@ -643,23 +960,103 @@ class LiveTickEngine:
 
             ticks = {}
 
+            instrument_status = {}
+
             for instrument in self.instruments:
 
-                if self._is_fresh_locked(instrument):
+                tick = self.latest_ticks.get(
+                    instrument
+                )
+
+                fresh = self._is_fresh_locked(
+                    instrument
+                )
+
+                if fresh and tick:
 
                     ticks[instrument] = dict(
-                        self.latest_ticks[instrument]
+                        tick
                     )
+
+                age = None
+
+                if tick:
+
+                    age = max(
+                        0.0,
+                        time.time()
+                        - tick["received_at"],
+                    )
+
+                instrument_status[instrument] = {
+                    "received": tick is not None,
+                    "fresh": fresh,
+                    "tick_count": self.tick_counts.get(
+                        instrument,
+                        0,
+                    ),
+                    "age_seconds": age,
+                    "bid": (
+                        tick["bid"]
+                        if tick
+                        else None
+                    ),
+                    "ask": (
+                        tick["ask"]
+                        if tick
+                        else None
+                    ),
+                }
+
+            all_fresh = all(
+                self._is_fresh_locked(
+                    symbol
+                )
+                for symbol in self.instruments
+            )
 
             return {
                 "running": self.running,
                 "connected": self.connected,
-                "ready": self.is_ready(),
-                "instruments": list(self.instruments),
-                "ticks_received": len(ticks),
-                "expected_ticks": len(self.instruments),
+
+                # True means every configured instrument
+                # has a fresh tick.
+                "ready": (
+                    self.running
+                    and self.connected
+                    and all_fresh
+                ),
+
+                # Connection health is independent of
+                # market tick freshness.
+                "stream_connected": self.connected,
+
+                "instruments": list(
+                    self.instruments
+                ),
+
+                "ticks_received": len(
+                    ticks
+                ),
+
+                "expected_ticks": len(
+                    self.instruments
+                ),
+
                 "latest_ticks": ticks,
-                "reconnect_attempts": self.reconnect_attempts,
+
+                "instrument_status": (
+                    instrument_status
+                ),
+
+                "tick_counts": dict(
+                    self.tick_counts
+                ),
+
+                "reconnect_attempts": (
+                    self.reconnect_attempts
+                ),
+
                 "last_error": self.last_error,
             }
 
