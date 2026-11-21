@@ -1,3 +1,4 @@
+
 import asyncio
 import inspect
 
@@ -54,13 +55,13 @@ class TradingEngine:
         return result
 
     # --------------------------------------------------
-    # LIVE TICK READINESS
+    # LIVE TICK CONNECTION
     # --------------------------------------------------
 
     async def start_live_ticks(self):
 
         logger.info(
-            "Starting existing Exness live-tick engine."
+            "Starting Exness push-based live-tick engine."
         )
 
         try:
@@ -103,38 +104,44 @@ class TradingEngine:
                     "Invalid live-tick engine status."
                 )
 
-            ready_method = getattr(
-                live_tick_engine,
-                "is_ready",
-                None,
+            # ------------------------------------------
+            # CONNECTION READINESS
+            # ------------------------------------------
+
+            connected = (
+                status.get("connected") is True
+                or status.get("stream_connected") is True
             )
 
-            if callable(ready_method):
+            # A ready stream is also necessarily connected.
+            if status.get("ready") is True:
+                connected = True
 
-                ready = await self._run_method(
-                    ready_method
-                )
-
-            else:
-
-                ready = status.get("ready", False)
-
-            self.live_tick_result = status
-
-            self.live_ticks_ready = (
-                ready is True
-                and status.get("ready", ready) is True
-            )
-
-            if not self.live_ticks_ready:
+            if not connected:
 
                 raise RuntimeError(
-                    "Live-tick engine did not become ready. "
+                    "Exness live-tick WebSocket "
+                    "is not connected. "
                     f"Status: {status}"
                 )
 
+            # ------------------------------------------
+            # IMPORTANT:
+            # Connection readiness is NOT tick readiness.
+            #
+            # We allow the engine to start after the
+            # WebSocket connects and subscribes.
+            #
+            # Exness will push ticks asynchronously.
+            # ------------------------------------------
+
+            self.live_ticks_ready = True
+
+            self.live_tick_result = status
+
             logger.info(
-                "Live-tick engine ready | "
+                "Exness live-tick WebSocket connected. "
+                "Waiting for pushed tick updates. "
                 "Status: %s",
                 status,
             )
@@ -146,10 +153,11 @@ class TradingEngine:
             self.live_ticks_ready = False
 
             logger.exception(
-                "Live-tick startup failed."
+                "Live-tick connection startup failed."
             )
 
             self.live_tick_result = {
+                "connected": False,
                 "ready": False,
                 "error": str(exc),
             }
@@ -235,33 +243,46 @@ class TradingEngine:
         )
 
         # ----------------------------------------------
-        # START EXISTING LIVE-TICK ENGINE
+        # START EXNESS PUSH LIVE-TICK CONNECTION
         # ----------------------------------------------
 
         state_manager.set_status(
             "STARTING_LIVE_TICKS"
         )
 
-        ticks_ready = await self.start_live_ticks()
+        ticks_connected = await self.start_live_ticks()
 
-        if not ticks_ready:
+        if not ticks_connected:
 
             state_manager.set_status(
                 "LIVE_TICKS_UNAVAILABLE"
             )
 
             logger.critical(
-                "Startup blocked. Fresh live Bid/Ask "
-                "ticks are not ready."
+                "Startup blocked. Exness live-tick "
+                "WebSocket connection failed."
             )
 
             return False
 
         # ----------------------------------------------
-        # FINAL STARTUP CHECK
+        # INITIAL TICK CHECK
+        #
+        # Ticks are NOT required at startup.
+        # Exness pushes them after subscription.
         # ----------------------------------------------
 
-        ticks = market_data_engine.get_live_ticks()
+        try:
+
+            ticks = market_data_engine.get_live_ticks()
+
+        except Exception:
+
+            logger.exception(
+                "Could not read initial live-tick state."
+            )
+
+            ticks = {}
 
         required_instruments = (
             "EURUSD",
@@ -275,31 +296,44 @@ class TradingEngine:
             if symbol not in ticks
         ]
 
+        received_count = (
+            len(required_instruments)
+            - len(missing_ticks)
+        )
+
         if missing_ticks:
 
-            self.live_ticks_ready = False
-
-            state_manager.set_status(
-                "LIVE_TICKS_INCOMPLETE"
-            )
-
-            logger.critical(
-                "Startup blocked. Missing fresh live ticks: %s",
+            logger.info(
+                "Live-tick stream connected. "
+                "Waiting for Exness to push ticks for: %s",
                 ", ".join(missing_ticks),
             )
 
-            return False
+        else:
+
+            logger.info(
+                "Live ticks already available for "
+                "all configured instruments."
+            )
+
+        # ----------------------------------------------
+        # STARTUP COMPLETE
+        # ----------------------------------------------
 
         logger.info(
-            "All startup checks passed | "
-            "Market data: %s/9 | "
-            "Live ticks: %s/3",
+            "Startup checks passed | "
+            "Market data: %s/%s | "
+            "Tick connection: CONNECTED | "
+            "Initial ticks: %s/%s",
             verified,
-            len(ticks),
+            expected,
+            received_count,
+            len(required_instruments),
         )
 
         logger.info(
-            "Engine initialization complete."
+            "Engine initialization complete. "
+            "Waiting for live Exness tick pushes."
         )
 
         return True
@@ -333,7 +367,8 @@ class TradingEngine:
                 logger.debug(
                     "Heartbeat | Health: %s | "
                     "Market data: %s | "
-                    "Live ticks ready: %s",
+                    "Tick connection: %s | "
+                    "Ticks received: %s",
                     health.get(
                         "status",
                         "UNKNOWN",
@@ -343,8 +378,15 @@ class TradingEngine:
                         0,
                     ),
                     tick_status.get(
-                        "ready",
-                        False,
+                        "connected",
+                        tick_status.get(
+                            "stream_connected",
+                            False,
+                        ),
+                    ),
+                    tick_status.get(
+                        "ticks_received",
+                        0,
                     ),
                 )
 
@@ -382,11 +424,17 @@ class TradingEngine:
         if not self.live_ticks_ready:
 
             raise RuntimeError(
-                "Scanner cannot start without ready live ticks."
+                "Scanner cannot start without a connected "
+                "live-tick WebSocket."
             )
 
         logger.info(
             "Starting Vrotex market scanner."
+        )
+
+        logger.info(
+            "Scanner active. Live prices are received "
+            "through Exness push events."
         )
 
         await scanner.run()
