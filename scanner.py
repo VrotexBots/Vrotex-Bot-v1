@@ -1,6 +1,6 @@
 """
 Vrotex Bot V1 - Market Scanner
-Version: 3.0
+Version: 3.1
 
 Approved instruments:
     EURUSD
@@ -21,6 +21,7 @@ Responsibilities:
 This module does NOT execute orders.
 """
 
+import asyncio
 import logging
 import threading
 import time
@@ -34,7 +35,7 @@ logger = logging.getLogger("vrotex.market_scanner")
 
 class MarketScanner:
 
-    VERSION = "3.0"
+    VERSION = "3.1"
 
     INSTRUMENTS = (
         "EURUSD",
@@ -1117,7 +1118,7 @@ class MarketScanner:
     # CONTINUOUS SCANNER
     # =========================================================
 
-    def run(self):
+    async def run(self):
 
         if self.running:
 
@@ -1145,7 +1146,15 @@ class MarketScanner:
 
                 try:
 
-                    self.scan_all()
+                    # Scanning is blocking, so run it
+                    # outside the asyncio event loop.
+                    await asyncio.to_thread(
+                        self.scan_all
+                    )
+
+                except asyncio.CancelledError:
+
+                    raise
 
                 except Exception:
 
@@ -1167,8 +1176,9 @@ class MarketScanner:
 
                 if remaining > 0:
 
-                    self._stop_event.wait(
-                        remaining
+                    await asyncio.to_thread(
+                        self._stop_event.wait,
+                        remaining,
                     )
 
         finally:
@@ -1183,7 +1193,7 @@ class MarketScanner:
     # STOP
     # =========================================================
 
-    def stop(self):
+    async def stop(self):
 
         logger.info(
             "Stopping Market Scanner"
@@ -1241,7 +1251,12 @@ class MarketScanner:
 
 
 # =============================================================
-# SINGLETON
+# SINGLETON — PRESERVE EXISTING ENGINE INTERFACE
 # =============================================================
 
 market_scanner = MarketScanner()
+
+# Existing engine.py requires:
+#     from scanner import scanner
+
+scanner = market_scanner
