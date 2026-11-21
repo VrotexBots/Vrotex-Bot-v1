@@ -1,11 +1,13 @@
 import asyncio
-import json
 import os
 import signal
 import sys
 
+import uvicorn
+
 from config import settings, validate_settings
 from logging_config import setup_logging
+from dashboard_api import create_app
 
 
 logger = setup_logging()
@@ -19,6 +21,7 @@ class VrotexBot:
         self.shutdown_event = asyncio.Event()
         self.engine_task = None
         self.http_server = None
+        self.engine_control_lock = asyncio.Lock()
 
     async def initialize(self):
 
@@ -42,246 +45,187 @@ class VrotexBot:
 
         logger.info("Strategy: H1 -> M5 -> M1")
 
+        # This flag represents the application/web-service lifecycle.
+        # The trading engine has its own independent lifecycle.
         self.running = True
 
-    # ==========================================
-    # HTTP SERVER
-    # ==========================================
+    def is_engine_running(self):
 
-    async def start_http_server(self):
-
-        port = int(os.environ.get("PORT", 10000))
-
-        self.http_server = await asyncio.start_server(
-            self.handle_http_request,
-            host="0.0.0.0",
-            port=port,
+        return bool(
+            self.engine_task
+            and not self.engine_task.done()
         )
 
-        addresses = [
-            socket.getsockname()
-            for socket in self.http_server.sockets
-        ]
+    async def start_engine(self):
 
-        logger.info(
-            "HTTP server listening on %s",
-            addresses,
-        )
+        async with self.engine_control_lock:
 
-        logger.info(
-            "Render port binding successful | PORT=%s",
-            port,
-        )
-
-    async def handle_http_request(
-        self,
-        reader,
-        writer,
-    ):
-
-        try:
-
-            request_line = await asyncio.wait_for(
-                reader.readline(),
-                timeout=5,
-            )
-
-            if not request_line:
-
-                return
-
-            request_line = request_line.decode(
-                "utf-8",
-                errors="replace",
-            ).strip()
-
-            parts = request_line.split()
-
-            if len(parts) < 2:
-
-                await self.send_http_response(
-                    writer,
-                    400,
-                    "Bad Request",
-                    "Invalid HTTP request.",
+            if self.shutdown_event.is_set():
+                raise RuntimeError(
+                    "The Vrotex service is shutting down."
                 )
 
-                return
+            if self.is_engine_running():
 
-            method = parts[0]
-            path = parts[1].split("?")[0]
-
-            # Read HTTP headers
-            while True:
-
-                header = await asyncio.wait_for(
-                    reader.readline(),
-                    timeout=5,
+                logger.info(
+                    "Trading engine is already running."
                 )
 
-                if not header or header in (
-                    b"\r\n",
-                    b"\n",
-                ):
-
-                    break
-
-            # ==================================
-            # HEALTH ENDPOINT
-            # ==================================
-
-            if path == "/health":
-
-                engine_status = (
-                    "running"
-                    if (
-                        self.engine_task
-                        and not self.engine_task.done()
-                    )
-                    else "stopped"
-                )
-
-                response_data = {
-                    "status": "ok",
-                    "bot": settings.BOT_NAME,
-                    "running": self.running,
-                    "engine": engine_status,
+                return {
+                    "success": True,
+                    "running": True,
+                    "message": "Trading engine is already running.",
                 }
 
-                body = json.dumps(
-                    response_data
-                )
+            from engine import engine
 
-                await self.send_http_response(
-                    writer,
-                    200,
-                    "OK",
-                    body,
-                    content_type="application/json",
-                )
-
-                return
-
-            # ==================================
-            # ROOT ENDPOINT
-            # ==================================
-
-            if path == "/":
-
-                body = (
-                    "Vrotex Bot V1 is running."
-                )
-
-                await self.send_http_response(
-                    writer,
-                    200,
-                    "OK",
-                    body,
-                    content_type="text/plain",
-                )
-
-                return
-
-            # ==================================
-            # UNKNOWN ENDPOINT
-            # ==================================
-
-            await self.send_http_response(
-                writer,
-                404,
-                "Not Found",
-                "Endpoint not found.",
+            logger.info(
+                "Starting Vrotex trading engine."
             )
 
-        except asyncio.TimeoutError:
-
-            logger.warning(
-                "HTTP request timed out."
+            self.engine_task = asyncio.create_task(
+                engine.start(),
+                name="vrotex-trading-engine",
             )
 
-        except Exception:
+            # Allow the engine task to begin and surface immediate startup errors.
+            await asyncio.sleep(0)
 
-            logger.exception(
-                "HTTP request handler error."
+            if self.engine_task.done():
+
+                exception = self.engine_task.exception()
+
+                if exception is not None:
+                    logger.error(
+                        "Trading engine failed during startup.",
+                        exc_info=(
+                            type(exception),
+                            exception,
+                            exception.__traceback__,
+                        ),
+                    )
+                    raise RuntimeError(
+                        "Trading engine failed during startup."
+                    ) from exception
+
+                logger.warning(
+                    "Trading engine exited during startup."
+                )
+
+                return {
+                    "success": False,
+                    "running": False,
+                    "message": "Trading engine exited during startup. Check Live Logs.",
+                }
+
+            return {
+                "success": True,
+                "running": True,
+                "message": "Trading engine start requested.",
+            }
+
+    async def stop_engine(self):
+
+        async with self.engine_control_lock:
+
+            from engine import engine
+
+            if not self.is_engine_running():
+
+                logger.info(
+                    "Trading engine is already stopped."
+                )
+
+                self.engine_task = None
+
+                return {
+                    "success": True,
+                    "running": False,
+                    "message": "Trading engine is already stopped.",
+                }
+
+            logger.info(
+                "Stopping Vrotex trading engine."
             )
-
-        finally:
-
-            writer.close()
 
             try:
 
-                await writer.wait_closed()
+                await engine.stop()
 
             except Exception:
 
-                pass
+                logger.exception(
+                    "Trading engine stop request failed."
+                )
 
-    async def send_http_response(
-        self,
-        writer,
-        status_code,
-        status_text,
-        body,
-        content_type="text/plain",
-    ):
+                raise
 
-        body_bytes = body.encode("utf-8")
+            if (
+                self.engine_task
+                and not self.engine_task.done()
+            ):
 
-        response_headers = (
-            f"HTTP/1.1 {status_code} {status_text}\r\n"
-            f"Content-Type: {content_type}; charset=utf-8\r\n"
-            f"Content-Length: {len(body_bytes)}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-        )
+                try:
 
-        writer.write(
-            response_headers.encode("utf-8")
-        )
+                    await asyncio.wait_for(
+                        self.engine_task,
+                        timeout=15,
+                    )
 
-        writer.write(body_bytes)
+                except asyncio.TimeoutError:
 
-        await writer.drain()
+                    logger.warning(
+                        "Trading engine did not stop within 15 seconds; cancelling its task."
+                    )
 
-    async def stop_http_server(self):
+                    self.engine_task.cancel()
 
-        if self.http_server:
+                    await asyncio.gather(
+                        self.engine_task,
+                        return_exceptions=True,
+                    )
 
-            logger.info(
-                "Stopping HTTP server."
-            )
-
-            self.http_server.close()
-
-            await self.http_server.wait_closed()
-
-            self.http_server = None
+            self.engine_task = None
 
             logger.info(
-                "HTTP server stopped."
+                "Vrotex trading engine stopped."
             )
 
-    # ==========================================
-    # BOT STARTUP
-    # ==========================================
+            return {
+                "success": True,
+                "running": False,
+                "message": "Trading engine stopped.",
+            }
 
     async def start(self):
 
         await self.initialize()
 
         logger.info(
-            "Vrotex Bot V1 starting."
+            "Vrotex Bot V1 service starting."
         )
 
-        # Start HTTP server for Render port detection
-        await self.start_http_server()
+        app = create_app(self)
 
-        from engine import engine
+        port = int(
+            os.environ.get("PORT", 10000)
+        )
 
-        self.engine_task = asyncio.create_task(
-            engine.start(),
-            name="vrotex-trading-engine",
+        uvicorn_config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_config=None,
+            access_log=True,
+        )
+
+        self.http_server = uvicorn.Server(
+            uvicorn_config
+        )
+
+        server_task = asyncio.create_task(
+            self.http_server.serve(),
+            name="vrotex-dashboard-api-server",
         )
 
         shutdown_task = asyncio.create_task(
@@ -289,24 +233,33 @@ class VrotexBot:
             name="vrotex-shutdown-waiter",
         )
 
+        logger.info(
+            "Dashboard/API server starting | PORT=%s",
+            port,
+        )
+
         try:
 
-            done, pending = await asyncio.wait(
-                [self.engine_task, shutdown_task],
+            # Preserve the existing automatic engine startup behavior.
+            await self.start_engine()
+
+            # The web server remains alive independently of the engine.
+            done, _ = await asyncio.wait(
+                [
+                    server_task,
+                    shutdown_task,
+                ],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            if shutdown_task in done:
+            if server_task in done:
 
-                logger.info(
-                    "Shutdown signal received."
+                # A web-server exit is a service-level event.
+                await server_task
+
+                logger.error(
+                    "Dashboard/API server exited."
                 )
-
-                await engine.stop()
-
-            if self.engine_task in done:
-
-                await self.engine_task
 
         finally:
 
@@ -319,30 +272,21 @@ class VrotexBot:
 
             await self.stop()
 
-    # ==========================================
-    # BOT SHUTDOWN
-    # ==========================================
-
     async def stop(self):
 
-        if not self.running:
+        if not self.running and self.http_server is None:
             return
 
         logger.info(
-            "Shutdown requested."
+            "Vrotex Bot V1 service shutdown requested."
         )
 
         self.running = False
-
         self.shutdown_event.set()
-
-        await self.stop_http_server()
 
         try:
 
-            from engine import engine
-
-            await engine.stop()
+            await self.stop_engine()
 
         except Exception:
 
@@ -350,21 +294,17 @@ class VrotexBot:
                 "Engine shutdown failed."
             )
 
-        if (
-            self.engine_task
-            and not self.engine_task.done()
-            and self.engine_task is not asyncio.current_task()
-        ):
+        if self.http_server:
 
-            self.engine_task.cancel()
-
-            await asyncio.gather(
-                self.engine_task,
-                return_exceptions=True,
+            logger.info(
+                "Stopping dashboard/API server."
             )
 
+            self.http_server.should_exit = True
+            self.http_server = None
+
         logger.info(
-            "Vrotex Bot V1 stopped."
+            "Vrotex Bot V1 service stopped."
         )
 
 
