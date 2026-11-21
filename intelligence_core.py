@@ -1,26 +1,28 @@
-
 """
 VROTEX BOT V1
 INTELLIGENCE CORE
-Version 1.0
+Version 1.1
 
 Purpose:
-- Coordinate the existing Technical Analysis Engine.
-- Coordinate the existing Fundamental Analysis Engine.
-- Publish analysis results to the Intelligence Registry.
-- Provide a shared intelligence interface to Vrotex modules.
+- Coordinate Technical Analysis Engine.
+- Coordinate Fundamental Analysis Engine.
+- Coordinate Strategy & Knowledge Library.
+- Publish analysis results to Intelligence Registry.
+- Provide shared intelligence interfaces to Vrotex modules.
 
 Scope:
 - Technical Analysis
 - Fundamental Analysis
+- Strategy Knowledge
 - Intelligence Registry communication
 
 Does NOT:
 - Duplicate TA or FA calculations.
 - Execute trades.
-- Generate SMC entry signals.
+- Generate entry signals.
+- Modify approved strategy rules.
 - Fetch external economic data.
-- Modify trading strategy or risk settings.
+- Modify risk settings.
 """
 
 from typing import Any, Dict, List, Optional
@@ -28,15 +30,18 @@ from typing import Any, Dict, List, Optional
 from technical_analysis_engine import technical_analysis_engine
 from fundamental_analysis_engine import fundamental_analysis_engine
 from intelligence_registry import intelligence_registry
+from strategy_knowledge_library import strategy_knowledge_library
 
 
 class IntelligenceCore:
 
-    VERSION = "1.0"
+    VERSION = "1.1"
 
     def __init__(self):
+
         self.technical_engine = technical_analysis_engine
         self.fundamental_engine = fundamental_analysis_engine
+        self.strategy_library = strategy_knowledge_library
         self.registry = intelligence_registry
 
         self.last_results: Dict[str, Any] = {}
@@ -76,6 +81,97 @@ class IntelligenceCore:
         return self.registry.get_record(key)
 
     # ---------------------------------------------------------
+    # STRATEGY KNOWLEDGE LIBRARY
+    # ---------------------------------------------------------
+
+    def get_strategy_knowledge(self) -> Dict[str, Any]:
+
+        return self.strategy_library.get_all()
+
+    def get_strategy_section(
+        self,
+        section_name: str
+    ) -> Optional[Dict[str, Any]]:
+
+        return self.strategy_library.get_section(
+            section_name
+        )
+
+    def get_strategy_context(
+        self,
+        instrument: Optional[str] = None
+    ) -> Dict[str, Any]:
+
+        context = (
+            self.strategy_library.get_strategy_context(
+                instrument
+            )
+        )
+
+        self._publish(
+            key="strategy_knowledge:context",
+            value=context,
+            source="STRATEGY_KNOWLEDGE_LIBRARY",
+            metadata={
+                "instrument": instrument,
+                "library_version": (
+                    self.strategy_library.VERSION
+                )
+            }
+        )
+
+        return context
+
+    def search_strategy_knowledge(
+        self,
+        query: str
+    ) -> List[Dict[str, Any]]:
+
+        return self.strategy_library.search(query)
+
+    def get_strategy_library_status(
+        self
+    ) -> Dict[str, Any]:
+
+        status = (
+            self.strategy_library.get_status()
+        )
+
+        self._publish(
+            key="strategy_knowledge:status",
+            value=status,
+            source="STRATEGY_KNOWLEDGE_LIBRARY",
+            metadata={
+                "library_version": (
+                    self.strategy_library.VERSION
+                )
+            }
+        )
+
+        return status
+
+    def validate_strategy_integrity(self) -> bool:
+
+        valid = (
+            self.strategy_library
+            .validate_strategy_integrity()
+        )
+
+        self._publish(
+            key="strategy_knowledge:integrity",
+            value={
+                "valid": valid,
+                "protected": True
+            },
+            source="STRATEGY_KNOWLEDGE_LIBRARY",
+            metadata={
+                "validation": True
+            }
+        )
+
+        return valid
+
+    # ---------------------------------------------------------
     # TECHNICAL ANALYSIS
     # ---------------------------------------------------------
 
@@ -92,12 +188,14 @@ class IntelligenceCore:
         timeframe = str(timeframe).upper().strip()
 
         if not symbol or not timeframe:
+
             return {
                 "success": False,
                 "reason": "INVALID_SYMBOL_OR_TIMEFRAME"
             }
 
         if not isinstance(candles, list):
+
             return {
                 "success": False,
                 "reason": "INVALID_CANDLE_INPUT",
@@ -116,18 +214,25 @@ class IntelligenceCore:
             )
 
             if not isinstance(result, dict):
+
                 raise TypeError(
-                    "Technical Analysis Engine returned an invalid result"
+                    "Technical Analysis Engine "
+                    "returned an invalid result"
                 )
 
             result["intelligence_source"] = (
                 "TECHNICAL_ANALYSIS_ENGINE"
             )
 
-            result["intelligence_version"] = self.VERSION
+            result["intelligence_version"] = (
+                self.VERSION
+            )
 
             self._publish(
-                key=f"technical_analysis:{symbol}:{timeframe}",
+                key=(
+                    f"technical_analysis:"
+                    f"{symbol}:{timeframe}"
+                ),
                 value=result,
                 source="TECHNICAL_ANALYSIS_ENGINE",
                 metadata={
@@ -154,7 +259,10 @@ class IntelligenceCore:
             }
 
             self._publish(
-                key=f"technical_analysis:{symbol}:{timeframe}",
+                key=(
+                    f"technical_analysis:"
+                    f"{symbol}:{timeframe}"
+                ),
                 value=error,
                 source="INTELLIGENCE_CORE",
                 metadata={
@@ -179,6 +287,7 @@ class IntelligenceCore:
         currency = str(currency).upper().strip()
 
         if not isinstance(data, dict):
+
             return {
                 "success": False,
                 "reason": "INVALID_CURRENCY_DATA"
@@ -221,6 +330,7 @@ class IntelligenceCore:
     ) -> Dict[str, Any]:
 
         if not isinstance(events, list):
+
             return {
                 "success": False,
                 "reason": "INVALID_EVENTS_INPUT"
@@ -228,7 +338,9 @@ class IntelligenceCore:
 
         try:
 
-            self.fundamental_engine.update_events(events)
+            self.fundamental_engine.update_events(
+                events
+            )
 
             self._publish(
                 key="fundamental_economic_events",
@@ -265,6 +377,7 @@ class IntelligenceCore:
         symbol = str(symbol).upper().strip()
 
         if not symbol:
+
             return {
                 "success": False,
                 "reason": "INVALID_SYMBOL"
@@ -272,20 +385,26 @@ class IntelligenceCore:
 
         try:
 
-            result = self.fundamental_engine.analyze_pair(
-                symbol
+            result = (
+                self.fundamental_engine.analyze_pair(
+                    symbol
+                )
             )
 
             if not isinstance(result, dict):
+
                 raise TypeError(
-                    "Fundamental Analysis Engine returned an invalid result"
+                    "Fundamental Analysis Engine "
+                    "returned an invalid result"
                 )
 
             result["intelligence_source"] = (
                 "FUNDAMENTAL_ANALYSIS_ENGINE"
             )
 
-            result["intelligence_version"] = self.VERSION
+            result["intelligence_version"] = (
+                self.VERSION
+            )
 
             self._publish(
                 key=f"fundamental_analysis:{symbol}",
@@ -331,53 +450,142 @@ class IntelligenceCore:
     def analyze_instrument(
         self,
         symbol: str,
-        candles_by_timeframe: Dict[str, List[Dict[str, Any]]],
-        previous_biases: Optional[Dict[str, str]] = None
+        candles_by_timeframe: Dict[
+            str, List[Dict[str, Any]]
+        ],
+        previous_biases: Optional[
+            Dict[str, str]
+        ] = None
     ) -> Dict[str, Any]:
 
         symbol = str(symbol).upper().strip()
 
-        if not isinstance(candles_by_timeframe, dict):
+        if not symbol:
+
+            return {
+                "success": False,
+                "reason": "INVALID_SYMBOL"
+            }
+
+        if not isinstance(
+            candles_by_timeframe,
+            dict
+        ):
+
             return {
                 "success": False,
                 "reason": "INVALID_TIMEFRAME_DATA"
             }
 
-        previous_biases = previous_biases or {}
+        previous_biases = (
+            previous_biases or {}
+        )
 
         technical_results = {}
 
-        for timeframe, candles in candles_by_timeframe.items():
+        # -----------------------------------------------------
+        # TECHNICAL ANALYSIS
+        # -----------------------------------------------------
 
-            timeframe = str(timeframe).upper().strip()
+        for timeframe, candles in (
+            candles_by_timeframe.items()
+        ):
+
+            timeframe = (
+                str(timeframe).upper().strip()
+            )
 
             technical_results[timeframe] = (
                 self.analyze_technical(
                     symbol=symbol,
                     timeframe=timeframe,
                     candles=candles,
-                    previous_bias=previous_biases.get(
-                        timeframe,
-                        "UNKNOWN"
+                    previous_bias=(
+                        previous_biases.get(
+                            timeframe,
+                            "UNKNOWN"
+                        )
                     )
                 )
             )
 
-        fundamental_result = self.analyze_fundamental(
-            symbol
+        # -----------------------------------------------------
+        # FUNDAMENTAL ANALYSIS
+        # -----------------------------------------------------
+
+        fundamental_result = (
+            self.analyze_fundamental(
+                symbol
+            )
         )
 
+        # -----------------------------------------------------
+        # STRATEGY KNOWLEDGE CONTEXT
+        # -----------------------------------------------------
+
+        try:
+
+            strategy_context = (
+                self.get_strategy_context(
+                    symbol
+                )
+            )
+
+            strategy_success = True
+
+        except Exception as exc:
+
+            strategy_context = {
+                "success": False,
+                "reason": (
+                    "STRATEGY_CONTEXT_UNAVAILABLE"
+                ),
+                "error": str(exc)
+            }
+
+            strategy_success = False
+
+        # -----------------------------------------------------
+        # COMBINED INTELLIGENCE RESULT
+        # -----------------------------------------------------
+
         result = {
+
             "success": True,
+
             "version": self.VERSION,
+
             "symbol": symbol,
-            "technical_analysis": technical_results,
-            "fundamental_analysis": fundamental_result,
+
+            "technical_analysis": (
+                technical_results
+            ),
+
+            "fundamental_analysis": (
+                fundamental_result
+            ),
+
+            "strategy_knowledge": (
+                strategy_context
+            ),
+
+            "strategy_knowledge_available": (
+                strategy_success
+            ),
+
             "sources": [
+
                 "TECHNICAL_ANALYSIS_ENGINE",
-                "FUNDAMENTAL_ANALYSIS_ENGINE"
-            ]
+
+                "FUNDAMENTAL_ANALYSIS_ENGINE",
+
+                "STRATEGY_KNOWLEDGE_LIBRARY",
+            ],
         }
+
+        # -----------------------------------------------------
+        # PUBLISH COMPLETE INTELLIGENCE
+        # -----------------------------------------------------
 
         self._publish(
             key=f"intelligence:{symbol}",
@@ -386,7 +594,12 @@ class IntelligenceCore:
             metadata={
                 "symbol": symbol,
                 "version": self.VERSION,
-                "timeframes": list(technical_results.keys())
+                "timeframes": list(
+                    technical_results.keys()
+                ),
+                "strategy_knowledge_available": (
+                    strategy_success
+                )
             }
         )
 
@@ -402,26 +615,65 @@ class IntelligenceCore:
 
     def get_status(self) -> Dict[str, Any]:
 
+        strategy_status = (
+            self.strategy_library.get_status()
+        )
+
+        strategy_integrity = (
+            self.strategy_library
+            .validate_strategy_integrity()
+        )
+
         return {
-            "component": "VROTEX_INTELLIGENCE_CORE",
+
+            "component": (
+                "VROTEX_INTELLIGENCE_CORE"
+            ),
+
             "version": self.VERSION,
+
             "status": "ACTIVE",
+
             "components": {
+
                 "technical_analysis": (
                     self.technical_engine.get_status()
                 ),
+
                 "fundamental_analysis": (
                     self.fundamental_engine.get_status()
                 ),
+
                 "intelligence_registry": (
                     self.registry.status()
-                )
+                ),
+
+                "strategy_knowledge_library": {
+
+                    "status": strategy_status,
+
+                    "integrity_valid": (
+                        strategy_integrity
+                    ),
+                },
             },
-            "last_result_count": len(self.last_results)
+
+            "last_result_count": (
+                len(self.last_results)
+            ),
         }
 
-    def get_last_results(self) -> Dict[str, Any]:
-        return dict(self.last_results)
+    # ---------------------------------------------------------
+    # LAST RESULTS
+    # ---------------------------------------------------------
+
+    def get_last_results(
+        self
+    ) -> Dict[str, Any]:
+
+        return dict(
+            self.last_results
+        )
 
 
 # -------------------------------------------------------------
