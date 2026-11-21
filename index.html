@@ -275,6 +275,59 @@ main { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflo
 .trade-order { padding:10px 0; border-bottom:1px solid #10263a; font-size:13px; }
 .trade-order-head { display:flex; justify-content:space-between; gap:10px; font-weight:700; margin-bottom:6px; }
 
+
+/* Vrotex Charts page — full-height MT5-inspired layout, scoped to the second page only. */
+#chat-page { height:100%; min-height:0; overflow:hidden; padding:0; background:#020711; }
+#chat-page.active { display:flex; }
+.charts-workspace { position:relative; display:flex; flex-direction:column; width:100%; height:100%; min-height:0; overflow:hidden; color:#eaf7ff; background:#020711; }
+.charts-topbar { flex:0 0 48px; display:flex; align-items:center; justify-content:space-between; gap:7px; padding:0 10px; border-bottom:1px solid #123653; background:linear-gradient(180deg,#07182b,#030c19); }
+.charts-symbol-wrap { min-width:0; display:grid; grid-template-columns:23px auto; grid-template-rows:23px 13px; align-items:center; column-gap:5px; }
+.charts-symbol-mark { grid-row:1 / span 2; display:grid; place-items:center; width:22px; height:22px; border:1px solid #168bd0; border-radius:6px; color:#63d6ff; font-size:15px; }
+#chart-symbol { min-width:0; width:112px; max-width:34vw; border:0; outline:0; background:transparent; color:#f4f9ff; font-size:15px; font-weight:800; }
+#chart-symbol option { background:#061326; color:#fff; }
+.charts-symbol-caption { color:#7f9db7; font-size:9px; grid-column:2; }
+.charts-top-actions { display:flex; align-items:center; gap:6px; }
+.charts-tool-btn { width:34px; height:32px; border:1px solid #17466b; border-radius:8px; background:#071a2d; color:#c8eaff; font-size:15px; font-weight:800; }
+.charts-tool-btn:active { background:#0c3150; }
+.charts-plus-btn { border-color:#2189cb; color:#77dcff; font-size:22px; }
+.charts-toolbar-row { flex:0 0 37px; display:flex; align-items:center; justify-content:space-between; gap:4px; padding:0 7px; border-bottom:1px solid #102b42; background:#030d1a; }
+.charts-timeframes { display:flex; align-items:center; gap:2px; min-width:0; }
+.charts-timeframes button { min-width:29px; height:26px; padding:0 4px; border:0; border-radius:5px; background:transparent; color:#8ea9bf; font-size:10px; font-weight:700; }
+.charts-timeframes button.selected { background:#0c4770; color:#fff; box-shadow:inset 0 0 0 1px #249de0; }
+.charts-live-state { flex:0 0 auto; color:#8aa7bf; font-size:8px; font-weight:800; white-space:nowrap; }
+.charts-live-state i { display:inline-block; width:6px; height:6px; margin-right:3px; border-radius:50%; background:#e5a83a; }
+.charts-live-state.connected i { background:#22df78; box-shadow:0 0 7px #22df78; }
+.charts-price-head { flex:0 0 37px; display:flex; align-items:center; justify-content:space-between; gap:5px; padding:0 9px; background:#020a14; border-bottom:1px solid #10283c; }
+.charts-price-head > div:first-child { font-size:12px; white-space:nowrap; }
+.charts-price-head > div:first-child strong { color:#f4f9ff; }
+.charts-price-head > div:first-child span { color:#8ea9bf; }
+.charts-price-values { display:flex; align-items:center; gap:9px; font-size:9px; }
+.charts-price-values b { font-size:11px; margin-left:3px; font-variant-numeric:tabular-nums; }
+.charts-bid { color:#48d98a; } .charts-ask { color:#ff737d; }
+.charts-plot-wrap { position:relative; flex:1 1 auto; min-height:0; width:100%; overflow:hidden; background:#020711; }
+#vrotex-price-chart { position:absolute; inset:0; width:100%; height:100%; }
+.charts-empty-state { position:absolute; z-index:2; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; padding:18px; text-align:center; color:#88a6c0; background:rgba(2,7,17,.72); pointer-events:none; }
+.charts-empty-state strong { color:#d9efff; font-size:13px; }
+.charts-empty-state span:last-child { max-width:245px; font-size:10px; line-height:1.5; }
+.charts-empty-icon { color:#4bbfff; font-size:28px; }
+.charts-watermark { position:absolute; left:8px; bottom:5px; z-index:3; font-size:9px; opacity:.78; }
+.charts-watermark a { color:#a8c8df; text-decoration:none; }
+.charts-bottom-strip { flex:0 0 53px; display:flex; align-items:center; justify-content:space-between; gap:6px; padding:0 10px; border-top:1px solid #17466a; background:linear-gradient(180deg,#07182a,#030b17); }
+.charts-market-name,.charts-current-price { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.charts-market-name strong { color:#f2f8ff; font-size:12px; letter-spacing:.3px; }
+.charts-market-name span,.charts-current-price span { color:#829fb8; font-size:9px; }
+.charts-current-price { align-items:center; }
+.charts-current-price strong { color:#eaf7ff; font-size:13px; font-variant-numeric:tabular-nums; }
+.charts-market-change { color:#42d98b; font-size:9px; font-weight:800; white-space:nowrap; }
+.charts-menu-pop { position:absolute; z-index:12; top:44px; right:8px; width:min(220px,72vw); padding:11px; border:1px solid #1b78b5; border-radius:10px; background:#06172a; box-shadow:0 10px 28px #000b; display:flex; flex-direction:column; gap:9px; font-size:11px; }
+.charts-menu-pop[hidden] { display:none; }
+.charts-menu-pop strong { color:#76d8ff; font-size:12px; }
+.charts-menu-pop span,.charts-menu-pop small { color:#8eaac1; line-height:1.4; }
+.charts-menu-pop label { display:flex; align-items:center; gap:7px; color:#e1effb; }
+.charts-menu-pop input { accent-color:#20a8ef; }
+.charts-draw-menu { top:44px; right:48px; }
+@media (max-width:360px) { .charts-timeframes button { min-width:25px; padding:0 2px; font-size:9px; } .charts-live-state { font-size:7px; } .charts-tool-btn { width:30px; } }
+
 </style>
 </head>
 <body>
@@ -313,17 +366,17 @@ main { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflo
         <div class="home-trading-pairs-list">
           <div class="home-trading-pair" aria-label="EURUSD enabled">
             <span class="home-trading-pair-flag" aria-hidden="true">🇪🇺</span>
-            <span class="home-trading-pair-name">EURUSD</span><span class="vrotex-live-quote" data-symbol="EURUSD" style="font-size:10px;color:#b9d5f5;white-space:nowrap">— / —</span>
+            <span class="home-trading-pair-name">EURUSD</span>
             <span class="home-trading-pair-dot" aria-hidden="true"></span>
           </div>
           <div class="home-trading-pair" aria-label="GBPUSD enabled">
             <span class="home-trading-pair-flag" aria-hidden="true">🇬🇧</span>
-            <span class="home-trading-pair-name">GBPUSD</span><span class="vrotex-live-quote" data-symbol="GBPUSD" style="font-size:10px;color:#b9d5f5;white-space:nowrap">— / —</span>
+            <span class="home-trading-pair-name">GBPUSD</span>
             <span class="home-trading-pair-dot" aria-hidden="true"></span>
           </div>
           <div class="home-trading-pair" aria-label="BTCUSD enabled">
             <span class="home-trading-pair-flag" aria-hidden="true">₿</span>
-            <span class="home-trading-pair-name">BTCUSD</span><span class="vrotex-live-quote" data-symbol="BTCUSD" style="font-size:10px;color:#b9d5f5;white-space:nowrap">— / —</span>
+            <span class="home-trading-pair-name">BTCUSD</span>
             <span class="home-trading-pair-dot" aria-hidden="true"></span>
           </div>
         </div>
@@ -364,13 +417,58 @@ main { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflo
         </button>
       </div>
     </section>
-    <section class="page blank-page" id="chat-page" aria-label="Chat — blank"></section>
-    <section class="page blank-page" id="live-logs-page" aria-label="Live Logs">
-      <div class="more-page-content" style="width:100%;max-width:900px;margin:0 auto;padding:18px;box-sizing:border-box">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;color:inherit"><strong style="font-size:18px">LIVE SYSTEM LOGS</strong><span id="live-logs-connection" style="font-size:11px;opacity:.75">CONNECTING…</span></div>
-        <div id="live-logs-output" role="log" aria-live="polite" style="height:min(68vh,650px);overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:rgba(2,10,24,.72);border:1px solid rgba(80,150,230,.3);border-radius:12px;padding:12px;font:11px/1.55 ui-monospace,monospace;color:#d7e7ff">Waiting for live backend logs…</div>
+    <section class="page" id="chat-page" aria-label="Charts">
+      <div class="charts-workspace">
+        <header class="charts-topbar">
+          <div class="charts-symbol-wrap">
+            <span class="charts-symbol-mark" aria-hidden="true">↗</span>
+            <select id="chart-symbol" aria-label="Trading instrument">
+              <option value="EURUSD">EURUSD</option><option value="GBPUSD">GBPUSD</option><option value="BTCUSD">BTCUSD</option>
+            </select>
+            <span class="charts-symbol-caption">Exness · Vrotex</span>
+          </div>
+          <div class="charts-top-actions">
+            <button type="button" class="charts-tool-btn" id="chart-indicators-btn" aria-label="Indicators" title="Indicators">ƒx</button>
+            <button type="button" class="charts-tool-btn" id="chart-drawings-btn" aria-label="Bot drawings" title="Bot drawings">▱</button>
+            <button type="button" class="charts-tool-btn charts-plus-btn" id="chart-more-btn" aria-label="More chart tools" title="More chart tools">＋</button>
+          </div>
+        </header>
+        <div class="charts-toolbar-row">
+          <div class="charts-timeframes" role="group" aria-label="Chart timeframe">
+            <button type="button" data-tf="M1">M1</button><button type="button" data-tf="M5" class="selected">M5</button><button type="button" data-tf="M15">M15</button><button type="button" data-tf="M30">M30</button><button type="button" data-tf="H1">H1</button><button type="button" data-tf="H4">H4</button><button type="button" data-tf="D1">D1</button>
+          </div>
+          <span class="charts-live-state" id="chart-live-state"><i></i> CONNECTING</span>
+        </div>
+        <div class="charts-menu-pop" id="chart-indicators-menu" hidden>
+          <strong>Indicators</strong><span>Indicator overlays will be connected to Vrotex analysis.</span>
+          <label><input type="checkbox" disabled> Moving average</label><label><input type="checkbox" disabled> Volume</label>
+          <small>No MACD or OBV panels.</small>
+        </div>
+        <div class="charts-menu-pop charts-draw-menu" id="chart-drawings-menu" hidden>
+          <strong>Vrotex bot drawings</strong>
+          <label><input type="checkbox" checked data-drawing="order_blocks"> Order blocks</label>
+          <label><input type="checkbox" checked data-drawing="fvg"> Fair value gaps</label>
+          <label><input type="checkbox" checked data-drawing="liquidity"> Liquidity levels</label>
+          <label><input type="checkbox" checked data-drawing="structure"> BOS / CHoCH</label>
+          <small>Drawings appear when the SMC engine supplies chart coordinates.</small>
+        </div>
+        <div class="charts-price-head">
+          <div><strong id="chart-instrument-label">EURUSD</strong><span id="chart-timeframe-label"> · M5</span></div>
+          <div class="charts-price-values"><span class="charts-bid">BID <b id="chart-bid">—</b></span><span class="charts-ask">ASK <b id="chart-ask">—</b></span></div>
+        </div>
+        <div class="charts-plot-wrap" id="chart-plot-wrap">
+          <div id="vrotex-price-chart" role="img" aria-label="Live Exness candlestick chart"></div>
+          <div class="charts-empty-state" id="chart-empty-state"><span class="charts-empty-icon">▥</span><strong>Waiting for Exness candles</strong><span>Historical candles will load here when the chart API is connected.</span></div>
+          <div class="charts-watermark"><a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView</a></div>
+        </div>
+        <footer class="charts-bottom-strip">
+          <div class="charts-market-name"><strong id="chart-footer-symbol">EURUSD</strong><span id="chart-footer-timeframe">5 minute</span></div>
+          <div class="charts-current-price"><span>Current price</span><strong id="chart-current-price">—</strong></div>
+          <div class="charts-market-change" id="chart-market-change">LIVE DATA</div>
+        </footer>
       </div>
     </section>
+    <section class="page blank-page" id="live-logs-page" aria-label="Live Logs"></section>
     <section class="page" id="trade-page" aria-label="Trade">
       <header class="trade-topbar">
         <button class="trade-menu-btn" id="trade-menu-toggle" aria-label="Open navigation menu" aria-expanded="false">☰</button>
@@ -426,7 +524,7 @@ main { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflo
   </main>
   <nav class="bottom-nav" aria-label="Main navigation">
     <button class="nav-btn active" data-page="home-page" aria-label="Home"><span class="icon">⌂</span><span>Home</span></button>
-    <button class="nav-btn" data-page="chat-page" aria-label="Chat"><span class="icon">▤</span><span>Chat</span></button>
+    <button class="nav-btn" data-page="chat-page" aria-label="Charts"><span class="icon">▥</span><span>Charts</span></button>
     <button class="nav-btn" data-page="trade-page" aria-label="Trade"><span class="icon">↗</span><span>Trade</span></button>
     <button class="nav-btn" data-page="journal-page" aria-label="Journal"><span class="icon">▣</span><span>Journal</span></button>
     <button class="nav-btn" data-page="broker-page" aria-label="Broker"><span class="icon">◉</span><span>Broker</span></button>
@@ -442,6 +540,7 @@ main { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflo
   <button class="add" id="broker-add-bottom" type="button">ADD BROKER</button>
 </div>
 <div id="toast" role="status" aria-live="polite"></div>
+<script src="https://unpkg.com/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 // Navigation, journal calendar, and Trade preview are functional. Bot controls are preview-only.
 let previewRunning=false, toastTimer;
@@ -580,7 +679,8 @@ navButtons.forEach(btn=>btn.addEventListener('click',()=>showPage(btn.dataset.pa
 moreButton.addEventListener('click',()=>showPage('more-page'));
 document.getElementById('more-vrotex-ai').addEventListener('click',()=>showPage('chat-page'));
 document.getElementById('more-live-logs').addEventListener('click',()=>showPage('live-logs-page'));
-// Live bot controls are wired by the Vrotex backend bridge below.
+document.getElementById('start').addEventListener('click',()=>{ previewRunning=true; notify('Preview only: Start selected. No live bot connection.'); });
+document.getElementById('stop').addEventListener('click',()=>{ previewRunning=false; notify('Preview only: Stop selected. No live bot connection.'); });
 
 // Market-session clock: reference UTC windows converted to South African Standard Time (UTC+2).
 (function initMarketSessionClock() {
@@ -613,27 +713,57 @@ document.getElementById('more-live-logs').addEventListener('click',()=>showPage(
 })();
 
 
-// Vrotex live backend bridge. Uses same-origin HTTPS endpoints; no broker secrets are sent to the browser.
-(function initVrotexBackendBridge(){
-  const $=id=>document.getElementById(id);
-  const logBox=$('live-logs-output'), logState=$('live-logs-connection');
-  let ws=null, lastLog='';
-  const fmt=(v)=>v===null||v===undefined?'—':Number(v).toFixed(5);
-  async function api(path, options={}){const r=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})},cache:'no-store'});let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(data.detail||data.error||('HTTP '+r.status));return data;}
-  function paintStatus(d){
-    const running=!!d.running;
-    const start=$('start'), stop=$('stop');
-    if(start){start.disabled=running;start.setAttribute('aria-label',running?'Bot running':'Start bot');start.style.opacity=running?'.55':'1';}
-    if(stop){stop.disabled=!running;stop.setAttribute('aria-label',running?'Stop bot':'Bot stopped');stop.style.opacity=running?'1':'.55';}
-    const statusNode=$('home-bot-status')||$('bot-status'); if(statusNode)statusNode.textContent=running?'RUNNING':'STOPPED';
+// Charts page: Lightweight Charts renderer. Market candles and ticks come only from the Vrotex/Exness API.
+(function initVrotexCharts(){
+  const page=document.getElementById('chat-page');
+  if(!page) return;
+  const symbolSelect=document.getElementById('chart-symbol');
+  const chartHost=document.getElementById('vrotex-price-chart');
+  const empty=document.getElementById('chart-empty-state');
+  const liveState=document.getElementById('chart-live-state');
+  const timeframeButtons=[...page.querySelectorAll('[data-tf]')];
+  const timeframeNames={M1:'1 minute',M5:'5 minute',M15:'15 minute',M30:'30 minute',H1:'1 hour',H4:'4 hour',D1:'1 day'};
+  let timeframe='M5', chart=null, candleSeries=null, candleTimer=null, tickTimer=null, active=false;
+  const el=id=>document.getElementById(id);
+  function setLive(text,connected=false){liveState.textContent=text;liveState.classList.toggle('connected',connected);}
+  function setSymbolLabels(){const symbol=symbolSelect.value;el('chart-instrument-label').textContent=symbol;el('chart-footer-symbol').textContent=symbol;el('chart-timeframe-label').textContent=' · '+timeframe;el('chart-footer-timeframe').textContent=timeframeNames[timeframe]||timeframe;}
+  function toUnix(value){
+    if(typeof value==='number') return Math.floor(value>1e12?value/1000:value);
+    if(typeof value==='string'){const n=Number(value);if(Number.isFinite(n)&&value.trim()!=='')return Math.floor(n>1e12?n/1000:n);const d=Date.parse(value);if(Number.isFinite(d))return Math.floor(d/1000);}
+    return null;
   }
-  function appendLog(entry){if(!logBox)return;const line=typeof entry==='string'?entry:(entry.timestamp+' | '+entry.level+' | '+entry.logger+' | '+entry.message);if(!line||line===lastLog)return;lastLog=line;if(logBox.textContent==='Waiting for live backend logs…')logBox.textContent='';logBox.textContent+=(logBox.textContent?'\n':'')+line;while(logBox.textContent.split('\n').length>500)logBox.textContent=logBox.textContent.slice(logBox.textContent.indexOf('\n')+1);logBox.scrollTop=logBox.scrollHeight;}
-  async function refresh(){try{const d=await api('/api/dashboard');paintStatus(d);(d.quotes||[]).forEach(q=>{document.querySelectorAll('[data-symbol="'+q.symbol+'"]').forEach(n=>{n.textContent=q.fresh?fmt(q.bid)+' / '+fmt(q.ask):(q.reason||'NO LIVE TICK');n.style.color=q.fresh?'#b9d5f5':'#f0b36b';});});if(d.logs) d.logs.forEach(appendLog);}catch(e){if(logState)logState.textContent='BACKEND OFFLINE';}}
-  async function control(action){const b=$(action);try{b.disabled=true;const result=await api('/api/bot/'+action,{method:'POST'});notify(result.message||('Bot '+action+' request accepted.'));await refresh();}catch(e){notify('Bot '+action+' failed: '+e.message);}finally{setTimeout(refresh,1000);}}
-  $('start')?.addEventListener('click',()=>control('start'));
-  $('stop')?.addEventListener('click',()=>control('stop'));
-  function connectLogs(){const scheme=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(scheme+'://'+location.host+'/ws/logs');ws.onopen=()=>{if(logState)logState.textContent='LIVE';};ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==='log')appendLog(d.entry);else if(d.type==='status')paintStatus(d.data);}catch{}};ws.onclose=()=>{if(logState)logState.textContent='RECONNECTING…';setTimeout(connectLogs,3000);};ws.onerror=()=>ws.close();}
-  refresh();connectLogs();setInterval(refresh,5000);
+  function normalizeBars(payload){
+    const rows=Array.isArray(payload)?payload:(payload?.candles||payload?.bars||payload?.data||[]);
+    const out=[];for(const row of rows){const time=toUnix(row.time??row.timestamp??row.date);const open=Number(row.open),high=Number(row.high),low=Number(row.low),close=Number(row.close);if(time&&[open,high,low,close].every(Number.isFinite)&&high>=low)out.push({time,open,high,low,close});}
+    out.sort((a,b)=>a.time-b.time);return out.filter((v,i)=>i===0||v.time!==out[i-1].time);
+  }
+  function createChart(){
+    if(!window.LightweightCharts||chart)return;
+    chart=LightweightCharts.createChart(chartHost,{width:chartHost.clientWidth,height:chartHost.clientHeight,layout:{background:{type:'solid',color:'#020711'},textColor:'#9db7cc',fontSize:10},grid:{vertLines:{color:'#0b1c2d'},horzLines:{color:'#0b1c2d'}},rightPriceScale:{visible:true,borderColor:'#24425b',scaleMargins:{top:.08,bottom:.08}},leftPriceScale:{visible:false},timeScale:{visible:true,borderColor:'#24425b',timeVisible:true,secondsVisible:false},crosshair:{vertLine:{color:'#428bb5',width:1,style:2},horzLine:{color:'#428bb5',width:1,style:2}},handleScroll:true,handleScale:true});
+    candleSeries=chart.addCandlestickSeries({upColor:'#20c878',downColor:'#f05b68',borderUpColor:'#20c878',borderDownColor:'#f05b68',wickUpColor:'#20c878',wickDownColor:'#f05b68',priceLineVisible:true,lastValueVisible:true});
+    const ro=new ResizeObserver(()=>{if(chart)chart.applyOptions({width:chartHost.clientWidth,height:chartHost.clientHeight});});ro.observe(chartHost);
+  }
+  async function loadCandles(){
+    if(!active)return;createChart();if(!chart){setLive('CHART LIBRARY UNAVAILABLE');return;}
+    const symbol=symbolSelect.value;setSymbolLabels();
+    try{const response=await fetch(`/api/chart/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&count=500`,{cache:'no-store'});if(!response.ok)throw new Error(`HTTP ${response.status}`);const data=await response.json();const bars=normalizeBars(data);if(!bars.length)throw new Error('No candle data returned');candleSeries.setData(bars);chart.timeScale().fitContent();empty.hidden=true;setLive('EXNESS DATA',true);}
+    catch(error){if(!candleSeries||candleSeries.data().length===0){empty.hidden=false;empty.querySelector('strong').textContent='Waiting for Exness candles';empty.querySelector('span:last-child').textContent='Chart API is not connected yet. No sample or fabricated candles are shown.';}setLive('DATA NOT CONNECTED');}
+  }
+  async function loadTick(){if(!active)return;const symbol=symbolSelect.value;try{const response=await fetch(`/api/chart/tick?symbol=${encodeURIComponent(symbol)}`,{cache:'no-store'});if(!response.ok)throw new Error('tick unavailable');const tick=await response.json();const bid=Number(tick.bid??tick.tick?.bid),ask=Number(tick.ask??tick.tick?.ask);if(Number.isFinite(bid)){const digits=symbol==='BTCUSD'?2:(symbol.endsWith('JPY')?3:5);el('chart-bid').textContent=bid.toFixed(digits);el('chart-current-price').textContent=bid.toFixed(digits);if(candleSeries&&tick.fresh){const now=Math.floor(Date.now()/1000);const seconds={M1:60,M5:300,M15:900,M30:1800,H1:3600,H4:14400,D1:86400}[timeframe];const barTime=Math.floor(now/seconds)*seconds;const last=candleSeries.data().slice(-1)[0];if(last&&last.time===barTime)candleSeries.update({time:barTime,open:last.open,high:Math.max(last.high,bid),low:Math.min(last.low,bid),close:bid});}}
+      if(Number.isFinite(ask)){const digits=symbol==='BTCUSD'?2:5;el('chart-ask').textContent=ask.toFixed(digits);}if(tick.fresh){setLive('LIVE TICK',true);el('chart-market-change').textContent='LIVE';}else{setLive('STALE / CLOSED');el('chart-market-change').textContent='STALE';}}
+    catch(_){setLive('WAITING FOR TICKS');}}
+  function activate(){if(active)return;active=true;setSymbolLabels();createChart();loadCandles();loadTick();candleTimer=setInterval(loadCandles,60000);tickTimer=setInterval(loadTick,1000);}
+  function deactivate(){active=false;clearInterval(candleTimer);clearInterval(tickTimer);candleTimer=tickTimer=null;}
+  symbolSelect.addEventListener('change',()=>{setSymbolLabels();loadCandles();loadTick();});
+  timeframeButtons.forEach(btn=>btn.addEventListener('click',()=>{timeframe=btn.dataset.tf;timeframeButtons.forEach(b=>b.classList.toggle('selected',b===btn));setSymbolLabels();loadCandles();}));
+  function toggleMenu(id){const target=el(id);const willOpen=target.hidden;page.querySelectorAll('.charts-menu-pop').forEach(m=>m.hidden=true);target.hidden=!willOpen;}
+  el('chart-indicators-btn').addEventListener('click',()=>toggleMenu('chart-indicators-menu'));
+  el('chart-drawings-btn').addEventListener('click',()=>toggleMenu('chart-drawings-menu'));
+  el('chart-more-btn').addEventListener('click',()=>notify('Additional chart tools will be added without changing the dashboard layout.'));
+  page.querySelectorAll('[data-drawing]').forEach(input=>input.addEventListener('change',()=>{notify('Drawing visibility preference selected. Bot drawing data is not connected yet.');}));
+  const observer=new MutationObserver(()=>{if(page.classList.contains('active')){activate();if(chart)requestAnimationFrame(()=>chart.applyOptions({width:chartHost.clientWidth,height:chartHost.clientHeight}));}else deactivate();});
+  observer.observe(page,{attributes:true,attributeFilter:['class']});
+  if(page.classList.contains('active'))activate();
 })();
 
 </script>
