@@ -1,4 +1,6 @@
+
 import asyncio
+import time
 
 from logging_config import get_logger
 from exness_connection import exness_connection
@@ -21,147 +23,194 @@ class ExnessConnector:
 
         self._lock = asyncio.Lock()
 
-        self.max_attempts = 3
-        self.retry_delay = 2
+        # The lower-level connection handles HTTP retries.
+        # Do not add another retry loop here.
+        self.max_attempts = 1
 
-    async def connect(self):
+        self.retry_delay = 2
+        self.cooldown_seconds = 60
+        self.rate_limit_cooldown_seconds = 120
+
+        self.next_retry_time = 0
+        self.last_connect_attempt = 0
+        self.last_success_time = 0
+
+    def _is_rate_limit_error(self, error=None):
+
+        error_text = str(error or self.last_error or "").lower()
+
+        return (
+            "429" in error_text
+            or "rate limit" in error_text
+            or "too many requests" in error_text
+        )
+
+    def _set_cooldown(self, error=None):
+
+        if self._is_rate_limit_error(error):
+
+            cooldown = self.rate_limit_cooldown_seconds
+
+        else:
+
+            cooldown = self.cooldown_seconds
+
+        self.next_retry_time = time.monotonic() + cooldown
+
+    def _cooldown_remaining(self):
+
+        remaining = self.next_retry_time - time.monotonic()
+
+        return max(0, int(remaining))
+
+    async def connect(self, force=False):
 
         async with self._lock:
 
-            if self.connected and self.connection.connected:
+            if self.connected:
 
-                return {
-                    "success": True,
-                    "connected": True,
-                    "message": "Already connected",
-                }
+                return True
+
+            if self.connecting:
+
+                return False
+
+            if not force and time.monotonic() < self.next_retry_time:
+
+                remaining = self._cooldown_remaining()
+
+                logger.warning(
+                    "Exness connection cooldown active. "
+                    "Retry in %s seconds.",
+                    remaining,
+                )
+
+                return False
 
             self.connecting = True
-            self.last_error = None
+            self.last_connect_attempt = time.time()
 
             try:
 
-                for attempt in range(
-                    1,
-                    self.max_attempts + 1
-                ):
+                logger.info("Connecting to Exness...")
 
-                    try:
+                # Lower-level connection owns its HTTP retry policy.
+                result = await self.connection.connect()
 
-                        logger.info(
-                            "Exness connection attempt %s/%s",
-                            attempt,
-                            self.max_attempts,
-                        )
+                if result:
 
-                        result = await self.connection.connect()
+                    self.connected = True
+                    self.last_error = None
+                    self.next_retry_time = 0
+                    self.last_success_time = time.time()
 
-                        self.connected = True
+                    logger.info("Exness connection successful.")
 
-                        self.account_info = result.get(
-                            "account"
-                        )
+                    return True
 
-                        self.last_error = None
+                self.connected = False
 
-                        logger.info(
-                            "Exness connector is connected."
-                        )
+                self.last_error = getattr(
+                    self.connection,
+                    "last_error",
+                    None,
+                )
 
-                        return {
-                            "success": True,
-                            "connected": True,
-                            "account_id": result.get(
-                                "account_id"
-                            ),
-                            "message": "Connection successful",
-                        }
+                self._set_cooldown(self.last_error)
 
-                    except Exception as exc:
+                logger.error(
+                    "Exness connection failed: %s",
+                    self.last_error,
+                )
 
-                        self.connected = False
-                        self.last_error = str(exc)
+                return False
 
-                        logger.error(
-                            "Connection attempt %s failed: %s",
-                            attempt,
-                            exc,
-                        )
+            except Exception as exc:
 
-                        if attempt < self.max_attempts:
+                self.connected = False
+                self.last_error = str(exc)
 
-                            delay = (
-                                self.retry_delay
-                                * attempt
-                            )
+                self._set_cooldown(exc)
 
-                            logger.info(
-                                "Retrying in %s seconds.",
-                                delay,
-                            )
+                logger.exception("Exness connector error.")
 
-                            await asyncio.sleep(
-                                delay
-                            )
-
-                return {
-                    "success": False,
-                    "connected": False,
-                    "message": "Connection failed",
-                    "error": self.last_error,
-                }
+                return False
 
             finally:
 
                 self.connecting = False
 
-    async def reconnect(self):
+    async def disconnect(self):
 
-        logger.warning(
-            "Exness reconnection requested."
-        )
+        async with self._lock:
 
-        try:
+            try:
 
-            await self.connection.disconnect()
+                if hasattr(self.connection, "disconnect"):
 
-        except Exception as exc:
+                    await self.connection.disconnect()
 
-            logger.warning(
-                "Disconnect before reconnect failed: %s",
-                exc,
-            )
+            except Exception as exc:
 
-        self.connected = False
-        self.account_info = None
+                logger.warning(
+                    "Error during Exness disconnect: %s",
+                    exc,
+                )
 
-        return await self.connect()
+            self.connected = False
+            self.connecting = False
 
-    async def check_connection(self):
-
-        if not self.connected:
-            return False
-
-        try:
-
-            account = await (
-                self.connection.get_account_info()
-            )
-
-            self.account_info = account
-            self.connected = True
+            logger.info("Exness disconnected.")
 
             return True
 
-        except Exception as exc:
+    async def check_connection(self, refresh_account=False):
 
-            logger.error(
-                "Connection health check failed: %s",
-                exc,
+        # Lightweight health check.
+        # No API request unless explicitly requested.
+
+        if not self.connected:
+
+            return False
+
+        if not refresh_account:
+
+            return True
+
+        try:
+
+            account = await self.connection.get_account_info()
+
+            if account:
+
+                self.account_info = account
+                self.last_success_time = time.time()
+
+                return True
+
+            self.connected = False
+
+            self.last_error = getattr(
+                self.connection,
+                "last_error",
+                "Account verification failed",
             )
+
+            self._set_cooldown(self.last_error)
+
+            return False
+
+        except Exception as exc:
 
             self.connected = False
             self.last_error = str(exc)
+
+            self._set_cooldown(exc)
+
+            logger.error(
+                "Exness connection check failed: %s",
+                exc,
+            )
 
             return False
 
@@ -169,48 +218,69 @@ class ExnessConnector:
 
         if not self.connected:
 
-            result = await self.connect()
+            success = await self.connect()
 
-            if not result.get("success"):
+            if not success:
 
-                raise ConnectionError(
-                    "Exness connection unavailable"
-                )
+                return None
 
-        account = await (
-            self.connection.get_account_info()
-        )
+        try:
 
-        self.account_info = account
+            account = await self.connection.get_account_info()
 
-        return account
+            if account:
+
+                self.account_info = account
+                self.last_error = None
+                self.last_success_time = time.time()
+
+                return account
+
+            self.connected = False
+
+            self.last_error = getattr(
+                self.connection,
+                "last_error",
+                "Account information unavailable",
+            )
+
+            self._set_cooldown(self.last_error)
+
+            return None
+
+        except Exception as exc:
+
+            self.connected = False
+            self.last_error = str(exc)
+
+            self._set_cooldown(exc)
+
+            logger.exception(
+                "Failed to retrieve Exness account information."
+            )
+
+            return None
+
+    async def reconnect(self):
+
+        logger.warning("Manual Exness reconnect requested.")
+
+        await self.disconnect()
+
+        # Explicit reconnect bypasses cooldown.
+        return await self.connect(force=True)
 
     def get_status(self):
 
         return {
             "connected": self.connected,
             "connecting": self.connecting,
-            "account_id": self.connection.account_id,
-            "access_point_resolved": bool(
-                self.connection.access_point
-            ),
+            "account_info": self.account_info,
             "last_error": self.last_error,
+            "last_connect_attempt": self.last_connect_attempt,
+            "last_success_time": self.last_success_time,
+            "retry_after": self._cooldown_remaining(),
         }
-
-    async def disconnect(self):
-
-        try:
-
-            await self.connection.disconnect()
-
-        finally:
-
-            self.connected = False
-            self.account_info = None
-
-            logger.info(
-                "Exness connector disconnected."
-            )
 
 
 exness_connector = ExnessConnector()
