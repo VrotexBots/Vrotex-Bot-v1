@@ -1,7 +1,7 @@
 """
 Vrotex Bot V1
 SMC Integration Adapter
-Version: 4.0
+Version: 4.1
 
 Purpose:
     Normalize evidence from TA, structure, liquidity,
@@ -9,7 +9,13 @@ Purpose:
 
     Preserve the four approved SMC pathways.
 
-    Evidence only. No order execution.
+    Strict body-close validation.
+    Strict external CHoCH validation.
+    Strict entry retest validation.
+    Risk validation.
+
+    Execution integration readiness.
+    No broker order placement in this adapter.
 """
 
 import logging
@@ -22,7 +28,7 @@ logger = logging.getLogger("vrotex.smc_adapter")
 
 class SMCIntegrationAdapter:
 
-    VERSION = "4.0"
+    VERSION = "4.1"
 
     DIRECTIONS = (
         "BULLISH",
@@ -31,8 +37,16 @@ class SMCIntegrationAdapter:
         "UNKNOWN",
     )
 
-    def __init__(self):
+    REQUIRED_RISK_CHECKS = (
+        "spread_valid",
+        "stop_loss_valid",
+        "risk_within_limit",
+        "daily_limit_valid",
+        "consecutive_loss_limit_valid",
+        "reward_risk_valid",
+    )
 
+    def __init__(self):
         self.last_evidence = {}
 
     # =========================================================
@@ -41,7 +55,6 @@ class SMCIntegrationAdapter:
 
     @staticmethod
     def _dict(value):
-
         return value if isinstance(value, dict) else {}
 
     @staticmethod
@@ -60,8 +73,19 @@ class SMCIntegrationAdapter:
 
     @staticmethod
     def _bool(value):
-
         return value is True
+
+    @staticmethod
+    def _number(value):
+
+        try:
+            if value is None:
+                return None
+
+            return float(value)
+
+        except (ValueError, TypeError):
+            return None
 
     @staticmethod
     def _direction(value):
@@ -76,11 +100,15 @@ class SMCIntegrationAdapter:
             "LONG": "BULLISH",
             "UP": "BULLISH",
             "BULL": "BULLISH",
+            "BULLISH_FVG": "BULLISH",
+            "BULLISH_GAP": "BULLISH",
 
             "SELL": "BEARISH",
             "SHORT": "BEARISH",
             "DOWN": "BEARISH",
             "BEAR": "BEARISH",
+            "BEARISH_FVG": "BEARISH",
+            "BEARISH_GAP": "BEARISH",
 
             "SIDEWAYS": "RANGING",
             "RANGE": "RANGING",
@@ -94,28 +122,166 @@ class SMCIntegrationAdapter:
             "BEARISH",
             "RANGING",
         ):
-
             return value
 
         return "UNKNOWN"
 
     @staticmethod
-    def _number(value):
+    def _event_type(event):
+
+        event = SMCIntegrationAdapter._dict(event)
+
+        value = event.get(
+            "type",
+            event.get(
+                "event",
+                event.get(
+                    "break_type",
+                    "",
+                ),
+            ),
+        )
+
+        value = str(value).upper().strip()
+
+        aliases = {
+            "CHANGE_OF_CHARACTER": "CHOCH",
+            "CHANGE CHARACTER": "CHOCH",
+            "CHoCH": "CHOCH",
+            "BREAK_OF_STRUCTURE": "BOS",
+            "BREAK STRUCTURE": "BOS",
+        }
+
+        return aliases.get(value, value)
+
+    @staticmethod
+    def _body_close_confirmed(event):
+
+        event = SMCIntegrationAdapter._dict(event)
+
+        confirmation = str(
+            event.get(
+                "confirmation",
+                "",
+            )
+        ).upper().strip()
+
+        # STRICT:
+        # Generic confirmed=True is NOT sufficient.
+        # Wick-only breaks must never qualify.
+
+        return (
+            event.get(
+                "body_close_confirmed"
+            ) is True
+
+            or event.get(
+                "body_close"
+            ) is True
+
+            or event.get(
+                "close_confirmed"
+            ) is True
+
+            or confirmation == "BODY_CLOSE"
+        )
+
+    @staticmethod
+    def _extract_items(value, keys=None):
+
+        if isinstance(value, (list, tuple)):
+            return list(value)
+
+        if isinstance(value, dict):
+
+            if keys:
+
+                for key in keys:
+
+                    candidate = value.get(key)
+
+                    if isinstance(
+                        candidate,
+                        (list, tuple),
+                    ):
+                        return list(candidate)
+
+            return [value]
+
+        return []
+
+    @staticmethod
+    def _deepcopy(value):
 
         try:
+            return deepcopy(value)
 
-            if value is None:
-                return None
-
-            return float(value)
-
-        except (ValueError, TypeError):
-
-            return None
+        except Exception:
+            return value
 
     # =========================================================
     # STRUCTURE NORMALIZATION
     # =========================================================
+
+    def _normalize_breaks(
+        self,
+        breaks,
+        timeframe=None,
+        structure_type=None,
+    ):
+
+        normalized = []
+
+        for event in self._list(breaks):
+
+            if not isinstance(event, dict):
+                continue
+
+            event_type = self._event_type(event)
+
+            direction = self._direction(
+                event.get(
+                    "direction",
+                    event.get(
+                        "bias",
+                    ),
+                )
+            )
+
+            body_close = (
+                self._body_close_confirmed(
+                    event
+                )
+            )
+
+            normalized_event = {
+                **event,
+                "type": event_type,
+                "direction": direction,
+                "body_close_confirmed": (
+                    body_close
+                ),
+                "close_confirmed": (
+                    body_close
+                ),
+                "timeframe": (
+                    event.get(
+                        "timeframe",
+                        timeframe,
+                    )
+                ),
+            }
+
+            if structure_type:
+                normalized_event[
+                    "structure_type"
+                ] = structure_type
+
+            normalized.append(
+                normalized_event
+            )
+
+        return normalized
 
     def normalize_structure(
         self,
@@ -125,12 +291,19 @@ class SMCIntegrationAdapter:
 
         structure = self._dict(structure)
 
-        # Support TA results wrapped inside a technical field.
-        if "technical" in structure:
+        original = self._deepcopy(
+            structure
+        )
 
-            structure = self._dict(
-                structure.get("technical")
-            )
+        # Support TA output wrapped in technical.
+        if isinstance(
+            structure.get("technical"),
+            dict,
+        ):
+
+            structure = structure[
+                "technical"
+            ]
 
         nested = structure.get(
             "structure",
@@ -138,11 +311,9 @@ class SMCIntegrationAdapter:
         )
 
         if isinstance(nested, dict):
-
             source = nested
 
         else:
-
             source = structure
 
         direction = self._direction(
@@ -153,101 +324,86 @@ class SMCIntegrationAdapter:
                     source.get(
                         "trend",
                         source.get(
-                            "structure_bias"
+                            "structure_bias",
                         ),
                     ),
                 ),
             )
         )
 
-        breaks = self._list(
+        breaks = self._normalize_breaks(
             source.get(
                 "breaks",
                 structure.get(
                     "breaks",
                     [],
                 ),
+            ),
+            timeframe=timeframe,
+        )
+
+        external = self._dict(
+            source.get(
+                "external_structure",
             )
         )
 
-        normalized_breaks = []
+        internal = self._dict(
+            source.get(
+                "internal_structure",
+            )
+        )
 
-        for event in breaks:
+        external_breaks = (
+            self._normalize_breaks(
+                external.get(
+                    "breaks",
+                    [],
+                ),
+                timeframe=timeframe,
+                structure_type="EXTERNAL",
+            )
+        )
 
-            if not isinstance(event, dict):
-                continue
+        internal_breaks = (
+            self._normalize_breaks(
+                internal.get(
+                    "breaks",
+                    [],
+                ),
+                timeframe=timeframe,
+                structure_type="INTERNAL",
+            )
+        )
 
-            event_type = str(
-                event.get(
-                    "type",
-                    event.get(
-                        "event",
-                        event.get(
-                            "break_type",
-                            "",
-                        ),
-                    ),
-                )
-            ).upper()
+        normalized_external = {
+            **external,
+            "breaks": external_breaks,
+        }
 
-            event_direction = self._direction(
-                event.get(
+        normalized_internal = {
+            **internal,
+            "breaks": internal_breaks,
+            "direction": self._direction(
+                internal.get(
                     "direction",
-                    event.get(
+                    internal.get(
                         "bias",
                     ),
                 )
-            )
-
-            close_confirmed = (
-                event.get(
-                    "close_confirmed",
-                    event.get(
-                        "body_close",
-                        event.get(
-                            "confirmed",
-                            False,
-                        ),
-                    ),
-                )
-                is True
-            )
-
-            normalized_breaks.append(
-                {
-                    **event,
-                    "type": event_type,
-                    "direction": event_direction,
-                    "close_confirmed": (
-                        close_confirmed
-                    ),
-                    "timeframe": (
-                        event.get(
-                            "timeframe",
-                            timeframe,
-                        )
-                    ),
-                }
-            )
+            ),
+        }
 
         return {
             "timeframe": timeframe,
             "direction": direction,
             "bias": direction,
-            "breaks": normalized_breaks,
+            "breaks": breaks,
             "external_structure": (
-                self._dict(
-                    source.get(
-                        "external_structure"
-                    )
-                )
+                normalized_external
             ),
             "internal_structure": (
-                self._dict(
-                    source.get(
-                        "internal_structure"
-                    )
-                )
+                normalized_internal
             ),
             "swing_highs": self._list(
                 source.get(
@@ -265,7 +421,7 @@ class SMCIntegrationAdapter:
                     ),
                 )
             ),
-            "raw": deepcopy(structure),
+            "raw": original,
         }
 
     # =========================================================
@@ -282,28 +438,22 @@ class SMCIntegrationAdapter:
         event = self._dict(event)
 
         direction = self._direction(
-            event.get("direction")
-        )
-
-        event_type = str(
             event.get(
-                "type",
-                event.get("event", ""),
-            )
-        ).upper()
-
-        body_close = (
-            event.get(
-                "close_confirmed",
+                "direction",
                 event.get(
-                    "body_close",
-                    event.get(
-                        "confirmed",
-                        False,
-                    ),
+                    "bias",
                 ),
             )
-            is True
+        )
+
+        event_type = self._event_type(
+            event
+        )
+
+        body_close = (
+            self._body_close_confirmed(
+                event
+            )
         )
 
         direction_valid = True
@@ -323,9 +473,11 @@ class SMCIntegrationAdapter:
 
             type_valid = (
                 event_type
-                == str(
-                    required_type
-                ).upper()
+                == self._event_type(
+                    {
+                        "type": required_type
+                    }
+                )
             )
 
         valid = (
@@ -345,7 +497,9 @@ class SMCIntegrationAdapter:
                 direction_valid
             ),
             "type_valid": type_valid,
-            "event": event,
+            "event": self._deepcopy(
+                event
+            ),
         }
 
     # =========================================================
@@ -364,17 +518,19 @@ class SMCIntegrationAdapter:
 
         external = self._dict(
             structure.get(
-                "external_structure"
+                "external_structure",
             )
         )
+
+        # IMPORTANT:
+        # No fallback to unclassified structure breaks.
+        # Only breaks explicitly belonging to the
+        # external structure may qualify.
 
         events = self._list(
             external.get(
                 "breaks",
-                structure.get(
-                    "breaks",
-                    [],
-                ),
+                [],
             )
         )
 
@@ -391,7 +547,7 @@ class SMCIntegrationAdapter:
                 expected_direction=(
                     expected_direction
                 ),
-                required_type="CHoCH",
+                required_type="CHOCH",
             )
 
             if result["valid"]:
@@ -401,7 +557,9 @@ class SMCIntegrationAdapter:
                     "direction": (
                         expected_direction
                     ),
-                    "event": event,
+                    "event": (
+                        result["event"]
+                    ),
                     "body_close_confirmed": (
                         True
                     ),
@@ -412,9 +570,15 @@ class SMCIntegrationAdapter:
 
         return {
             "confirmed": False,
-            "direction": expected_direction,
-            "body_close_confirmed": False,
-            "structure_type": "EXTERNAL",
+            "direction": (
+                expected_direction
+            ),
+            "body_close_confirmed": (
+                False
+            ),
+            "structure_type": (
+                "EXTERNAL"
+            ),
             "reason": (
                 "No qualifying external "
                 "CHoCH body-close found"
@@ -436,7 +600,7 @@ class SMCIntegrationAdapter:
 
         internal = self._dict(
             structure.get(
-                "internal_structure"
+                "internal_structure",
             )
         )
 
@@ -446,6 +610,7 @@ class SMCIntegrationAdapter:
                 "available": False,
                 "direction": "UNKNOWN",
                 "breaks": [],
+                "validated_breaks": [],
             }
 
         direction = self._direction(
@@ -464,11 +629,26 @@ class SMCIntegrationAdapter:
             )
         )
 
+        validated = []
+
+        for event in breaks:
+
+            validated.append(
+                self.validate_break(
+                    event,
+                )
+            )
+
         return {
             "available": True,
             "direction": direction,
             "breaks": breaks,
-            "raw": deepcopy(internal),
+            "validated_breaks": (
+                validated
+            ),
+            "raw": self._deepcopy(
+                internal
+            ),
         }
 
     # =========================================================
@@ -484,31 +664,43 @@ class SMCIntegrationAdapter:
             liquidity
         )
 
-        sweeps = self._list(
+        sweeps = self._extract_items(
             liquidity.get(
                 "sweeps",
                 liquidity.get(
                     "liquidity_sweeps",
                 ),
-            )
+            ),
+            keys=(
+                "sweeps",
+                "liquidity_sweeps",
+            ),
         )
 
-        equal_highs = self._list(
+        equal_highs = self._extract_items(
             liquidity.get(
                 "equal_highs",
                 liquidity.get(
                     "eqh",
                 ),
-            )
+            ),
+            keys=(
+                "equal_highs",
+                "eqh",
+            ),
         )
 
-        equal_lows = self._list(
+        equal_lows = self._extract_items(
             liquidity.get(
                 "equal_lows",
                 liquidity.get(
                     "eql",
                 ),
-            )
+            ),
+            keys=(
+                "equal_lows",
+                "eql",
+            ),
         )
 
         normalized_sweeps = []
@@ -535,17 +727,16 @@ class SMCIntegrationAdapter:
                         "",
                     ),
                 )
-            ).upper()
+            ).upper().strip()
 
             close_back_inside = (
                 sweep.get(
                     "close_back_inside",
-                    sweep.get(
-                        "reclaimed",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or sweep.get(
+                    "reclaimed",
+                ) is True
             )
 
             normalized_sweeps.append(
@@ -556,14 +747,30 @@ class SMCIntegrationAdapter:
                     "close_back_inside": (
                         close_back_inside
                     ),
+                    "valid": (
+                        direction
+                        in (
+                            "BULLISH",
+                            "BEARISH",
+                        )
+                        and bool(sweep_type)
+                    ),
                 }
             )
 
         return {
-            "sweeps": normalized_sweeps,
-            "equal_highs": equal_highs,
-            "equal_lows": equal_lows,
-            "raw": deepcopy(liquidity),
+            "sweeps": (
+                normalized_sweeps
+            ),
+            "equal_highs": (
+                equal_highs
+            ),
+            "equal_lows": (
+                equal_lows
+            ),
+            "raw": self._deepcopy(
+                liquidity
+            ),
         }
 
     # =========================================================
@@ -576,13 +783,24 @@ class SMCIntegrationAdapter:
         expected_direction=None,
     ):
 
-        items = self._list(fvg)
+        items = self._extract_items(
+            fvg,
+            keys=(
+                "fvg",
+                "fvgs",
+                "gaps",
+                "fair_value_gaps",
+            ),
+        )
 
         normalized = []
 
         for item in items:
 
-            if not isinstance(item, dict):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 continue
 
             direction = self._direction(
@@ -597,20 +815,17 @@ class SMCIntegrationAdapter:
             clean = (
                 item.get(
                     "clean",
-                    item.get(
-                        "unmitigated",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "unmitigated",
+                ) is True
             )
 
             invalidated = (
                 item.get(
                     "invalidated",
-                    False,
-                )
-                is True
+                ) is True
             )
 
             lower = self._number(
@@ -618,6 +833,9 @@ class SMCIntegrationAdapter:
                     "lower",
                     item.get(
                         "bottom",
+                        item.get(
+                            "low",
+                        ),
                     ),
                 )
             )
@@ -627,6 +845,9 @@ class SMCIntegrationAdapter:
                     "upper",
                     item.get(
                         "top",
+                        item.get(
+                            "high",
+                        ),
                     ),
                 )
             )
@@ -648,6 +869,18 @@ class SMCIntegrationAdapter:
                 and lower < upper
             )
 
+            valid = (
+                direction
+                in (
+                    "BULLISH",
+                    "BEARISH",
+                )
+                and clean
+                and not invalidated
+                and bounds_valid
+                and direction_valid
+            )
+
             normalized.append(
                 {
                     **item,
@@ -664,12 +897,7 @@ class SMCIntegrationAdapter:
                     "direction_valid": (
                         direction_valid
                     ),
-                    "valid_poi": (
-                        clean
-                        and not invalidated
-                        and bounds_valid
-                        and direction_valid
-                    ),
+                    "valid_poi": valid,
                 }
             )
 
@@ -686,7 +914,16 @@ class SMCIntegrationAdapter:
         current_price=None,
     ):
 
-        items = self._list(poi)
+        items = self._extract_items(
+            poi,
+            keys=(
+                "poi",
+                "pois",
+                "order_blocks",
+                "obs",
+                "blocks",
+            ),
+        )
 
         normalized = []
 
@@ -696,7 +933,10 @@ class SMCIntegrationAdapter:
 
         for item in items:
 
-            if not isinstance(item, dict):
+            if not isinstance(
+                item,
+                dict,
+            ):
                 continue
 
             direction = self._direction(
@@ -704,6 +944,9 @@ class SMCIntegrationAdapter:
                     "direction",
                     item.get(
                         "bias",
+                        item.get(
+                            "type",
+                        ),
                     ),
                 )
             )
@@ -713,6 +956,9 @@ class SMCIntegrationAdapter:
                     "lower",
                     item.get(
                         "bottom",
+                        item.get(
+                            "low",
+                        ),
                     ),
                 )
             )
@@ -722,6 +968,9 @@ class SMCIntegrationAdapter:
                     "upper",
                     item.get(
                         "top",
+                        item.get(
+                            "high",
+                        ),
                     ),
                 )
             )
@@ -729,20 +978,17 @@ class SMCIntegrationAdapter:
             clean = (
                 item.get(
                     "clean",
-                    item.get(
-                        "unmitigated",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "unmitigated",
+                ) is True
             )
 
             invalidated = (
                 item.get(
                     "invalidated",
-                    False,
-                )
-                is True
+                ) is True
             )
 
             bounds_valid = (
@@ -765,12 +1011,11 @@ class SMCIntegrationAdapter:
             tapped = (
                 item.get(
                     "tapped",
-                    item.get(
-                        "tap_confirmed",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "tap_confirmed",
+                ) is True
             )
 
             if (
@@ -784,6 +1029,18 @@ class SMCIntegrationAdapter:
                     <= current_price
                     <= upper
                 )
+
+            valid_poi = (
+                direction
+                in (
+                    "BULLISH",
+                    "BEARISH",
+                )
+                and clean
+                and not invalidated
+                and bounds_valid
+                and direction_valid
+            )
 
             normalized.append(
                 {
@@ -803,10 +1060,11 @@ class SMCIntegrationAdapter:
                     ),
                     "tapped": tapped,
                     "valid_poi": (
-                        clean
-                        and not invalidated
-                        and bounds_valid
-                        and direction_valid
+                        valid_poi
+                    ),
+                    "valid_poi_tapped": (
+                        valid_poi
+                        and tapped
                     ),
                 }
             )
@@ -823,8 +1081,13 @@ class SMCIntegrationAdapter:
         expected_direction=None,
     ):
 
-        items = self._list(
-            displacement
+        items = self._extract_items(
+            displacement,
+            keys=(
+                "displacement",
+                "displacements",
+                "events",
+            ),
         )
 
         normalized = []
@@ -846,12 +1109,17 @@ class SMCIntegrationAdapter:
             confirmed = (
                 item.get(
                     "confirmed",
-                    item.get(
-                        "valid",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "displacement_confirmed",
+                ) is True
+            )
+
+            invalidated = (
+                item.get(
+                    "invalidated",
+                ) is True
             )
 
             direction_valid = True
@@ -865,18 +1133,29 @@ class SMCIntegrationAdapter:
                     )
                 )
 
+            valid = (
+                confirmed
+                and not invalidated
+                and direction_valid
+                and direction
+                in (
+                    "BULLISH",
+                    "BEARISH",
+                )
+            )
+
             normalized.append(
                 {
                     **item,
                     "direction": direction,
                     "confirmed": confirmed,
+                    "invalidated": (
+                        invalidated
+                    ),
                     "direction_valid": (
                         direction_valid
                     ),
-                    "valid": (
-                        confirmed
-                        and direction_valid
-                    ),
+                    "valid": valid,
                 }
             )
 
@@ -892,8 +1171,14 @@ class SMCIntegrationAdapter:
         expected_direction=None,
     ):
 
-        items = self._list(
-            entry_models
+        items = self._extract_items(
+            entry_models,
+            keys=(
+                "entry_models",
+                "models",
+                "entries",
+                "signals",
+            ),
         )
 
         normalized = []
@@ -915,31 +1200,27 @@ class SMCIntegrationAdapter:
             confirmed = (
                 item.get(
                     "confirmed",
-                    item.get(
-                        "valid",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "model_confirmed",
+                ) is True
             )
 
             invalidated = (
                 item.get(
                     "invalidated",
-                    False,
-                )
-                is True
+                ) is True
             )
 
             retest_confirmed = (
                 item.get(
                     "retest_confirmed",
-                    item.get(
-                        "retest",
-                        False,
-                    ),
-                )
-                is True
+                ) is True
+
+                or item.get(
+                    "retest",
+                ) is True
             )
 
             direction_valid = True
@@ -952,6 +1233,22 @@ class SMCIntegrationAdapter:
                         expected_direction
                     )
                 )
+
+            # Approved entry confirmation:
+            # Model confirmation + retest +
+            # valid direction + not invalidated.
+
+            valid = (
+                confirmed
+                and retest_confirmed
+                and not invalidated
+                and direction_valid
+                and direction
+                in (
+                    "BULLISH",
+                    "BEARISH",
+                )
+            )
 
             normalized.append(
                 {
@@ -967,11 +1264,7 @@ class SMCIntegrationAdapter:
                     "direction_valid": (
                         direction_valid
                     ),
-                    "valid": (
-                        confirmed
-                        and not invalidated
-                        and direction_valid
-                    ),
+                    "valid": valid,
                 }
             )
 
@@ -980,15 +1273,6 @@ class SMCIntegrationAdapter:
     # =========================================================
     # RISK CHECKS
     # =========================================================
-
-    REQUIRED_RISK_CHECKS = (
-        "spread_valid",
-        "stop_loss_valid",
-        "risk_within_limit",
-        "daily_limit_valid",
-        "consecutive_loss_limit_valid",
-        "reward_risk_valid",
-    )
 
     def normalize_risk_checks(
         self,
@@ -1015,7 +1299,9 @@ class SMCIntegrationAdapter:
         ]
 
         passed = (
-            all(normalized.values())
+            all(
+                normalized.values()
+            )
             and not missing
         )
 
@@ -1023,7 +1309,7 @@ class SMCIntegrationAdapter:
             "checks": normalized,
             "missing": missing,
             "passed": passed,
-            "raw": deepcopy(
+            "raw": self._deepcopy(
                 risk_checks
             ),
         }
@@ -1074,19 +1360,23 @@ class SMCIntegrationAdapter:
             )
         )
 
-        fvg_data = self.normalize_fvg(
-            fvg,
-            expected_direction=(
-                trade_direction
-            ),
+        fvg_data = (
+            self.normalize_fvg(
+                fvg,
+                expected_direction=(
+                    trade_direction
+                ),
+            )
         )
 
-        poi_data = self.normalize_poi(
-            poi,
-            expected_direction=(
-                trade_direction
-            ),
-            current_price=current_price,
+        poi_data = (
+            self.normalize_poi(
+                poi,
+                expected_direction=(
+                    trade_direction
+                ),
+                current_price=current_price,
+            )
         )
 
         displacement_data = (
@@ -1126,9 +1416,52 @@ class SMCIntegrationAdapter:
             )
         )
 
+        valid_fvg = any(
+            item.get(
+                "valid_poi",
+                False,
+            )
+            for item in fvg_data
+        )
+
+        valid_poi = any(
+            item.get(
+                "valid_poi",
+                False,
+            )
+            for item in poi_data
+        )
+
+        valid_tapped_poi = any(
+            item.get(
+                "valid_poi_tapped",
+                False,
+            )
+            for item in poi_data
+        )
+
+        displacement_confirmed = any(
+            item.get(
+                "valid",
+                False,
+            )
+            for item in displacement_data
+        )
+
+        entry_model_confirmed = any(
+            item.get(
+                "valid",
+                False,
+            )
+            for item in entry_data
+        )
+
         evidence = {
             "version": self.VERSION,
-            "direction": trade_direction,
+
+            "direction": (
+                trade_direction
+            ),
 
             "structure": {
                 "H1": h1,
@@ -1210,52 +1543,30 @@ class SMCIntegrationAdapter:
 
                 "liquidity_available": (
                     bool(
-                        liquidity_data["sweeps"]
+                        liquidity_data[
+                            "sweeps"
+                        ]
                     )
                 ),
 
                 "valid_fvg_available": (
-                    any(
-                        item.get(
-                            "valid_poi",
-                            False,
-                        )
-                        for item in fvg_data
-                    )
+                    valid_fvg
                 ),
 
                 "valid_poi_available": (
-                    any(
-                        item.get(
-                            "valid_poi",
-                            False,
-                        )
-                        for item in poi_data
-                    )
+                    valid_poi
+                ),
+
+                "valid_tapped_poi_available": (
+                    valid_tapped_poi
                 ),
 
                 "displacement_confirmed": (
-                    any(
-                        item.get(
-                            "valid",
-                            False,
-                        )
-                        for item in (
-                            displacement_data
-                        )
-                    )
+                    displacement_confirmed
                 ),
 
                 "entry_model_confirmed": (
-                    any(
-                        item.get(
-                            "valid",
-                            False,
-                        )
-                        for item in (
-                            entry_data
-                        )
-                    )
+                    entry_model_confirmed
                 ),
 
                 "risk_checks_passed": (
@@ -1263,11 +1574,29 @@ class SMCIntegrationAdapter:
                 ),
             },
 
+            # This adapter produces evidence.
+            # Final execution authorization belongs
+            # to the master decision/risk/execution pipeline.
+
+            "execution_ready": (
+                risk_data["passed"]
+                and valid_tapped_poi
+                and displacement_confirmed
+                and entry_model_confirmed
+                and trade_direction
+                in (
+                    "BULLISH",
+                    "BEARISH",
+                )
+            ),
+
             "execution_authorized": False,
         }
 
-        self.last_evidence = deepcopy(
-            evidence
+        self.last_evidence = (
+            self._deepcopy(
+                evidence
+            )
         )
 
         return evidence
@@ -1282,14 +1611,16 @@ class SMCIntegrationAdapter:
             "version": self.VERSION,
             "status": "READY",
             "execution_authorized": False,
-            "last_evidence": deepcopy(
-                self.last_evidence
+            "last_evidence": (
+                self._deepcopy(
+                    self.last_evidence
+                )
             ),
         }
 
     def get_last_evidence(self):
 
-        return deepcopy(
+        return self._deepcopy(
             self.last_evidence
         )
 
