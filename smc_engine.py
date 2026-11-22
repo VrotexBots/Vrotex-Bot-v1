@@ -1,20 +1,19 @@
 """
 Vrotex Bot V1
 Master Smart Money Concepts Engine
-Version: 3.1
+Version: 3.2 - Execution Authorization Enabled
 
-Four independent setup pathways:
+Four approved pathways:
 1. H1-aligned continuation
 2. H1 countertrend reversal
 3. M5 internal countertrend reversal
 4. Ranging-market opportunities
 
 A+ threshold: 85/100
+Adapter: SMC Integration Adapter V4.1
 
-Evidence is normalized through SMCIntegrationAdapter.
-Execution authorization remains downstream.
-
-Existing public interfaces preserved.
+This engine authorizes qualifying trade decisions for the downstream
+execution engine. It does not itself submit broker orders.
 """
 
 from __future__ import annotations
@@ -22,40 +21,21 @@ from __future__ import annotations
 import math
 import logging
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("vrotex.smc_engine")
 
-
-# =============================================================
-# ADAPTER CONNECTION
-# =============================================================
-
 try:
-    from smc_integration_adapter import (
-        smc_integration_adapter,
-    )
-
+    from smc_integration_adapter import smc_integration_adapter
     ADAPTER_AVAILABLE = True
-
 except ImportError:
-
     smc_integration_adapter = None
     ADAPTER_AVAILABLE = False
+    logger.exception("SMC integration adapter import failed")
 
-    logger.exception(
-        "SMC integration adapter import failed"
-    )
-
-
-# =============================================================
-# MASTER ENGINE
-# =============================================================
 
 class SMCEngine:
-
-    VERSION = "3.1"
-
+    VERSION = "3.2"
+    EXECUTION_ENABLED = True
     A_PLUS_THRESHOLD = 85
 
     CATEGORY_WEIGHTS = {
@@ -75,10 +55,7 @@ class SMCEngine:
         "RANGING_MARKET",
     )
 
-    DIRECTIONS = (
-        "BULLISH",
-        "BEARISH",
-    )
+    DIRECTIONS = ("BULLISH", "BEARISH")
 
     REQUIRED_RISK_CHECKS = (
         "spread_valid",
@@ -90,488 +67,327 @@ class SMCEngine:
     )
 
     def __init__(self, adapter=None):
-
-        self.adapter = (
-            adapter
-            if adapter is not None
-            else smc_integration_adapter
-        )
-
+        self.adapter = adapter if adapter is not None else smc_integration_adapter
         self.last_analysis = {}
-
         self.adapter_errors = 0
 
-    # =========================================================
-    # SAFE HELPERS
-    # =========================================================
+    # ----------------------- Helpers -----------------------
 
     @staticmethod
     def _dict(value):
-
-        return (
-            value
-            if isinstance(value, dict)
-            else {}
-        )
+        return value if isinstance(value, dict) else {}
 
     @staticmethod
     def _list(value):
-
         if isinstance(value, list):
             return value
-
         if isinstance(value, tuple):
             return list(value)
-
         return []
 
     @staticmethod
     def _number(value):
-
         try:
-
-            number = float(value)
-
-            if not math.isfinite(number):
-                return None
-
-            return number
-
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
-        ):
-
+            n = float(value)
+            return n if math.isfinite(n) else None
+        except (TypeError, ValueError, OverflowError):
             return None
 
     @staticmethod
     def _direction(value):
-
-        value = str(
-            value or ""
-        ).upper().strip()
-
+        value = str(value or "").upper().strip()
         aliases = {
             "BULL": "BULLISH",
             "BUY": "BULLISH",
             "LONG": "BULLISH",
             "UP": "BULLISH",
-
             "BEAR": "BEARISH",
             "SELL": "BEARISH",
             "SHORT": "BEARISH",
             "DOWN": "BEARISH",
-
             "RANGE": "RANGING",
             "SIDEWAYS": "RANGING",
             "NEUTRAL": "RANGING",
         }
-
-        value = aliases.get(
-            value,
-            value,
-        )
-
-        if value in (
-            "BULLISH",
-            "BEARISH",
-            "RANGING",
-        ):
-
-            return value
-
-        return None
+        value = aliases.get(value, value)
+        return value if value in ("BULLISH", "BEARISH", "RANGING") else None
 
     @staticmethod
-    def _normalise_trade_direction(value):
+    def _event_type(event):
+        event = SMCEngine._dict(event)
+        raw = str(
+            event.get(
+                "type",
+                event.get(
+                    "event",
+                    event.get("break_type", ""),
+                ),
+            )
+        ).upper().strip()
 
-        return SMCEngine._direction(
-            value
-        )
+        return {
+            "CHANGE_OF_CHARACTER": "CHOCH",
+            "CHANGE CHARACTER": "CHOCH",
+            "BREAK_OF_STRUCTURE": "BOS",
+            "BREAK STRUCTURE": "BOS",
+        }.get(raw, raw)
 
     @staticmethod
-    def _opposite(direction):
+    def _body_close(event):
+        event = SMCEngine._dict(event)
+        confirmation = str(
+            event.get("confirmation", "")
+        ).upper().strip()
 
-        if direction == "BULLISH":
-            return "BEARISH"
-
-        return "BULLISH"
+        # Strict: generic confirmed=True is not a body-close confirmation.
+        return (
+            event.get("body_close_confirmed") is True
+            or event.get("body_close") is True
+            or event.get("close_confirmed") is True
+            or confirmation == "BODY_CLOSE"
+        )
 
     @staticmethod
     def _technical(data):
-
         data = SMCEngine._dict(data)
-
-        if isinstance(
-            data.get("technical"),
-            dict,
-        ):
-
-            return data["technical"]
-
-        return data
-
-    def _tf(
-        self,
-        market_data,
-        timeframe,
-    ):
-
-        market_data = self._dict(
-            market_data
+        return (
+            data.get("technical")
+            if isinstance(data.get("technical"), dict)
+            else data
         )
 
+    def _tf(self, market_data, timeframe):
         return self._technical(
-            market_data.get(
-                timeframe
-            )
+            self._dict(market_data).get(timeframe)
         )
 
     @staticmethod
-    def _price_inside_zone(
-        price,
-        zone,
-    ):
-
+    def _price_inside_zone(price, zone):
         if price is None:
             return False
 
-        zone = SMCEngine._dict(
-            zone
-        )
+        zone = SMCEngine._dict(zone)
 
-        lower = SMCEngine._number(
+        low = SMCEngine._number(
             zone.get(
                 "lower",
                 zone.get(
                     "low",
-                    zone.get(
-                        "bottom"
-                    )
+                    zone.get("bottom"),
                 ),
             )
         )
 
-        upper = SMCEngine._number(
+        high = SMCEngine._number(
             zone.get(
                 "upper",
                 zone.get(
                     "high",
-                    zone.get(
-                        "top"
-                    ),
+                    zone.get("top"),
                 ),
             )
         )
 
-        if (
-            lower is None
-            or upper is None
-        ):
-
-            return False
-
-        if lower > upper:
-            return False
-
         return (
-            lower
-            <= price
-            <= upper
+            low is not None
+            and high is not None
+            and low <= high
+            and low <= price <= high
         )
 
-    # =========================================================
-    # BREAK VALIDATION
-    # =========================================================
+    # ------------------- Strict break checks -------------------
 
-    @staticmethod
     def _confirmed_break(
+        self,
         event,
         direction,
+        required_type=None,
+        external_only=False,
     ):
+        event = self._dict(event)
 
-        event = SMCEngine._dict(
-            event
-        )
-
-        event_direction = (
-            SMCEngine._direction(
-                event.get(
-                    "direction"
-                )
+        event_direction = self._direction(
+            event.get(
+                "direction",
+                event.get("bias"),
             )
         )
 
-        confirmed = (
-            event.get(
-                "confirmed"
-            ) is True
-            or event.get(
-                "body_close_confirmed"
-            ) is True
-            or event.get(
-                "close_confirmed"
-            ) is True
-        )
+        event_type = self._event_type(event)
 
-        body_close = (
-            event.get(
-                "confirmation"
-            ) == "BODY_CLOSE"
-            or event.get(
-                "body_close_confirmed"
-            ) is True
-            or event.get(
-                "close_confirmed"
-            ) is True
-            or event.get(
-                "body_close"
-            ) is True
-        )
+        if (
+            event.get("invalidated") is True
+            or not self._body_close(event)
+        ):
+            return False
 
-        invalidated = (
-            event.get(
-                "invalidated"
-            ) is True
-        )
+        if event_direction != direction:
+            return False
 
-        return (
-            event_direction == direction
-            and confirmed
-            and body_close
-            and not invalidated
-        )
+        if required_type and event_type != required_type.upper():
+            return False
+
+        if (
+            external_only
+            and str(
+                event.get("structure_type", "")
+            ).upper() != "EXTERNAL"
+        ):
+            return False
+
+        return True
 
     def _find_break(
         self,
-        technical,
+        structure,
         direction,
+        required_type=None,
+        external_only=False,
     ):
-
-        technical = self._dict(
-            technical
-        )
-
-        # Prefer external structure when
-        # explicitly supplied.
-
+        structure = self._dict(structure)
         external = self._dict(
-            technical.get(
-                "external_structure"
-            )
+            structure.get("external_structure")
         )
 
-        events = self._list(
-            external.get(
-                "breaks"
-            )
+        events = (
+            self._list(external.get("breaks"))
+            if external_only
+            else []
         )
 
         if not events:
-
             events = self._list(
-                technical.get(
-                    "breaks"
-                )
+                structure.get("breaks")
             )
 
-        for event in reversed(
-            events
-        ):
-
-            if not isinstance(
-                event,
-                dict,
-            ):
-                continue
-
+        for event in reversed(events):
             if self._confirmed_break(
                 event,
                 direction,
+                required_type,
+                external_only,
             ):
-
-                return deepcopy(
-                    event
-                )
+                return deepcopy(event)
 
         return None
 
-    # =========================================================
-    # H1 DIRECTION
-    # =========================================================
-
-    def determine_h1_direction(
-        self,
-        data,
-    ):
-
-        data = self._technical(
-            data
-        )
+    def determine_h1_direction(self, data):
+        data = self._technical(data)
 
         direction = self._direction(
-            data.get(
-                "direction"
-            )
+            data.get("direction")
         )
 
         if direction in self.DIRECTIONS:
             return direction
 
         structure = self._dict(
-            data.get(
-                "structure"
-            )
+            data.get("structure")
         )
 
         direction = self._direction(
-            structure.get(
-                "direction"
-            )
-            or structure.get(
-                "bias"
-            )
+            structure.get("direction")
+            or structure.get("bias")
         )
 
         if direction in self.DIRECTIONS:
             return direction
 
         return self._direction(
-            data.get(
-                "bias"
-            )
+            data.get("bias")
         )
-
-    # =========================================================
-    # M5 EXTERNAL BREAK VALIDATION
-    # =========================================================
 
     def validate_m5_external_choch(
         self,
         data,
         expected_direction,
     ):
+        data = self._technical(data)
 
-        data = self._technical(
-            data
-        )
-
-        expected_direction = (
-            self._direction(
-                expected_direction
-            )
-        )
-
-        if (
+        expected_direction = self._direction(
             expected_direction
-            not in self.DIRECTIONS
-        ):
+        )
 
+        if expected_direction not in self.DIRECTIONS:
             return {
                 "valid": False,
                 "reason": "INVALID_DIRECTION",
             }
 
-        event = self._find_break(
-            data,
-            expected_direction,
+        external = self._dict(
+            data.get("external_structure")
         )
 
-        if event is None:
+        # Only explicitly classified external breaks qualify.
+        # No fallback to generic breaks.
+        events = self._list(
+            external.get("breaks")
+        )
 
-            return {
-                "valid": False,
-                "reason": (
-                    "BODY_CLOSE_EXTERNAL_BREAK_MISSING"
-                ),
-            }
+        for event in reversed(events):
+            if self._confirmed_break(
+                event,
+                expected_direction,
+                "CHOCH",
+                external_only=True,
+            ):
+                return {
+                    "valid": True,
+                    "direction": expected_direction,
+                    "event": deepcopy(event),
+                    "reason": (
+                        "EXTERNAL_CHOCH_BODY_CLOSE_CONFIRMED"
+                    ),
+                }
 
         return {
-            "valid": True,
-            "direction": expected_direction,
-            "event": event,
-            "reason": (
-                "EXTERNAL_BREAK_CONFIRMED"
-            ),
+            "valid": False,
+            "reason": "EXTERNAL_CHOCH_BODY_CLOSE_MISSING",
         }
 
-    # =========================================================
-    # SCORE CALCULATION
-    # =========================================================
+    # ------------------------ Scoring ------------------------
 
-    def calculate_a_plus_score(
-        self,
-        category_scores=None,
-    ):
-
-        category_scores = self._dict(
-            category_scores
-        )
+    def calculate_a_plus_score(self, category_scores=None):
+        category_scores = self._dict(category_scores)
 
         total = 0.0
         details = {}
         complete = True
 
-        for category, weight in (
-            self.CATEGORY_WEIGHTS.items()
-        ):
-
+        for category, weight in self.CATEGORY_WEIGHTS.items():
             raw = self._number(
-                category_scores.get(
-                    category
-                )
+                category_scores.get(category)
             )
 
             if raw is None:
-
                 complete = False
                 raw = 0.0
 
             raw = max(
                 0.0,
-                min(
-                    100.0,
-                    raw,
-                ),
+                min(100.0, raw),
             )
 
-            weighted = (
-                raw
-                * weight
-                / 100.0
-            )
-
+            weighted = raw * weight / 100.0
             total += weighted
 
             details[category] = {
                 "score": raw,
                 "weight": weight,
-                "weighted_score": round(
-                    weighted,
-                    4,
-                ),
+                "weighted_score": round(weighted, 4),
             }
 
-        total = round(
-            total,
-            2,
-        )
+        total = round(total, 2)
 
         return {
             "score": total,
             "threshold": self.A_PLUS_THRESHOLD,
-            "a_plus": (
-                total
-                >= self.A_PLUS_THRESHOLD
-            ),
+            "a_plus": total >= self.A_PLUS_THRESHOLD,
             "complete": complete,
             "categories": details,
         }
 
-    # =========================================================
-    # ADAPTER EVIDENCE NORMALIZATION
-    # =========================================================
+    # ---------------- Adapter evidence ----------------
 
     def _build_adapter_evidence(
         self,
@@ -584,128 +400,64 @@ class SMCEngine:
         fvg_evidence,
         risk_checks,
     ):
-
         if self.adapter is None:
-
             return {
                 "available": False,
                 "error": "ADAPTER_NOT_CONNECTED",
             }
 
         try:
-
-            h1 = self._tf(
-                market_data,
-                "H1",
+            h1, m5, m1 = (
+                self._tf(market_data, tf)
+                for tf in ("H1", "M5", "M1")
             )
 
-            m5 = self._tf(
-                market_data,
-                "M5",
-            )
-
-            m1 = self._tf(
-                market_data,
-                "M1",
-            )
-
-            liquidity = (
-                market_data.get(
-                    "liquidity",
-                    {},
-                )
+            liquidity = self._dict(
+                market_data.get("liquidity")
             )
 
             if not liquidity:
-
                 liquidity = {
-                    "H1": h1.get(
-                        "liquidity",
-                        {},
-                    ),
-                    "M5": m5.get(
-                        "liquidity",
-                        {},
-                    ),
-                    "M1": m1.get(
-                        "liquidity",
-                        {},
-                    ),
+                    "H1": h1.get("liquidity", {}),
+                    "M5": m5.get("liquidity", {}),
+                    "M1": m1.get("liquidity", {}),
                 }
-
-            # Flatten POIs for adapter normalization.
-            # Original timeframe mapping is retained
-            # separately for pathway evaluation.
 
             poi_items = []
 
-            for timeframe, items in (
-                self._dict(
-                    poi_evidence
-                ).items()
-            ):
+            for timeframe, items in self._dict(
+                poi_evidence
+            ).items():
 
-                if isinstance(
-                    items,
-                    dict,
-                ):
-
-                    item = deepcopy(
-                        items
-                    )
-
-                    item.setdefault(
-                        "timeframe",
-                        timeframe,
-                    )
-
-                    poi_items.append(
-                        item
-                    )
-
-                elif isinstance(
-                    items,
-                    list,
-                ):
-
-                    for item in items:
-
-                        if isinstance(
-                            item,
-                            dict,
-                        ):
-
-                            item = deepcopy(
-                                item
-                            )
-
-                            item.setdefault(
-                                "timeframe",
-                                timeframe,
-                            )
-
-                            poi_items.append(
-                                item
-                            )
-
-            evidence = (
-                self.adapter.build_evidence(
-                    trade_direction=direction,
-                    h1_structure=h1,
-                    m5_structure=m5,
-                    m1_structure=m1,
-                    liquidity=liquidity,
-                    fvg=fvg_evidence,
-                    poi=poi_items,
-                    displacement=(
-                        displacement_evidence
-                    ),
-                    entry_models=(
-                        entry_evidence
-                    ),
-                    risk_checks=risk_checks,
-                    current_price=current_price,
+                source_items = (
+                    [items]
+                    if isinstance(items, dict)
+                    else items
+                    if isinstance(items, list)
+                    else []
                 )
+
+                for item in source_items:
+                    if isinstance(item, dict):
+                        copied = deepcopy(item)
+                        copied.setdefault(
+                            "timeframe",
+                            timeframe,
+                        )
+                        poi_items.append(copied)
+
+            evidence = self.adapter.build_evidence(
+                trade_direction=direction,
+                h1_structure=h1,
+                m5_structure=m5,
+                m1_structure=m1,
+                liquidity=liquidity,
+                fvg=fvg_evidence,
+                poi=poi_items,
+                displacement=displacement_evidence,
+                entry_models=entry_evidence,
+                risk_checks=risk_checks,
+                current_price=current_price,
             )
 
             return {
@@ -714,9 +466,7 @@ class SMCEngine:
             }
 
         except Exception as exc:
-
             self.adapter_errors += 1
-
             logger.exception(
                 "SMC adapter normalization failed"
             )
@@ -726,9 +476,7 @@ class SMCEngine:
                 "error": str(exc),
             }
 
-    # =========================================================
-    # POI VALIDATION
-    # =========================================================
+    # ------------------- POI / entry checks -------------------
 
     def _validate_poi(
         self,
@@ -737,524 +485,243 @@ class SMCEngine:
         current_price,
         require_tap=True,
     ):
-
-        if isinstance(
-            poi,
-            list,
-        ):
-
-            candidates = poi
-
-            poi = None
-
-            for candidate in candidates:
-
-                candidate = self._dict(
-                    candidate
-                )
-
-                if (
-                    self._direction(
-                        candidate.get(
-                            "direction"
-                        )
-                    )
-                    == direction
-                ):
-
-                    poi = candidate
-                    break
-
-        if not isinstance(
-            poi,
-            dict,
-        ):
-
-            return {
-                "valid": False,
-                "reason": (
-                    "POI_EVIDENCE_MISSING"
-                ),
-            }
-
-        poi = self._dict(
+        candidates = (
             poi
+            if isinstance(poi, list)
+            else [poi]
         )
 
-        poi_direction = (
-            self._direction(
-                poi.get(
-                    "direction"
+        selected = None
+
+        for candidate in candidates:
+            candidate = self._dict(candidate)
+
+            if self._direction(
+                candidate.get(
+                    "direction",
+                    candidate.get("bias"),
                 )
-            )
-        )
+            ) == direction:
+                selected = candidate
+                break
 
-        if poi_direction != direction:
-
+        if selected is None:
             return {
                 "valid": False,
                 "reason": (
-                    "POI_DIRECTION_MISMATCH"
+                    "POI_EVIDENCE_MISSING_OR_DIRECTION_MISMATCH"
                 ),
             }
 
         clean = (
-            poi.get(
-                "clean"
-            ) is True
-            or (
-                poi.get(
-                    "valid_poi"
-                ) is True
-            )
+            selected.get("clean") is True
+            or selected.get("unmitigated") is True
         )
 
         if not clean:
-
             return {
                 "valid": False,
                 "reason": (
-                    "POI_NOT_CLEAN"
+                    "POI_NOT_CLEAN_OR_UNMITIGATED"
                 ),
             }
 
-        unmitigated = (
-            poi.get(
-                "unmitigated"
-            ) is True
-            or (
-                poi.get(
-                    "valid_poi"
-                ) is True
-            )
-        )
-
-        if not unmitigated:
-
+        if selected.get("invalidated") is True:
             return {
                 "valid": False,
-                "reason": (
-                    "POI_ALREADY_MITIGATED"
-                ),
+                "reason": "POI_INVALIDATED",
             }
 
-        if poi.get(
-            "invalidated"
-        ) is True:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "POI_INVALIDATED"
-                ),
-            }
-
-        bounds_valid = (
-            self._price_inside_zone(
-                current_price,
-                poi,
-            )
+        in_zone = self._price_inside_zone(
+            current_price,
+            selected,
         )
 
         tapped = (
-            poi.get(
-                "tapped"
-            ) is True
-            or poi.get(
-                "tap_confirmed"
-            ) is True
-            or (
-                bounds_valid
-            )
+            selected.get("tapped") is True
+            or selected.get("tap_confirmed") is True
+            or in_zone
         )
 
         if require_tap and not tapped:
-
             return {
                 "valid": False,
-                "reason": (
-                    "PRICE_NOT_TAPPED_POI"
-                ),
+                "reason": "PRICE_NOT_TAPPED_POI",
             }
 
-        if not bounds_valid:
-
+        if not in_zone:
             return {
                 "valid": False,
-                "reason": (
-                    "POI_ZONE_INVALID"
-                ),
+                "reason": "PRICE_OUTSIDE_POI_ZONE",
             }
 
         return {
             "valid": True,
             "reason": "VALID_POI_TAP",
-            "poi": deepcopy(
-                poi
-            ),
+            "poi": deepcopy(selected),
         }
-
-    # =========================================================
-    # ENTRY VALIDATION
-    # =========================================================
 
     def _validate_entry(
         self,
         entry_evidence,
         direction,
     ):
-
-        # Adapter-normalized list format.
-
-        if isinstance(
-            entry_evidence,
-            list,
-        ):
-
-            valid_models = []
-
-            for model in (
-                entry_evidence
-            ):
-
-                model = self._dict(
-                    model
-                )
-
-                if (
-                    model.get(
-                        "valid"
-                    ) is True
-                    and model.get(
-                        "invalidated"
-                    ) is not True
-                    and self._direction(
-                        model.get(
-                            "direction"
-                        )
-                    ) == direction
-                ):
-
-                    valid_models.append(
-                        model.get(
-                            "model",
-                            model.get(
-                                "name",
-                                "ENTRY_MODEL",
-                            ),
-                        )
-                    )
-
-            if valid_models:
-
-                return {
-                    "valid": True,
-                    "models": list(
-                        dict.fromkeys(
-                            valid_models
-                        )
-                    ),
-                    "reason": (
-                        "ENTRY_MODEL_CONFIRMED"
-                    ),
-                }
-
-            return {
-                "valid": False,
-                "reason": (
-                    "NO_VALID_DIRECTIONAL_ENTRY_MODEL"
-                ),
-            }
-
-        entry_evidence = self._dict(
+        items = (
             entry_evidence
-        )
-
-        confirmed_models = (
-            entry_evidence.get(
-                "confirmed_models"
-            )
-        )
-
-        models = self._dict(
-            entry_evidence.get(
-                "models"
-            )
+            if isinstance(entry_evidence, list)
+            else None
         )
 
         valid_models = []
 
-        if isinstance(
-            confirmed_models,
-            list,
-        ):
-
-            for name in (
-                confirmed_models
-            ):
-
-                model = self._dict(
-                    models.get(
-                        name
-                    )
-                )
+        if items is not None:
+            for model in items:
+                model = self._dict(model)
 
                 if (
-                    model.get(
-                        "confirmed"
-                    ) is True
+                    model.get("valid") is True
+                    and model.get("retest_confirmed") is True
+                    and model.get("invalidated") is not True
                     and self._direction(
-                        model.get(
-                            "direction"
-                        )
+                        model.get("direction")
                     ) == direction
-                    and model.get(
-                        "invalidated"
-                    ) is not True
                 ):
-
                     valid_models.append(
-                        name
+                        model.get(
+                            "model",
+                            model.get("name", "ENTRY_MODEL"),
+                        )
                     )
 
-        if not valid_models:
+        else:
+            entry = self._dict(entry_evidence)
+            models = self._dict(
+                entry.get("models")
+            )
 
-            for name, model in (
-                models.items()
-            ):
+            confirmed_names = entry.get(
+                "confirmed_models",
+                [],
+            )
 
-                model = self._dict(
-                    model
-                )
+            names = (
+                confirmed_names
+                if isinstance(confirmed_names, list)
+                else []
+            )
+
+            for name, model in models.items():
+                model = self._dict(model)
 
                 if (
-                    model.get(
-                        "confirmed"
-                    ) is True
+                    model.get("confirmed") is True
+                    and model.get("retest_confirmed") is True
+                    and model.get("invalidated") is not True
                     and self._direction(
-                        model.get(
-                            "direction"
-                        )
+                        model.get("direction")
                     ) == direction
-                    and model.get(
-                        "invalidated"
-                    ) is not True
+                    and (not names or name in names)
                 ):
-
-                    valid_models.append(
-                        name
-                    )
-
-        if (
-            entry_evidence.get(
-                "confirmed"
-            ) is True
-            and self._direction(
-                entry_evidence.get(
-                    "direction"
-                )
-            ) == direction
-        ):
-
-            valid_models.append(
-                entry_evidence.get(
-                    "model",
-                    "ENTRY_CONFIRMED",
-                )
-            )
-
-        valid_models = list(
-            dict.fromkeys(
-                valid_models
-            )
-        )
-
-        if not valid_models:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "NO_VALID_DIRECTIONAL_ENTRY_MODEL"
-                ),
-            }
-
-        return {
-            "valid": True,
-            "models": valid_models,
-            "reason": (
-                "ENTRY_MODEL_CONFIRMED"
-            ),
-        }
-
-    # =========================================================
-    # FVG VALIDATION
-    # =========================================================
-
-    def _validate_fvg(
-        self,
-        evidence,
-        direction,
-    ):
-
-        evidence = self._dict(
-            evidence
-        )
-
-        fvg_items = self._list(
-            evidence.get(
-                "fvg"
-            )
-        )
-
-        if not fvg_items:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "FVG_EVIDENCE_MISSING"
-                ),
-            }
-
-        valid_items = []
-
-        for item in (
-            fvg_items
-        ):
-
-            item = self._dict(
-                item
-            )
+                    valid_models.append(name)
 
             if (
-                item.get(
-                    "valid_poi"
-                ) is True
-                and item.get(
-                    "invalidated"
-                ) is not True
+                entry.get("confirmed") is True
+                and entry.get("retest_confirmed") is True
+                and entry.get("invalidated") is not True
                 and self._direction(
-                    item.get(
-                        "direction"
-                    )
+                    entry.get("direction")
                 ) == direction
             ):
-
-                valid_items.append(
-                    deepcopy(
-                        item
+                valid_models.append(
+                    entry.get(
+                        "model",
+                        "ENTRY_CONFIRMED",
                     )
                 )
 
-        if not valid_items:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "NO_VALID_DIRECTIONAL_FVG"
-                ),
-            }
+        valid_models = list(
+            dict.fromkeys(valid_models)
+        )
 
         return {
-            "valid": True,
+            "valid": bool(valid_models),
+            "models": valid_models,
             "reason": (
-                "DIRECTIONAL_FVG_CONFIRMED"
+                "ENTRY_MODEL_AND_RETEST_CONFIRMED"
+                if valid_models
+                else "ENTRY_MODEL_RETEST_NOT_CONFIRMED"
             ),
-            "fvg": valid_items,
         }
 
-    # =========================================================
-    # DISPLACEMENT VALIDATION
-    # =========================================================
+    def _validate_fvg(self, evidence, direction):
+        items = self._list(
+            self._dict(evidence).get("fvg")
+        )
+
+        valid = [
+            deepcopy(item)
+            for item in items
+            if isinstance(item, dict)
+            and item.get("valid_poi") is True
+            and item.get("invalidated") is not True
+            and self._direction(
+                item.get("direction")
+            ) == direction
+        ]
+
+        return {
+            "valid": bool(valid),
+            "reason": (
+                "DIRECTIONAL_FVG_CONFIRMED"
+                if valid
+                else "VALID_DIRECTIONAL_FVG_MISSING"
+            ),
+            "fvg": valid,
+        }
 
     def _validate_displacement(
         self,
         evidence,
         direction,
     ):
-
-        evidence = self._dict(
-            evidence
-        )
-
         items = self._list(
-            evidence.get(
-                "displacement"
-            )
+            self._dict(evidence).get("displacement")
         )
 
-        if not items:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "DISPLACEMENT_EVIDENCE_MISSING"
-                ),
-            }
-
-        valid_items = []
-
-        for item in (
-            items
-        ):
-
-            item = self._dict(
-                item
-            )
-
-            if (
-                item.get(
-                    "valid"
-                ) is True
-                and self._direction(
-                    item.get(
-                        "direction"
-                    )
-                ) == direction
-            ):
-
-                valid_items.append(
-                    deepcopy(
-                        item
-                    )
-                )
-
-        if not valid_items:
-
-            return {
-                "valid": False,
-                "reason": (
-                    "DIRECTIONAL_DISPLACEMENT_NOT_CONFIRMED"
-                ),
-            }
+        valid = [
+            deepcopy(item)
+            for item in items
+            if isinstance(item, dict)
+            and item.get("valid") is True
+            and item.get("invalidated") is not True
+            and self._direction(
+                item.get("direction")
+            ) == direction
+        ]
 
         return {
-            "valid": True,
+            "valid": bool(valid),
             "reason": (
                 "DIRECTIONAL_DISPLACEMENT_CONFIRMED"
+                if valid
+                else "DIRECTIONAL_DISPLACEMENT_MISSING"
             ),
-            "displacement": valid_items,
+            "displacement": valid,
         }
-
-    # =========================================================
-    # CONFIRMATION EVIDENCE
-    # =========================================================
 
     def _validate_confirmation(
         self,
         adapter_evidence,
         direction,
     ):
-
         fvg = self._validate_fvg(
             adapter_evidence,
             direction,
         )
 
-        displacement = (
-            self._validate_displacement(
-                adapter_evidence,
-                direction,
-            )
+        displacement = self._validate_displacement(
+            adapter_evidence,
+            direction,
         )
 
         return {
@@ -1266,55 +733,34 @@ class SMCEngine:
             "displacement": displacement,
         }
 
-    # =========================================================
-    # RISK VALIDATION
-    # =========================================================
+    def _validate_risk(self, risk_checks):
+        risk_checks = self._dict(risk_checks)
 
-    @staticmethod
-    def _validate_risk(
-        risk_checks,
-    ):
-
-        risk_checks = (
-            SMCEngine._dict(
-                risk_checks
-            )
-        )
-
-        missing = [
+        failed = [
             name
-            for name in (
-                SMCEngine.REQUIRED_RISK_CHECKS
-            )
-            if risk_checks.get(
-                name
-            ) is not True
+            for name in self.REQUIRED_RISK_CHECKS
+            if risk_checks.get(name) is not True
         ]
 
         return {
-            "valid": (
-                not missing
-            ),
-            "missing_or_failed": missing,
+            "valid": not failed,
+            "missing_or_failed": failed,
             "reason": (
                 "RISK_VALIDATION_PASSED"
-                if not missing
+                if not failed
                 else "RISK_CHECKS_FAILED"
             ),
         }
 
-    # =========================================================
-    # PATHWAY REJECTION
-    # =========================================================
+    # ---------------- Pathway helpers ----------------
 
     @staticmethod
-    def _pathway_reject(
+    def _reject(
         name,
         direction,
         reason,
         evidence=None,
     ):
-
         return {
             "pathway": name,
             "direction": direction,
@@ -1323,834 +769,523 @@ class SMCEngine:
             "execution_authorized": False,
             "status": "REJECTED",
             "reason": reason,
-            "evidence": (
-                evidence or {}
-            ),
+            "evidence": evidence or {},
         }
-
-    # =========================================================
-    # PATHWAY 1: H1 ALIGNED CONTINUATION
-    # =========================================================
 
     def _pathway_continuation(
         self,
         market_data,
-        current_price,
+        price,
         direction,
-        poi_evidence,
-        entry_evidence,
-        confirmation_evidence,
+        poi,
+        entry,
+        confirmation,
     ):
+        h1 = self._tf(market_data, "H1")
+        m5 = self._tf(market_data, "M5")
 
-        h1 = self._tf(
-            market_data,
-            "H1",
-        )
-
-        m5 = self._tf(
-            market_data,
-            "M5",
-        )
-
-        h1_direction = (
-            self.determine_h1_direction(
-                h1
-            )
-        )
-
-        if h1_direction != direction:
-
-            return self._pathway_reject(
+        if self.determine_h1_direction(h1) != direction:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 "H1_DIRECTION_NOT_ALIGNED",
             )
 
-        h1_poi = self._dict(
-            self._dict(
-                poi_evidence
-            ).get(
-                "H1"
-            )
+        h1poi = self._validate_poi(
+            self._dict(poi).get("H1"),
+            direction,
+            price,
         )
 
-        h1_validation = (
-            self._validate_poi(
-                h1_poi,
-                direction,
-                current_price,
-                True,
-            )
-        )
-
-        if not h1_validation["valid"]:
-
-            return self._pathway_reject(
+        if not h1poi["valid"]:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
-                h1_validation["reason"],
+                h1poi["reason"],
             )
 
-        m5_break = (
-            self.validate_m5_external_choch(
-                m5,
-                direction,
-            )
+        br = self.validate_m5_external_choch(
+            m5,
+            direction,
         )
 
-        if not m5_break["valid"]:
-
-            return self._pathway_reject(
+        if not br["valid"]:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
-                m5_break["reason"],
+                br["reason"],
             )
 
-        m5_poi = self._dict(
-            self._dict(
-                poi_evidence
-            ).get(
-                "M5"
-            )
+        m5poi = self._validate_poi(
+            self._dict(poi).get("M5"),
+            direction,
+            price,
         )
 
-        m5_validation = (
-            self._validate_poi(
-                m5_poi,
-                direction,
-                current_price,
-                True,
-            )
-        )
-
-        if not m5_validation["valid"]:
-
-            return self._pathway_reject(
+        if not m5poi["valid"]:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
-                "M5_POI_TAP_REQUIRED",
-                {
-                    "m5_poi": m5_validation,
-                },
+                m5poi["reason"],
             )
 
-        confirmation = (
-            self._validate_confirmation(
-                confirmation_evidence,
-                direction,
-            )
+        conf = self._validate_confirmation(
+            confirmation,
+            direction,
         )
 
-        if not confirmation["valid"]:
-
-            return self._pathway_reject(
+        if not conf["valid"]:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
-                "M5_CONFIRMATION_EVIDENCE_FAILED",
-                confirmation,
+                "CONFIRMATION_EVIDENCE_FAILED",
+                conf,
             )
 
-        entry = (
-            self._validate_entry(
-                entry_evidence,
-                direction,
-            )
+        ent = self._validate_entry(
+            entry,
+            direction,
         )
 
-        if not entry["valid"]:
-
-            return self._pathway_reject(
+        if not ent["valid"]:
+            return self._reject(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
-                entry["reason"],
+                ent["reason"],
             )
 
         return {
-            "pathway": (
-                "H1_ALIGNED_CONTINUATION"
-            ),
+            "pathway": "H1_ALIGNED_CONTINUATION",
             "direction": direction,
             "qualified": True,
-            "status": (
-                "QUALIFIED_PENDING_SCORE"
-            ),
-            "reason": (
-                "CONTINUATION_EVIDENCE_CONFIRMED"
-            ),
+            "status": "QUALIFIED_PENDING_SCORE",
+            "reason": "CONTINUATION_EVIDENCE_CONFIRMED",
             "evidence": {
-                "h1_direction": h1_direction,
-                "h1_poi": h1_validation,
-                "m5_external_break": m5_break,
-                "m5_poi": m5_validation,
-                "confirmation": confirmation,
-                "entry": entry,
+                "h1_direction": direction,
+                "h1_poi": h1poi,
+                "m5_external_choch": br,
+                "m5_poi": m5poi,
+                "confirmation": conf,
+                "entry": ent,
             },
         }
-
-    # =========================================================
-    # PATHWAY 2: H1 COUNTERTREND REVERSAL
-    # =========================================================
 
     def _pathway_h1_countertrend(
         self,
         market_data,
-        current_price,
+        price,
         direction,
-        poi_evidence,
-        entry_evidence,
-        confirmation_evidence,
+        poi,
+        entry,
+        confirmation,
     ):
+        h1 = self._tf(market_data, "H1")
+        m5 = self._tf(market_data, "M5")
 
-        h1 = self._tf(
-            market_data,
-            "H1",
-        )
+        h1dir = self.determine_h1_direction(h1)
 
-        m5 = self._tf(
-            market_data,
-            "M5",
-        )
-
-        h1_direction = (
-            self.determine_h1_direction(
-                h1
-            )
-        )
-
-        if h1_direction not in self.DIRECTIONS:
-
-            return self._pathway_reject(
+        if h1dir not in self.DIRECTIONS:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "H1_DIRECTION_UNAVAILABLE",
             )
 
-        if h1_direction == direction:
-
-            return self._pathway_reject(
+        if h1dir == direction:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "NOT_COUNTERTREND",
             )
 
-        m5_break = (
-            self.validate_m5_external_choch(
-                m5,
-                direction,
-            )
+        br = self.validate_m5_external_choch(
+            m5,
+            direction,
         )
 
-        if not m5_break["valid"]:
-
-            return self._pathway_reject(
+        if not br["valid"]:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "M5_EXTERNAL_REVERSAL_NOT_CONFIRMED",
             )
 
-        m5_poi = self._dict(
-            self._dict(
-                poi_evidence
-            ).get(
-                "M5"
-            )
+        p = self._validate_poi(
+            self._dict(poi).get("M5"),
+            direction,
+            price,
         )
 
-        poi_validation = (
-            self._validate_poi(
-                m5_poi,
-                direction,
-                current_price,
-                True,
-            )
-        )
-
-        if not poi_validation["valid"]:
-
-            return self._pathway_reject(
+        if not p["valid"]:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
-                poi_validation["reason"],
+                p["reason"],
             )
 
-        confirmation = (
-            self._validate_confirmation(
-                confirmation_evidence,
-                direction,
-            )
+        conf = self._validate_confirmation(
+            confirmation,
+            direction,
         )
 
-        if not confirmation["valid"]:
-
-            return self._pathway_reject(
+        if not conf["valid"]:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
-                "M5_CONFIRMATION_EVIDENCE_FAILED",
-                confirmation,
+                "CONFIRMATION_EVIDENCE_FAILED",
+                conf,
             )
 
-        entry = (
-            self._validate_entry(
-                entry_evidence,
-                direction,
-            )
+        ent = self._validate_entry(
+            entry,
+            direction,
         )
 
-        if not entry["valid"]:
-
-            return self._pathway_reject(
+        if not ent["valid"]:
+            return self._reject(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
-                entry["reason"],
+                ent["reason"],
             )
 
         return {
-            "pathway": (
-                "H1_COUNTERTREND_REVERSAL"
-            ),
+            "pathway": "H1_COUNTERTREND_REVERSAL",
             "direction": direction,
             "qualified": True,
-            "status": (
-                "QUALIFIED_PENDING_SCORE"
-            ),
-            "reason": (
-                "COUNTERTREND_REVERSAL_CONFIRMED"
-            ),
+            "status": "QUALIFIED_PENDING_SCORE",
+            "reason": "COUNTERTREND_REVERSAL_CONFIRMED",
             "evidence": {
-                "h1_direction": h1_direction,
-                "m5_external_break": m5_break,
-                "m5_poi": poi_validation,
-                "confirmation": confirmation,
-                "entry": entry,
+                "h1_direction": h1dir,
+                "m5_external_choch": br,
+                "m5_poi": p,
+                "confirmation": conf,
+                "entry": ent,
             },
         }
-
-    # =========================================================
-    # PATHWAY 3: M5 INTERNAL COUNTERTREND
-    # =========================================================
 
     def _pathway_internal(
         self,
         market_data,
-        current_price,
+        price,
         direction,
-        poi_evidence,
-        entry_evidence,
-        confirmation_evidence,
+        poi,
+        entry,
+        confirmation,
     ):
-
-        m5 = self._tf(
-            market_data,
-            "M5",
-        )
+        m5 = self._tf(market_data, "M5")
 
         external = self._dict(
-            m5.get(
-                "external_structure"
-            )
+            m5.get("external_structure")
         )
 
         internal = self._dict(
-            m5.get(
-                "internal_structure"
+            m5.get("internal_structure")
+        )
+
+        extdir = self._direction(
+            external.get(
+                "direction",
+                external.get("bias"),
             )
         )
 
-        external_direction = (
-            self._direction(
-                external.get(
-                    "direction"
-                )
-                or external.get(
-                    "bias"
-                )
+        intdir = self._direction(
+            internal.get(
+                "direction",
+                internal.get("bias"),
             )
         )
 
-        internal_direction = (
-            self._direction(
-                internal.get(
-                    "direction"
-                )
-                or internal.get(
-                    "bias"
-                )
-            )
-        )
-
-        if external_direction not in self.DIRECTIONS:
-
-            return self._pathway_reject(
+        if extdir not in self.DIRECTIONS:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "M5_EXTERNAL_STRUCTURE_UNAVAILABLE",
             )
 
-        if internal_direction != direction:
-
-            return self._pathway_reject(
+        if intdir != direction:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "INTERNAL_DIRECTION_NOT_CONFIRMED",
             )
 
-        if external_direction == direction:
-
-            return self._pathway_reject(
+        if extdir == direction:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "NOT_COUNTERTREND_TO_EXTERNAL",
             )
 
-        internal_break = (
-            self._find_break(
-                internal,
-                direction,
-            )
+        br = self._find_break(
+            internal,
+            direction,
         )
 
-        if internal_break is None:
-
-            return self._pathway_reject(
+        if br is None:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "INTERNAL_BODY_CLOSE_BREAK_MISSING",
             )
 
-        internal_poi = self._dict(
-            self._dict(
-                poi_evidence
-            ).get(
-                "M5_INTERNAL"
-            )
+        p = self._validate_poi(
+            self._dict(poi).get("M5_INTERNAL"),
+            direction,
+            price,
         )
 
-        poi_validation = (
-            self._validate_poi(
-                internal_poi,
-                direction,
-                current_price,
-                True,
-            )
-        )
-
-        if not poi_validation["valid"]:
-
-            return self._pathway_reject(
+        if not p["valid"]:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
-                poi_validation["reason"],
+                p["reason"],
             )
 
-        confirmation = (
-            self._validate_confirmation(
-                confirmation_evidence,
-                direction,
-            )
+        conf = self._validate_confirmation(
+            confirmation,
+            direction,
         )
 
-        if not confirmation["valid"]:
-
-            return self._pathway_reject(
+        if not conf["valid"]:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
-                "M5_CONFIRMATION_EVIDENCE_FAILED",
-                confirmation,
+                "CONFIRMATION_EVIDENCE_FAILED",
+                conf,
             )
 
-        entry = (
-            self._validate_entry(
-                entry_evidence,
-                direction,
-            )
+        ent = self._validate_entry(
+            entry,
+            direction,
         )
 
-        if not entry["valid"]:
-
-            return self._pathway_reject(
+        if not ent["valid"]:
+            return self._reject(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
-                entry["reason"],
+                ent["reason"],
             )
 
         return {
-            "pathway": (
-                "M5_INTERNAL_COUNTERTREND"
-            ),
+            "pathway": "M5_INTERNAL_COUNTERTREND",
             "direction": direction,
             "qualified": True,
-            "status": (
-                "QUALIFIED_PENDING_SCORE"
-            ),
-            "reason": (
-                "INTERNAL_COUNTERTREND_CONFIRMED"
-            ),
+            "status": "QUALIFIED_PENDING_SCORE",
+            "reason": "INTERNAL_COUNTERTREND_CONFIRMED",
             "evidence": {
-                "external_direction": external_direction,
-                "internal_direction": internal_direction,
-                "internal_break": internal_break,
-                "internal_poi": poi_validation,
-                "confirmation": confirmation,
-                "entry": entry,
+                "external_direction": extdir,
+                "internal_direction": intdir,
+                "internal_break": br,
+                "internal_poi": p,
+                "confirmation": conf,
+                "entry": ent,
             },
         }
-
-    # =========================================================
-    # PATHWAY 4: RANGING MARKET
-    # =========================================================
 
     def _pathway_range(
         self,
         market_data,
-        current_price,
+        price,
         direction,
-        poi_evidence,
-        entry_evidence,
-        confirmation_evidence,
+        poi,
+        entry,
+        confirmation,
     ):
+        h1 = self._tf(market_data, "H1")
 
-        h1 = self._tf(
-            market_data,
-            "H1",
+        range_data = (
+            self._dict(h1.get("range"))
+            or self._dict(h1.get("premium_discount"))
         )
 
-        h1_direction = (
-            self.determine_h1_direction(
-                h1
-            )
-        )
-
-        range_data = self._dict(
-            h1.get(
-                "range"
-            )
-        )
-
-        if not range_data:
-
-            range_data = self._dict(
-                h1.get(
-                    "premium_discount"
-                )
-            )
-
-        range_high = self._number(
+        high = self._number(
             range_data.get(
                 "range_high",
-                range_data.get(
-                    "high"
-                ),
+                range_data.get("high"),
             )
         )
 
-        range_low = self._number(
+        low = self._number(
             range_data.get(
                 "range_low",
-                range_data.get(
-                    "low"
-                ),
+                range_data.get("low"),
             )
         )
+
+        if high is None or low is None or high <= low:
+            return self._reject(
+                "RANGING_MARKET",
+                direction,
+                "RANGE_BOUNDARIES_MISSING_OR_INVALID",
+            )
+
+        if price is None or not low <= price <= high:
+            return self._reject(
+                "RANGING_MARKET",
+                direction,
+                "PRICE_OUTSIDE_RANGE_OR_MISSING",
+            )
+
+        eq = (high + low) / 2
 
         if (
-            range_high is None
-            or range_low is None
+            direction == "BULLISH"
+            and price >= eq
+        ) or (
+            direction == "BEARISH"
+            and price <= eq
         ):
-
-            return self._pathway_reject(
+            return self._reject(
                 "RANGING_MARKET",
                 direction,
-                "RANGE_BOUNDARIES_MISSING",
+                "WRONG_RANGE_HALF",
             )
 
-        if range_high <= range_low:
-
-            return self._pathway_reject(
-                "RANGING_MARKET",
-                direction,
-                "INVALID_RANGE_BOUNDARIES",
-            )
-
-        if current_price is None:
-
-            return self._pathway_reject(
-                "RANGING_MARKET",
-                direction,
-                "CURRENT_PRICE_MISSING",
-            )
-
-        if not (
-            range_low
-            <= current_price
-            <= range_high
-        ):
-
-            return self._pathway_reject(
-                "RANGING_MARKET",
-                direction,
-                "PRICE_OUTSIDE_RANGE",
-            )
-
-        equilibrium = (
-            range_high
-            + range_low
-        ) / 2
-
-        if direction == "BULLISH":
-
-            if current_price >= equilibrium:
-
-                return self._pathway_reject(
-                    "RANGING_MARKET",
-                    direction,
-                    "BULLISH_SETUP_NOT_IN_DISCOUNT",
-                )
-
-        else:
-
-            if current_price <= equilibrium:
-
-                return self._pathway_reject(
-                    "RANGING_MARKET",
-                    direction,
-                    "BEARISH_SETUP_NOT_IN_PREMIUM",
-                )
-
-        range_poi = self._dict(
-            self._dict(
-                poi_evidence
-            ).get(
-                "RANGE"
-            )
+        p = self._validate_poi(
+            self._dict(poi).get("RANGE"),
+            direction,
+            price,
         )
 
-        poi_validation = (
-            self._validate_poi(
-                range_poi,
-                direction,
-                current_price,
-                True,
-            )
-        )
-
-        if not poi_validation["valid"]:
-
-            return self._pathway_reject(
+        if not p["valid"]:
+            return self._reject(
                 "RANGING_MARKET",
                 direction,
-                poi_validation["reason"],
+                p["reason"],
             )
 
-        confirmation = (
-            self._validate_confirmation(
-                confirmation_evidence,
-                direction,
-            )
+        conf = self._validate_confirmation(
+            confirmation,
+            direction,
         )
 
-        if not confirmation["valid"]:
-
-            return self._pathway_reject(
+        if not conf["valid"]:
+            return self._reject(
                 "RANGING_MARKET",
                 direction,
-                "RANGE_CONFIRMATION_EVIDENCE_FAILED",
-                confirmation,
+                "RANGE_CONFIRMATION_FAILED",
+                conf,
             )
 
-        entry = (
-            self._validate_entry(
-                entry_evidence,
-                direction,
-            )
+        ent = self._validate_entry(
+            entry,
+            direction,
         )
 
-        if not entry["valid"]:
-
-            return self._pathway_reject(
+        if not ent["valid"]:
+            return self._reject(
                 "RANGING_MARKET",
                 direction,
-                entry["reason"],
+                ent["reason"],
             )
 
         return {
-            "pathway": (
-                "RANGING_MARKET"
-            ),
+            "pathway": "RANGING_MARKET",
             "direction": direction,
             "qualified": True,
-            "status": (
-                "QUALIFIED_PENDING_SCORE"
-            ),
-            "reason": (
-                "RANGE_SETUP_CONFIRMED"
-            ),
+            "status": "QUALIFIED_PENDING_SCORE",
+            "reason": "RANGE_SETUP_CONFIRMED",
             "evidence": {
-                "range_high": range_high,
-                "range_low": range_low,
-                "equilibrium": equilibrium,
-                "h1_direction": h1_direction,
-                "poi": poi_validation,
-                "confirmation": confirmation,
-                "entry": entry,
+                "range_high": high,
+                "range_low": low,
+                "equilibrium": eq,
+                "poi": p,
+                "confirmation": conf,
+                "entry": ent,
             },
         }
 
-    # =========================================================
-    # PATHWAY SCORING
-    # =========================================================
+    # -------------------- Scoring and authorization --------------------
 
-    def _pathway_scores(
-        self,
-        category_scores,
-        pathway_name,
-    ):
-
-        scores = self._dict(
-            category_scores
+    def _pathway_scores(self, scores, name):
+        scores = self._dict(scores)
+        return (
+            self._dict(scores.get(name))
+            if name in scores
+            else scores
         )
-
-        if pathway_name in scores:
-
-            return self._dict(
-                scores.get(
-                    pathway_name
-                )
-            )
-
-        return scores
-
-    # =========================================================
-    # COMPLETE PATHWAY EVALUATION
-    # =========================================================
 
     def _evaluate_pathway(
         self,
-        pathway_result,
+        result,
         category_scores,
         risk_checks,
         fundamentals,
+        adapter_ready,
     ):
+        if not result.get("qualified"):
+            return result
 
-        if not pathway_result.get(
-            "qualified"
-        ):
+        name = result["pathway"]
 
-            return pathway_result
-
-        name = pathway_result.get(
-            "pathway"
-        )
-
-        scores = (
-            self._pathway_scores(
-                category_scores,
-                name,
-            )
+        scores = self._pathway_scores(
+            category_scores,
+            name,
         )
 
         if (
             "fundamentals" not in scores
-            and fundamentals.get(
-                "score"
-            ) is not None
+            and fundamentals.get("score") is not None
         ):
+            scores = dict(scores)
+            scores["fundamentals"] = fundamentals.get("score")
 
-            scores = dict(
-                scores
-            )
+        scoring = self.calculate_a_plus_score(scores)
+        risk = self._validate_risk(risk_checks)
 
-            scores["fundamentals"] = (
-                fundamentals.get(
-                    "score"
-                )
-            )
-
-        scoring = (
-            self.calculate_a_plus_score(
-                scores
-            )
-        )
-
-        risk = (
-            self._validate_risk(
-                risk_checks
-            )
-        )
-
-        result = deepcopy(
-            pathway_result
-        )
-
+        result = deepcopy(result)
         result["scoring"] = scoring
         result["risk"] = risk
-
+        result["a_plus"] = False
         result["execution_authorized"] = False
 
         if not scoring["complete"]:
-
-            result["status"] = (
-                "INCOMPLETE_SCORE"
+            result.update(
+                status="INCOMPLETE_SCORE",
+                reason="CATEGORY_SCORES_INCOMPLETE",
             )
-
-            result["a_plus"] = False
-
-            result["reason"] = (
-                "CATEGORY_SCORES_INCOMPLETE"
-            )
-
             return result
 
-        if (
-            scoring["score"]
-            < self.A_PLUS_THRESHOLD
-        ):
-
-            result["status"] = (
-                "BELOW_A_PLUS_THRESHOLD"
+        if scoring["score"] < self.A_PLUS_THRESHOLD:
+            result.update(
+                status="BELOW_A_PLUS_THRESHOLD",
+                reason="SCORE_BELOW_85",
             )
-
-            result["a_plus"] = False
-
-            result["reason"] = (
-                "SCORE_BELOW_85"
-            )
-
             return result
-
-        if not risk["valid"]:
-
-            result["status"] = (
-                "RISK_REJECTED"
-            )
-
-            result["a_plus"] = True
-
-            result["reason"] = (
-                "RISK_VALIDATION_FAILED"
-            )
-
-            return result
-
-        result["status"] = (
-            "A_PLUS_SETUP"
-        )
 
         result["a_plus"] = True
 
-        result["reason"] = (
-            "A_PLUS_SETUP_QUALIFIED"
+        if not risk["valid"]:
+            result.update(
+                status="RISK_REJECTED",
+                reason="RISK_VALIDATION_FAILED",
+            )
+            return result
+
+        if not adapter_ready:
+            result.update(
+                status="ADAPTER_NOT_EXECUTION_READY",
+                reason="ADAPTER_EVIDENCE_GATE_FAILED",
+            )
+            return result
+
+        if not self.EXECUTION_ENABLED:
+            result.update(
+                status="EXECUTION_DISABLED",
+                reason="ENGINE_EXECUTION_SWITCH_DISABLED",
+            )
+            return result
+
+        result.update(
+            status="A_PLUS_SETUP",
+            reason="A_PLUS_SETUP_AUTHORIZED",
+            execution_authorized=True,
         )
-
-        # Authorization deliberately remains
-        # downstream.
-
-        result["execution_authorized"] = False
 
         return result
 
-    # =========================================================
-    # MASTER ANALYSIS
-    # =========================================================
+    # -------------------- Master analysis --------------------
 
     def analyse(
         self,
@@ -2164,388 +1299,263 @@ class SMCEngine:
         category_scores=None,
         fundamentals=None,
     ):
+        market_data = self._dict(market_data)
+        price = self._number(current_price)
+        poi_evidence = self._dict(poi_evidence)
+        risk_checks = self._dict(risk_checks)
+        category_scores = self._dict(category_scores)
+        fundamentals = self._dict(fundamentals)
 
-        market_data = self._dict(
-            market_data
+        h1_direction = self.determine_h1_direction(
+            self._tf(market_data, "H1")
         )
-
-        current_price = self._number(
-            current_price
-        )
-
-        entry_evidence = (
-            entry_evidence
-        )
-
-        poi_evidence = self._dict(
-            poi_evidence
-        )
-
-        displacement_evidence = (
-            displacement_evidence
-        )
-
-        fvg_evidence = (
-            fvg_evidence
-        )
-
-        risk_checks = self._dict(
-            risk_checks
-        )
-
-        category_scores = (
-            self._dict(
-                category_scores
-            )
-        )
-
-        fundamentals = (
-            self._dict(
-                fundamentals
-            )
-        )
-
-        h1 = self._tf(
-            market_data,
-            "H1",
-        )
-
-        h1_direction = (
-            self.determine_h1_direction(
-                h1
-            )
-        )
-
-        # -----------------------------------------------------
-        # CONNECT ADAPTER
-        # -----------------------------------------------------
 
         adapter_results = {}
 
-        for direction in (
-            self.DIRECTIONS
-        ):
-
-            adapter_results[
-                direction
-            ] = (
+        for direction in self.DIRECTIONS:
+            adapter_results[direction] = (
                 self._build_adapter_evidence(
-                    direction=direction,
-                    market_data=market_data,
-                    current_price=current_price,
-                    entry_evidence=entry_evidence,
-                    poi_evidence=poi_evidence,
-                    displacement_evidence=(
-                        displacement_evidence
-                    ),
-                    fvg_evidence=fvg_evidence,
-                    risk_checks=risk_checks,
+                    direction,
+                    market_data,
+                    price,
+                    entry_evidence,
+                    poi_evidence,
+                    displacement_evidence,
+                    fvg_evidence,
+                    risk_checks,
                 )
             )
 
         pathways = {}
 
-        # -----------------------------------------------------
-        # EVALUATE ALL FOUR PATHWAYS
-        # INDEPENDENTLY FOR BOTH DIRECTIONS
-        # -----------------------------------------------------
-
-        for direction in (
-            self.DIRECTIONS
-        ):
-
-            adapter_result = (
-                adapter_results.get(
-                    direction,
-                    {},
-                )
-            )
-
-            normalized = (
-                self._dict(
-                    adapter_result.get(
-                        "evidence"
-                    )
-                )
+        for direction in self.DIRECTIONS:
+            ar = adapter_results[direction]
+            normalized = self._dict(
+                ar.get("evidence")
             )
 
             adapter_available = (
-                adapter_result.get(
-                    "available"
-                ) is True
+                ar.get("available") is True
             )
 
-            # No fabricated evidence.
-            # If adapter fails, pathway confirmation
-            # evidence remains unavailable and pathways
-            # fail closed.
+            adapter_ready = (
+                adapter_available
+                and normalized.get("execution_ready") is True
+            )
 
-            continuation = (
+            confirmation_input = (
+                normalized
+                if adapter_available
+                else {}
+            )
+
+            pathway_results = (
                 self._pathway_continuation(
                     market_data,
-                    current_price,
+                    price,
                     direction,
                     poi_evidence,
                     entry_evidence,
-                    normalized,
-                )
-            )
-
-            countertrend = (
+                    confirmation_input,
+                ),
                 self._pathway_h1_countertrend(
                     market_data,
-                    current_price,
+                    price,
                     direction,
                     poi_evidence,
                     entry_evidence,
-                    normalized,
-                )
-            )
-
-            internal = (
+                    confirmation_input,
+                ),
                 self._pathway_internal(
                     market_data,
-                    current_price,
+                    price,
                     direction,
                     poi_evidence,
                     entry_evidence,
-                    normalized,
-                )
-            )
-
-            ranging = (
+                    confirmation_input,
+                ),
                 self._pathway_range(
                     market_data,
-                    current_price,
+                    price,
                     direction,
                     poi_evidence,
                     entry_evidence,
-                    normalized,
-                )
+                    confirmation_input,
+                ),
             )
 
-            for pathway in (
-                continuation,
-                countertrend,
-                internal,
-                ranging,
-            ):
-
-                pathway = (
-                    self._evaluate_pathway(
-                        pathway,
-                        category_scores,
-                        risk_checks,
-                        fundamentals,
-                    )
+            for item in pathway_results:
+                item = self._evaluate_pathway(
+                    item,
+                    category_scores,
+                    risk_checks,
+                    fundamentals,
+                    adapter_ready,
                 )
 
-                pathway_key = (
-                    pathway["pathway"]
+                key = (
+                    item["pathway"]
                     + "_"
                     + direction
                 )
 
-                pathways[
-                    pathway_key
-                ] = pathway
+                pathways[key] = item
 
-        # -----------------------------------------------------
-        # QUALIFIED SETUPS
-        # -----------------------------------------------------
+        authorized = [
+            item
+            for item in pathways.values()
+            if item.get("execution_authorized") is True
+        ]
 
         qualified = [
-            result
-            for result in pathways.values()
+            item
+            for item in pathways.values()
             if (
-                result.get(
-                    "status"
-                ) == "A_PLUS_SETUP"
-                and result.get(
-                    "a_plus"
-                ) is True
+                item.get("a_plus") is True
+                and item.get("qualified") is True
             )
         ]
 
-        # Keep every qualified setup.
-        # Do not discard simultaneous pathways.
-
-        best = None
-
-        if qualified:
-
-            best = max(
-                qualified,
-                key=lambda item: (
-                    item.get(
-                        "scoring",
-                        {},
-                    ).get(
-                        "score",
-                        0,
-                    )
-                ),
+        best = (
+            max(
+                authorized,
+                key=lambda x: x.get(
+                    "scoring", {}
+                ).get("score", 0),
             )
+            if authorized
+            else None
+        )
+
+        best_candidate = (
+            max(
+                qualified,
+                key=lambda x: x.get(
+                    "scoring", {}
+                ).get("score", 0),
+            )
+            if qualified
+            else None
+        )
 
         if best:
+            status = "EXECUTION_AUTHORIZED"
 
-            overall_status = (
-                "A_PLUS_SETUP"
+        elif best_candidate:
+            status = best_candidate.get(
+                "status",
+                "NOT_AUTHORIZED",
             )
 
         elif any(
-            item.get(
-                "status"
-            ) == "INCOMPLETE_SCORE"
-            for item in pathways.values()
+            x.get("status") == "INCOMPLETE_SCORE"
+            for x in pathways.values()
         ):
-
-            overall_status = (
-                "INCOMPLETE_EVIDENCE"
-            )
+            status = "INCOMPLETE_EVIDENCE"
 
         else:
+            status = "NO_CONFIRMED_SETUP"
 
-            overall_status = (
-                "NO_CONFIRMED_SETUP"
-            )
+        # Execution payload is a decision handoff,
+        # not a broker order submission.
 
-        # -----------------------------------------------------
-        # RESULT
-        # -----------------------------------------------------
+        execution_payload = None
+
+        if best:
+            execution_payload = {
+                "authorized": True,
+                "symbol": market_data.get("symbol"),
+                "direction": best.get("direction"),
+                "pathway": best.get("pathway"),
+                "score": best.get(
+                    "scoring", {}
+                ).get("score"),
+                "current_price": price,
+                "risk_checks": deepcopy(risk_checks),
+                "trade_plan": deepcopy(
+                    risk_checks.get(
+                        "trade_plan",
+                        risk_checks.get("execution_plan"),
+                    )
+                ),
+                "evidence": deepcopy(
+                    best.get("evidence")
+                ),
+            }
 
         result = {
             "success": True,
-
             "version": self.VERSION,
-
-            "status": overall_status,
-
-            "symbol": (
-                market_data.get(
-                    "symbol"
-                )
-            ),
-
-            "current_price": (
-                current_price
-            ),
-
-            "h1_direction": (
-                h1_direction
-            ),
+            "execution_enabled": self.EXECUTION_ENABLED,
+            "status": status,
+            "symbol": market_data.get("symbol"),
+            "current_price": price,
+            "h1_direction": h1_direction,
 
             "adapter": {
-                "available": (
-                    self.adapter
-                    is not None
+                "available": self.adapter is not None,
+                "connected": all(
+                    x.get("available") is True
+                    for x in adapter_results.values()
                 ),
-
-                "connected": (
-                    all(
-                        item.get(
-                            "available"
-                        ) is True
-                        for item in (
-                            adapter_results.values()
-                        )
-                    )
-                ),
-
-                "errors": (
-                    self.adapter_errors
-                ),
-
-                "evidence": (
-                    adapter_results
-                ),
+                "errors": self.adapter_errors,
+                "evidence": adapter_results,
             },
 
-            "pathways": (
-                pathways
-            ),
-
-            "qualified_pathways": (
-                qualified
-            ),
-
-            "qualified_pathway_count": (
-                len(qualified)
-            ),
-
-            "best_setup": (
-                deepcopy(best)
-            ),
+            "pathways": pathways,
+            "qualified_pathways": qualified,
+            "authorized_pathways": authorized,
+            "qualified_pathway_count": len(qualified),
+            "authorized_pathway_count": len(authorized),
+            "best_setup": deepcopy(best),
+            "best_candidate": deepcopy(best_candidate),
 
             "direction": (
-                best.get(
-                    "direction"
-                )
+                best.get("direction")
                 if best
                 else None
             ),
 
             "pathway": (
-                best.get(
-                    "pathway"
-                )
+                best.get("pathway")
                 if best
                 else None
             ),
 
             "a_plus": (
-                best.get(
-                    "a_plus",
-                    False,
-                )
+                best.get("a_plus", False)
                 if best
                 else False
             ),
 
             "score": (
                 best.get(
-                    "scoring",
-                    {},
-                ).get(
-                    "score"
-                )
+                    "scoring", {}
+                ).get("score")
                 if best
                 else None
             ),
 
-            "execution_authorized": False,
-
-            "evidence_only": True,
-
-            "trade_authorization_pending": (
-                bool(best)
+            "execution_authorized": bool(best),
+            "execution_payload": execution_payload,
+            "evidence_only": False,
+            "trade_authorization_pending": bool(
+                best_candidate and not best
             ),
 
             "reason": (
-                "A_PLUS_SETUP_QUALIFIED"
+                "A_PLUS_SETUP_AUTHORIZED"
                 if best
-                else overall_status
+                else status
             ),
         }
 
-        self.last_analysis = (
-            deepcopy(
-                result
-            )
-        )
-
+        self.last_analysis = deepcopy(result)
         return result
 
-    # =========================================================
-    # REJECTION COMPATIBILITY
-    # =========================================================
+    # ---------------- Compatibility / status ----------------
 
-    def _reject(
-        self,
-        reason,
-        **kwargs,
-    ):
-
+    def _reject(self, reason, **kwargs):
         result = {
             "success": False,
             "version": self.VERSION,
@@ -2555,60 +1565,26 @@ class SMCEngine:
             "reason": reason,
         }
 
-        result.update(
-            kwargs
-        )
-
-        self.last_analysis = (
-            deepcopy(
-                result
-            )
-        )
-
+        result.update(kwargs)
+        self.last_analysis = deepcopy(result)
         return result
 
-    # =========================================================
-    # STATUS
-    # =========================================================
-
     def get_status(self):
-
         return {
             "version": self.VERSION,
-
-            "threshold": (
-                self.A_PLUS_THRESHOLD
-            ),
-
-            "pathways": (
-                list(
-                    self.PATHWAYS
-                )
-            ),
-
-            "adapter_connected": (
-                self.adapter
-                is not None
-            ),
-
-            "adapter_errors": (
-                self.adapter_errors
-            ),
-
-            "last_analysis_status": (
-                self.last_analysis.get(
-                    "status"
-                )
-                if self.last_analysis
-                else "NOT_ANALYZED"
+            "execution_enabled": self.EXECUTION_ENABLED,
+            "threshold": self.A_PLUS_THRESHOLD,
+            "pathways": list(self.PATHWAYS),
+            "adapter_connected": self.adapter is not None,
+            "adapter_errors": self.adapter_errors,
+            "last_analysis_status": self.last_analysis.get(
+                "status",
+                "NOT_ANALYZED",
             ),
         }
 
     def get_last_analysis(self):
-
-        return deepcopy(
-            self.last_analysis
-        )
+        return deepcopy(self.last_analysis)
 
 
 # =============================================================
