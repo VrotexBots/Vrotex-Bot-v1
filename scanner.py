@@ -1,6 +1,6 @@
 """
 Vrotex Bot V1 - Market Scanner
-Version: 3.1
+Version: 3.2
 
 Approved instruments:
     EURUSD
@@ -13,7 +13,9 @@ Strategy timeframes:
 Responsibilities:
     - Continuous instrument scanning
     - Market-data collection
-    - Technical analysis on H1/M5/M1
+    - Technical analysis
+    - Fundamental analysis
+    - Risk-check collection
     - Evidence collection
     - Master SMC analysis
     - Setup-state reporting
@@ -27,15 +29,13 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
 
 logger = logging.getLogger("vrotex.market_scanner")
 
 
 class MarketScanner:
 
-    VERSION = "3.1"
+    VERSION = "3.2"
 
     INSTRUMENTS = (
         "EURUSD",
@@ -50,38 +50,35 @@ class MarketScanner:
     )
 
     CANDLE_COUNT = 1000
-
     DEFAULT_SCAN_INTERVAL = 30
 
     def __init__(
         self,
         market_data_engine=None,
         technical_analysis_engine=None,
+        fundamental_analysis_engine=None,
+        risk_management_engine=None,
         smc_engine=None,
         scan_interval=None,
     ):
 
         self.market_data_engine = market_data_engine
         self.technical_analysis_engine = technical_analysis_engine
+        self.fundamental_analysis_engine = fundamental_analysis_engine
+        self.risk_management_engine = risk_management_engine
         self.smc_engine = smc_engine
 
         self.scan_interval = (
-            scan_interval
-            or self.DEFAULT_SCAN_INTERVAL
+            scan_interval or self.DEFAULT_SCAN_INTERVAL
         )
 
         self.running = False
-
         self._stop_event = threading.Event()
-
         self._lock = threading.RLock()
 
         self.last_scan_time = None
-
         self.last_scan_results = {}
-
         self.scan_count = 0
-
         self.error_count = 0
 
         self.instrument_states = {
@@ -95,6 +92,9 @@ class MarketScanner:
                 "setup_direction": None,
                 "setup_type": None,
                 "a_plus_score": 0,
+                "execution_authorized": False,
+                "fundamental_status": "NOT_ANALYZED",
+                "risk_status": "NOT_ANALYZED",
             }
             for symbol in self.INSTRUMENTS
         }
@@ -113,56 +113,107 @@ class MarketScanner:
     # ENGINE INITIALIZATION
     # =========================================================
 
+    @staticmethod
+    def _load_engine(module_name, names):
+
+        try:
+
+            module = __import__(
+                module_name,
+                fromlist=list(names),
+            )
+
+            for name in names:
+
+                engine = getattr(
+                    module,
+                    name,
+                    None,
+                )
+
+                if engine is not None:
+                    return engine
+
+        except Exception as exc:
+
+            logger.warning(
+                "Engine import failed | %s | %s",
+                module_name,
+                exc,
+            )
+
+        return None
+
     def _initialize_engines(self):
 
         if self.market_data_engine is None:
 
-            try:
-                from market_data_engine import market_data_engine
-
-                self.market_data_engine = market_data_engine
-
-            except Exception as exc:
-
-                logger.error(
-                    "Market Data Engine unavailable: %s",
-                    exc,
+            self.market_data_engine = (
+                self._load_engine(
+                    "market_data_engine",
+                    ("market_data_engine",),
                 )
+            )
 
         if self.technical_analysis_engine is None:
 
-            try:
-                from technical_analysis_engine import (
-                    technical_analysis_engine,
+            self.technical_analysis_engine = (
+                self._load_engine(
+                    "technical_analysis_engine",
+                    ("technical_analysis_engine",),
                 )
+            )
 
-                self.technical_analysis_engine = (
-                    technical_analysis_engine
+        if self.fundamental_analysis_engine is None:
+
+            self.fundamental_analysis_engine = (
+                self._load_engine(
+                    "fundamental_analysis_engine",
+                    (
+                        "fundamental_analysis_engine",
+                        "fundamental_engine",
+                    ),
                 )
+            )
 
-            except Exception as exc:
+        if self.risk_management_engine is None:
 
-                logger.error(
-                    "Technical Analysis Engine unavailable: %s",
-                    exc,
+            self.risk_management_engine = (
+                self._load_engine(
+                    "risk_management_engine",
+                    (
+                        "risk_management_engine",
+                        "risk_manager",
+                    ),
+                )
+            )
+
+            if self.risk_management_engine is None:
+
+                self.risk_management_engine = (
+                    self._load_engine(
+                        "risk_manager",
+                        (
+                            "risk_manager",
+                            "risk_management_engine",
+                        ),
+                    )
                 )
 
         if self.smc_engine is None:
 
-            try:
-                from smc_engine import smc_engine
-
-                self.smc_engine = smc_engine
-
-            except Exception as exc:
-
-                logger.error(
-                    "Master SMC Engine unavailable: %s",
-                    exc,
+            self.smc_engine = (
+                self._load_engine(
+                    "smc_engine",
+                    (
+                        "smc_engine",
+                        "master_smc_engine",
+                    ),
                 )
+            )
 
     # =========================================================
-    # GENERAL HELPERS
+    # HELPERS
     # =========================================================
 
     @staticmethod
@@ -256,7 +307,6 @@ class MarketScanner:
             )
 
         if candles is None:
-
             return []
 
         if isinstance(candles, dict):
@@ -305,7 +355,6 @@ class MarketScanner:
                     continue
 
                 if isinstance(tick, (int, float)):
-
                     return float(tick)
 
                 if isinstance(tick, dict):
@@ -326,26 +375,25 @@ class MarketScanner:
                         tick.get("mid")
                     )
 
-                    if bid and ask:
-
+                    if bid is not None and ask is not None:
                         return (bid + ask) / 2.0
 
-                    if bid:
+                    if bid is not None:
                         return bid
 
-                    if ask:
+                    if ask is not None:
                         return ask
 
-                    if last:
+                    if last is not None:
                         return last
 
-                    if mid:
+                    if mid is not None:
                         return mid
 
             except Exception:
 
                 logger.debug(
-                    "Live price method failed: %s",
+                    "Live-price method failed: %s",
                     method_name,
                     exc_info=True,
                 )
@@ -418,36 +466,14 @@ class MarketScanner:
                 "Technical Analysis returned invalid result"
             )
 
-        result.setdefault(
-            "symbol",
-            symbol,
-        )
-
-        result.setdefault(
-            "timeframe",
-            timeframe,
-        )
-
-        result.setdefault(
-            "candles",
-            len(candles),
-        )
-
-        result.setdefault(
-            "status",
-            "ANALYZED",
-        )
+        result.setdefault("symbol", symbol)
+        result.setdefault("timeframe", timeframe)
+        result.setdefault("candles", len(candles))
+        result.setdefault("status", "ANALYZED")
 
         return result
 
-    # =========================================================
-    # EVIDENCE COLLECTION
-    # =========================================================
-
-    def _collect_market_data(
-        self,
-        symbol,
-    ):
+    def _collect_market_data(self, symbol):
 
         result = {}
 
@@ -493,15 +519,13 @@ class MarketScanner:
 
         return result
 
-    def _extract_entry_evidence(
-        self,
-        market_data,
-    ):
+    # =========================================================
+    # EVIDENCE COLLECTION
+    # =========================================================
 
-        m1 = market_data.get(
-            "M1",
-            {},
-        )
+    def _extract_entry_evidence(self, market_data):
+
+        m1 = market_data.get("M1", {})
 
         technical = self._safe_dict(
             m1.get("technical")
@@ -517,16 +541,11 @@ class MarketScanner:
         for candidate in candidates:
 
             if candidate:
-
                 return candidate
 
-        # Do not invent entry confirmations.
         return None
 
-    def _extract_poi_evidence(
-        self,
-        market_data,
-    ):
+    def _extract_poi_evidence(self, market_data):
 
         evidence = {}
 
@@ -558,17 +577,14 @@ class MarketScanner:
                 if candidate:
 
                     if isinstance(candidate, list):
-
                         found.extend(candidate)
 
                     elif isinstance(candidate, dict):
-
                         found.append(candidate)
 
             evidence[timeframe] = found
 
         if not any(evidence.values()):
-
             return None
 
         return evidence
@@ -582,13 +598,11 @@ class MarketScanner:
 
         for timeframe in self.TIMEFRAMES:
 
-            tf_data = market_data.get(
-                timeframe,
-                {},
-            )
-
             technical = self._safe_dict(
-                tf_data.get("technical")
+                market_data.get(
+                    timeframe,
+                    {},
+                ).get("technical")
             )
 
             displacement = technical.get(
@@ -599,31 +613,21 @@ class MarketScanner:
             )
 
             if displacement:
-
                 evidence[timeframe] = displacement
 
-        if not evidence:
+        return evidence or None
 
-            return None
-
-        return evidence
-
-    def _extract_fvg_evidence(
-        self,
-        market_data,
-    ):
+    def _extract_fvg_evidence(self, market_data):
 
         evidence = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            tf_data = market_data.get(
-                timeframe,
-                {},
-            )
-
             technical = self._safe_dict(
-                tf_data.get("technical")
+                market_data.get(
+                    timeframe,
+                    {},
+                ).get("technical")
             )
 
             fvg = technical.get(
@@ -637,17 +641,142 @@ class MarketScanner:
             )
 
             if fvg:
-
                 evidence[timeframe] = fvg
 
-        if not evidence:
-
-            return None
-
-        return evidence
+        return evidence or None
 
     # =========================================================
-    # RISK CHECK INPUT
+    # FUNDAMENTAL ENGINE
+    # =========================================================
+
+    def _collect_fundamentals(
+        self,
+        symbol,
+        market_data,
+        current_price,
+    ):
+
+        engine = self.fundamental_analysis_engine
+
+        if engine is None:
+
+            return {
+                "status": "FUNDAMENTAL_ENGINE_UNAVAILABLE",
+                "available": False,
+                "symbol": symbol,
+                "data": None,
+            }
+
+        method = None
+        method_name = None
+
+        for name in (
+            "analyze_instrument",
+            "analyse_instrument",
+            "analyze",
+            "analyse",
+        ):
+
+            candidate = getattr(
+                engine,
+                name,
+                None,
+            )
+
+            if callable(candidate):
+
+                method = candidate
+                method_name = name
+                break
+
+        if method is None:
+
+            return {
+                "status": "FUNDAMENTAL_METHOD_UNAVAILABLE",
+                "available": False,
+                "symbol": symbol,
+                "data": None,
+            }
+
+        try:
+
+            try:
+
+                result = method(
+                    symbol=symbol,
+                    market_data=market_data,
+                    current_price=current_price,
+                )
+
+            except TypeError:
+
+                try:
+
+                    result = method(
+                        symbol,
+                        market_data=market_data,
+                        current_price=current_price,
+                    )
+
+                except TypeError:
+
+                    try:
+                        result = method(symbol)
+
+                    except TypeError:
+                        result = method(
+                            instrument=symbol
+                        )
+
+            if isinstance(result, dict):
+
+                return {
+                    "status": result.get(
+                        "status",
+                        "ANALYZED",
+                    ),
+                    "available": True,
+                    "symbol": symbol,
+                    "data": result,
+                    "engine_method": method_name,
+                }
+
+            if result is not None:
+
+                return {
+                    "status": "ANALYZED",
+                    "available": True,
+                    "symbol": symbol,
+                    "data": result,
+                    "engine_method": method_name,
+                }
+
+            return {
+                "status": "NO_FUNDAMENTAL_RESULT",
+                "available": False,
+                "symbol": symbol,
+                "data": None,
+            }
+
+        except Exception as exc:
+
+            logger.error(
+                "%s | Fundamental analysis failed: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+
+            return {
+                "status": "FUNDAMENTAL_ANALYSIS_ERROR",
+                "available": False,
+                "symbol": symbol,
+                "error": str(exc),
+                "data": None,
+            }
+
+    # =========================================================
+    # RISK MANAGEMENT ENGINE
     # =========================================================
 
     def _collect_risk_checks(
@@ -657,11 +786,117 @@ class MarketScanner:
         current_price,
     ):
 
-        # Scanner does not manufacture successful risk checks.
-        # Actual risk validation must be supplied by the
-        # integrated risk-management component.
+        engine = self.risk_management_engine
 
-        return None
+        if engine is None:
+
+            return {
+                "status": "RISK_ENGINE_UNAVAILABLE",
+                "available": False,
+                "checks": None,
+            }
+
+        method = None
+        method_name = None
+
+        possible_methods = (
+            "check_trade",
+            "validate_trade",
+            "validate_risk",
+            "check_risk",
+            "analyze_risk",
+            "analyse_risk",
+            "get_risk_checks",
+        )
+
+        for name in possible_methods:
+
+            candidate = getattr(
+                engine,
+                name,
+                None,
+            )
+
+            if callable(candidate):
+
+                method = candidate
+                method_name = name
+                break
+
+        if method is None:
+
+            return {
+                "status": "RISK_METHOD_UNAVAILABLE",
+                "available": False,
+                "checks": None,
+            }
+
+        try:
+
+            try:
+
+                result = method(
+                    symbol=symbol,
+                    market_data=market_data,
+                    current_price=current_price,
+                )
+
+            except TypeError:
+
+                try:
+
+                    result = method(
+                        symbol,
+                        market_data=market_data,
+                        current_price=current_price,
+                    )
+
+                except TypeError:
+
+                    try:
+
+                        result = method(
+                            symbol,
+                            current_price,
+                        )
+
+                    except TypeError:
+
+                        result = method(symbol)
+
+            if isinstance(result, dict):
+
+                return {
+                    "status": result.get(
+                        "status",
+                        "CHECKS_RETURNED",
+                    ),
+                    "available": True,
+                    "checks": result,
+                    "engine_method": method_name,
+                }
+
+            return {
+                "status": "INVALID_RISK_RESULT",
+                "available": False,
+                "checks": None,
+            }
+
+        except Exception as exc:
+
+            logger.error(
+                "%s | Risk validation failed: %s",
+                symbol,
+                exc,
+                exc_info=True,
+            )
+
+            return {
+                "status": "RISK_VALIDATION_ERROR",
+                "available": False,
+                "error": str(exc),
+                "checks": None,
+            }
 
     # =========================================================
     # MASTER SMC ANALYSIS
@@ -672,6 +907,8 @@ class MarketScanner:
         symbol,
         market_data,
         current_price,
+        fundamentals,
+        risk_checks,
     ):
 
         engine = self.smc_engine
@@ -706,52 +943,32 @@ class MarketScanner:
                 "execution_authorized": False,
             }
 
-        entry_evidence = (
-            self._extract_entry_evidence(
+        arguments = {
+            "market_data": market_data,
+            "current_price": current_price,
+            "entry_evidence": self._extract_entry_evidence(
                 market_data
-            )
-        )
-
-        poi_evidence = (
-            self._extract_poi_evidence(
+            ),
+            "poi_evidence": self._extract_poi_evidence(
                 market_data
-            )
-        )
-
-        displacement_evidence = (
-            self._extract_displacement_evidence(
+            ),
+            "displacement_evidence": (
+                self._extract_displacement_evidence(
+                    market_data
+                )
+            ),
+            "fvg_evidence": self._extract_fvg_evidence(
                 market_data
-            )
-        )
-
-        fvg_evidence = (
-            self._extract_fvg_evidence(
-                market_data
-            )
-        )
-
-        risk_checks = (
-            self._collect_risk_checks(
-                symbol,
-                market_data,
-                current_price,
-            )
-        )
+            ),
+            "risk_checks": risk_checks,
+            "category_scores": None,
+            "fundamentals": fundamentals,
+        }
 
         try:
 
             decision = method(
-                market_data=market_data,
-                current_price=current_price,
-                entry_evidence=entry_evidence,
-                poi_evidence=poi_evidence,
-                displacement_evidence=(
-                    displacement_evidence
-                ),
-                fvg_evidence=fvg_evidence,
-                risk_checks=risk_checks,
-                category_scores=None,
-                fundamentals=None,
+                **arguments
             )
 
             if not isinstance(decision, dict):
@@ -784,10 +1001,7 @@ class MarketScanner:
     # SCAN ONE INSTRUMENT
     # =========================================================
 
-    def scan_instrument(
-        self,
-        symbol,
-    ):
+    def scan_instrument(self, symbol):
 
         if symbol not in self.INSTRUMENTS:
 
@@ -809,10 +1023,8 @@ class MarketScanner:
                 symbol
             )
 
-            market_data = (
-                self._collect_market_data(
-                    symbol
-                )
+            market_data = self._collect_market_data(
+                symbol
             )
 
             valid_timeframes = []
@@ -833,10 +1045,17 @@ class MarketScanner:
                     tf_data.get("technical")
                 )
 
+                invalid_statuses = (
+                    "INSUFFICIENT_DATA",
+                    "NO_DATA",
+                    "ERROR",
+                    "FAILED",
+                )
+
                 if (
                     len(candles) >= 50
                     and technical.get("status")
-                    != "INSUFFICIENT_DATA"
+                    not in invalid_statuses
                 ):
 
                     valid_timeframes.append(
@@ -850,9 +1069,7 @@ class MarketScanner:
                     "status": "INSUFFICIENT_MARKET_DATA",
                     "timestamp": self._utc_now(),
                     "current_price": current_price,
-                    "valid_timeframes": (
-                        valid_timeframes
-                    ),
+                    "valid_timeframes": valid_timeframes,
                     "market_data": market_data,
                     "setup_found": False,
                     "a_plus": False,
@@ -885,10 +1102,27 @@ class MarketScanner:
 
                 return result
 
+            # Fundamental analysis
+            fundamentals = self._collect_fundamentals(
+                symbol,
+                market_data,
+                current_price,
+            )
+
+            # Actual risk engine validation
+            risk_checks = self._collect_risk_checks(
+                symbol,
+                market_data,
+                current_price,
+            )
+
+            # Master SMC engine
             decision = self._run_smc_analysis(
                 symbol,
                 market_data,
                 current_price,
+                fundamentals,
+                risk_checks,
             )
 
             status = decision.get(
@@ -896,14 +1130,11 @@ class MarketScanner:
                 "UNKNOWN",
             )
 
-            # Master SMC setup detection.
             a_plus = (
                 status == "A_PLUS_SETUP"
                 and decision.get("a_plus") is True
             )
 
-            # Authorization must be explicitly returned
-            # by a verified authorization component.
             execution_authorized = (
                 decision.get(
                     "execution_authorized",
@@ -921,9 +1152,19 @@ class MarketScanner:
                 ),
                 "current_price": current_price,
                 "market_data": market_data,
+
+                # Fundamental evidence
+                "fundamentals": fundamentals,
+
+                # Risk evidence
+                "risk_checks": risk_checks,
+
+                # SMC decision
                 "smc_decision": decision,
+
                 "setup_found": a_plus,
                 "a_plus": a_plus,
+
                 "a_plus_score": decision.get(
                     "a_plus_score",
                     decision.get(
@@ -931,17 +1172,25 @@ class MarketScanner:
                         0,
                     ),
                 ),
+
                 "setup_direction": decision.get(
                     "direction"
                 ),
+
                 "setup_type": decision.get(
                     "pathway",
                     decision.get(
                         "setup_type"
                     ),
                 ),
+
                 "execution_authorized": (
                     execution_authorized
+                ),
+
+                # Pass-through only; scanner does not execute.
+                "execution_payload": decision.get(
+                    "execution_payload"
                 ),
             }
 
@@ -1014,49 +1263,43 @@ class MarketScanner:
 
         with self._lock:
 
+            fundamentals = self._safe_dict(
+                result.get("fundamentals")
+            )
+
+            risk = self._safe_dict(
+                result.get("risk_checks")
+            )
+
             self.instrument_states[symbol].update(
                 {
-                    "status": result.get(
-                        "status"
-                    ),
-                    "last_scan": result.get(
-                        "timestamp"
-                    ),
-                    "last_price": result.get(
-                        "current_price"
-                    ),
-                    "last_error": result.get(
-                        "error"
-                    ),
-                    "setup_found": result.get(
-                        "setup_found",
+                    "status": result.get("status"),
+                    "last_scan": result.get("timestamp"),
+                    "last_price": result.get("current_price"),
+                    "last_error": result.get("error"),
+                    "setup_found": result.get("setup_found", False),
+                    "setup_direction": result.get("setup_direction"),
+                    "setup_type": result.get("setup_type"),
+                    "a_plus_score": result.get("a_plus_score", 0),
+                    "execution_authorized": result.get(
+                        "execution_authorized",
                         False,
                     ),
-                    "setup_direction": result.get(
-                        "setup_direction"
+                    "fundamental_status": fundamentals.get(
+                        "status",
+                        "NOT_ANALYZED",
                     ),
-                    "setup_type": result.get(
-                        "setup_type"
-                    ),
-                    "a_plus_score": result.get(
-                        "a_plus_score",
-                        0,
-                    ),
-                    "execution_authorized": (
-                        result.get(
-                            "execution_authorized",
-                            False,
-                        )
+                    "risk_status": risk.get(
+                        "status",
+                        "NOT_ANALYZED",
                     ),
                 }
             )
 
-            self.last_scan_results[symbol] = (
-                result
-            )
+            self.last_scan_results[symbol] = result
 
     # =========================================================
-    # SCAN ALL APPROVED INSTRUMENTS
+    # SCAN ALL INSTRUMENTS
     # =========================================================
 
     def scan_all(self):
@@ -1069,33 +1312,24 @@ class MarketScanner:
             "Starting Vrotex V1 full scan"
         )
 
-        # Sequential scanning is intentional:
-        # avoids unnecessary resource pressure
-        # on the phone/cloud runtime.
+        # Sequential scanning preserves phone/runtime resources.
 
         for symbol in self.INSTRUMENTS:
 
             if self._stop_event.is_set():
-
                 break
 
-            results[symbol] = (
-                self.scan_instrument(
-                    symbol
-                )
+            results[symbol] = self.scan_instrument(
+                symbol
             )
 
         with self._lock:
 
             self.scan_count += 1
 
-            self.last_scan_time = (
-                self._utc_now()
-            )
+            self.last_scan_time = self._utc_now()
 
-        duration = (
-            time.time() - scan_started
-        )
+        duration = time.time() - scan_started
 
         logger.info(
             "Full scan completed | "
@@ -1108,9 +1342,7 @@ class MarketScanner:
             "timestamp": self._utc_now(),
             "scan_number": self.scan_count,
             "duration": duration,
-            "instruments_scanned": len(
-                results
-            ),
+            "instruments_scanned": len(results),
             "results": results,
         }
 
@@ -1146,8 +1378,6 @@ class MarketScanner:
 
                 try:
 
-                    # Scanning is blocking, so run it
-                    # outside the asyncio event loop.
                     await asyncio.to_thread(
                         self.scan_all
                     )
@@ -1214,27 +1444,17 @@ class MarketScanner:
             return {
                 "version": self.VERSION,
                 "running": self.running,
-                "scan_interval": (
-                    self.scan_interval
-                ),
-                "instruments": (
-                    self.INSTRUMENTS
-                ),
-                "timeframes": (
-                    self.TIMEFRAMES
-                ),
-                "scan_count": (
-                    self.scan_count
-                ),
-                "error_count": (
-                    self.error_count
-                ),
-                "last_scan_time": (
-                    self.last_scan_time
-                ),
-                "instrument_states": (
-                    self.instrument_states.copy()
-                ),
+                "scan_interval": self.scan_interval,
+                "instruments": self.INSTRUMENTS,
+                "timeframes": self.TIMEFRAMES,
+                "scan_count": self.scan_count,
+                "error_count": self.error_count,
+                "last_scan_time": self.last_scan_time,
+                "instrument_states": {
+                    symbol: state.copy()
+                    for symbol, state
+                    in self.instrument_states.items()
+                },
             }
 
     # =========================================================
@@ -1245,9 +1465,11 @@ class MarketScanner:
 
         with self._lock:
 
-            return (
-                self.last_scan_results.copy()
-            )
+            return {
+                symbol: result.copy()
+                for symbol, result
+                in self.last_scan_results.items()
+            }
 
 
 # =============================================================
