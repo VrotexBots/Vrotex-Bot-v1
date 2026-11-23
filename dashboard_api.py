@@ -4,17 +4,15 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import math
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
-
 
 LOGS = deque(maxlen=500)
 CLIENTS: set[WebSocket] = set()
@@ -28,22 +26,14 @@ MAX_CHART_CANDLES = 1000
 def make_json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-
     if isinstance(value, (datetime, date)):
         return value.isoformat()
-
     if isinstance(value, Enum):
         return make_json_safe(value.value)
-
     if dataclasses.is_dataclass(value):
         return make_json_safe(dataclasses.asdict(value))
-
     if isinstance(value, dict):
-        return {
-            str(k): make_json_safe(v)
-            for k, v in value.items()
-        }
-
+        return {str(k): make_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, deque)):
         return [make_json_safe(v) for v in value]
 
@@ -60,145 +50,101 @@ def make_json_safe(value: Any) -> Any:
         return str(value)
 
 
-def candle_time_to_unix(value: Any) -> int | None:
-    if value is None:
-        return None
-
-    try:
-        if isinstance(value, datetime):
-            dt = value
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-
-        if isinstance(value, date):
-            dt = datetime(
-                value.year,
-                value.month,
-                value.day,
-                tzinfo=timezone.utc,
-            )
-            return int(dt.timestamp())
-
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-
-            if not math.isfinite(timestamp):
-                return None
-
-            # Convert milliseconds to seconds.
-            if timestamp > 100_000_000_000:
-                timestamp /= 1000
-
-            return int(timestamp)
-
-        if isinstance(value, str):
-            text = value.strip()
-
-            if not text:
-                return None
-
-            # Numeric timestamp represented as text.
-            try:
-                timestamp = float(text)
-
-                if not math.isfinite(timestamp):
-                    return None
-
-                if timestamp > 100_000_000_000:
-                    timestamp /= 1000
-
-                return int(timestamp)
-            except ValueError:
-                pass
-
-            # ISO-8601 date/time.
-            if text.endswith("Z"):
-                text = text[:-1] + "+00:00"
-
-            dt = datetime.fromisoformat(text)
-
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            return int(dt.timestamp())
-
-    except (ValueError, TypeError, OverflowError, OSError):
-        return None
-
-    return None
-
-
-def normalize_chart_candles(candles: Any) -> list[dict[str, Any]]:
-    if isinstance(candles, dict):
-        candles = candles.get(
-            "candles",
-            candles.get("data", []),
+def candle_time_to_unix(value: Any) -> int:
+    """Convert candle time to Lightweight Charts Unix seconds."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    elif isinstance(value, (int, float)):
+        stamp = float(value)
+        if stamp > 100_000_000_000:
+            stamp /= 1000.0
+        return int(stamp)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError("Candle is missing its time value")
+        try:
+            stamp = float(raw)
+            if stamp > 100_000_000_000:
+                stamp /= 1000.0
+            return int(stamp)
+        except ValueError:
+            pass
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+    else:
+        raise ValueError(
+            f"Unsupported candle time type: {type(value).__name__}"
         )
 
-    if not isinstance(candles, (list, tuple)):
-        return []
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
 
-    normalized = []
-    seen_times = set()
+    return int(dt.astimezone(timezone.utc).timestamp())
 
-    for candle in candles:
+
+def normalize_chart_candles(raw_candles: Any) -> list[dict[str, Any]]:
+    """Return sorted, unique OHLC bars."""
+    if isinstance(raw_candles, dict):
+        raw_candles = raw_candles.get(
+            "candles",
+            raw_candles.get("data", raw_candles.get("items", []))
+        )
+
+    if not isinstance(raw_candles, (list, tuple)):
+        raise ValueError("Unexpected candle payload")
+
+    by_time: dict[int, dict[str, Any]] = {}
+
+    for candle in raw_candles:
         if not isinstance(candle, dict):
             continue
 
-        candle_time = candle_time_to_unix(
-            candle.get(
-                "time",
-                candle.get(
-                    "timestamp",
-                    candle.get("datetime"),
-                ),
-            )
-        )
-
-        if candle_time is None or candle_time in seen_times:
-            continue
-
         try:
-            open_price = float(candle["open"])
-            high_price = float(candle["high"])
-            low_price = float(candle["low"])
-            close_price = float(candle["close"])
+            stamp = candle_time_to_unix(
+                candle.get("time", candle.get("timestamp"))
+            )
+
+            bar = {
+                "time": stamp,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+            }
 
             values = (
-                open_price,
-                high_price,
-                low_price,
-                close_price,
+                bar["open"],
+                bar["high"],
+                bar["low"],
+                bar["close"],
             )
 
-            if not all(math.isfinite(v) for v in values):
+            if not all(
+                number == number and abs(number) != float("inf")
+                for number in values
+            ):
                 continue
 
-            if high_price < low_price:
+            if bar["high"] < max(
+                bar["open"], bar["close"], bar["low"]
+            ):
                 continue
 
-            if high_price < max(open_price, close_price):
+            if bar["low"] > min(
+                bar["open"], bar["close"], bar["high"]
+            ):
                 continue
 
-            if low_price > min(open_price, close_price):
-                continue
-
-            normalized.append({
-                "time": candle_time,
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": close_price,
-            })
-
-            seen_times.add(candle_time)
+            by_time[stamp] = bar
 
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
-    normalized.sort(key=lambda item: item["time"])
-    return normalized
+    return [by_time[t] for t in sorted(by_time)]
 
 
 class DashboardLogHandler(logging.Handler):
@@ -206,8 +152,7 @@ class DashboardLogHandler(logging.Handler):
         try:
             entry = {
                 "timestamp": datetime.fromtimestamp(
-                    record.created,
-                    timezone.utc,
+                    record.created, timezone.utc
                 ).astimezone().isoformat(timespec="seconds"),
                 "level": record.levelname,
                 "logger": record.name,
@@ -219,10 +164,7 @@ class DashboardLogHandler(logging.Handler):
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(
-                    broadcast({
-                        "type": "log",
-                        "entry": entry,
-                    })
+                    broadcast({"type": "log", "entry": entry})
                 )
             except RuntimeError:
                 pass
@@ -262,7 +204,7 @@ def create_app(bot: Any) -> FastAPI:
         if not dashboard_file.is_file():
             raise HTTPException(
                 status_code=404,
-                detail="Dashboard file not found",
+                detail="Dashboard file not found"
             )
 
         return FileResponse(dashboard_file)
@@ -274,7 +216,7 @@ def create_app(bot: Any) -> FastAPI:
         if not dashboard_file.is_file():
             raise HTTPException(
                 status_code=404,
-                detail="Dashboard file not found",
+                detail="Dashboard file not found"
             )
 
         return FileResponse(dashboard_file)
@@ -289,20 +231,17 @@ def create_app(bot: Any) -> FastAPI:
 
     @app.get("/api/logs")
     async def logs():
-        return {
-            "logs": make_json_safe(list(LOGS))
-        }
+        return {"logs": make_json_safe(list(LOGS))}
 
-    # ---------------------------------------------------------
-    # CHART API: HISTORICAL CANDLES
-    # Uses the existing Exness market-data engine.
-    # ---------------------------------------------------------
+    # ==========================================================
+    # CHART API
+    # ==========================================================
 
     @app.get("/api/chart/candles")
     async def chart_candles(
-        symbol: str = "EURUSD",
-        timeframe: str = "M5",
-        count: int = 500,
+        symbol: str = Query("EURUSD", min_length=6, max_length=10),
+        timeframe: str = Query("M5", min_length=2, max_length=3),
+        count: int = Query(500, ge=1, le=MAX_CHART_CANDLES),
     ):
         symbol = symbol.upper().strip()
         timeframe = timeframe.upper().strip()
@@ -310,42 +249,71 @@ def create_app(bot: Any) -> FastAPI:
         if symbol not in CHART_INSTRUMENTS:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported chart instrument",
+                detail="Instrument is not enabled for Vrotex V1"
             )
 
         if timeframe not in CHART_TIMEFRAMES:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported chart timeframe",
+                detail="Unsupported chart timeframe"
             )
 
-        if count < 1 or count > MAX_CHART_CANDLES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Count must be between 1 and "
-                    f"{MAX_CHART_CANDLES}"
-                ),
-            )
+        timeframe_seconds = {
+            "M1": 60,
+            "M5": 300,
+            "M15": 900,
+            "M30": 1800,
+            "H1": 3600,
+            "H4": 14400,
+            "D1": 86400,
+        }
 
         try:
             from market_data_engine import market_data_engine
 
-            candles = await market_data_engine.request_candles(
+            raw = await asyncio.to_thread(
+                market_data_engine._get_recent_candles,
                 symbol,
                 timeframe,
+                "bid",
                 count,
-                price_type="bid",
             )
 
-            normalized = normalize_chart_candles(candles)
+            bars = normalize_chart_candles(raw)
+
+            if len(bars) < count:
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(
+                    seconds=timeframe_seconds[timeframe] * count
+                )
+
+                fetched = await asyncio.to_thread(
+                    market_data_engine.get_historical_candles,
+                    symbol,
+                    timeframe,
+                    start,
+                    end,
+                    "bid",
+                )
+
+                bars = normalize_chart_candles(
+                    list(raw or []) + list(fetched or [])
+                )[-count:]
 
             return {
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "price_type": "bid",
-                "candles": normalized,
-                "count": len(normalized),
+                "candles": bars,
+                "count": len(bars),
+                "source": (
+                    "SQLITE_CACHE_AND_EXNESS"
+                    if bars else "UNAVAILABLE"
+                ),
+                "message": (
+                    None if bars
+                    else "No historical candles available"
+                ),
             }
 
         except HTTPException:
@@ -361,24 +329,119 @@ def create_app(bot: Any) -> FastAPI:
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Chart candle data is temporarily unavailable: "
+                    f"Historical candle data unavailable: "
                     f"{type(exc).__name__}: {exc}"
                 ),
+            ) from exc
+
+    # ==========================================================
+    # ACCOUNT API
+    # ==========================================================
+
+    @app.get("/api/account")
+    async def account_snapshot():
+        try:
+            from exness_connection import (
+                get_account_details,
+                engine_status,
             )
 
-    # ---------------------------------------------------------
-    # CHART API: LIVE BID / ASK TICK
-    # Uses the existing Exness live-tick engine.
-    # ---------------------------------------------------------
+            details = await asyncio.to_thread(get_account_details)
+            connection = await asyncio.to_thread(engine_status)
+
+            if not isinstance(details, dict):
+                raise RuntimeError(
+                    "Unexpected Exness account response"
+                )
+
+            def find_value(data, aliases):
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if str(key).lower() in aliases:
+                            if value is not None:
+                                return value
+
+                    for value in data.values():
+                        found = find_value(value, aliases)
+                        if found is not None:
+                            return found
+
+                elif isinstance(data, (list, tuple)):
+                    for item in data:
+                        found = find_value(item, aliases)
+                        if found is not None:
+                            return found
+
+                return None
+
+            fields = {
+                "balance": {
+                    "balance", "account_balance"
+                },
+                "equity": {
+                    "equity", "account_equity"
+                },
+                "profit": {
+                    "profit", "floating_profit",
+                    "unrealized_profit", "pnl", "pl"
+                },
+                "margin": {
+                    "margin", "used_margin"
+                },
+                "free_margin": {
+                    "free_margin", "available_margin"
+                },
+                "margin_level": {
+                    "margin_level", "marginlevel"
+                },
+                "currency": {
+                    "currency", "account_currency"
+                },
+            }
+
+            normalized = {
+                key: find_value(details, aliases)
+                for key, aliases in fields.items()
+            }
+
+            return {
+                "status": "ok",
+                "connected": bool(connection.get("connected")),
+                "account_id": connection.get("account_id"),
+                "account": normalized,
+                "raw": make_json_safe(details),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Exness account snapshot failed"
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Account data unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+
+    # ==========================================================
+    # LIVE CHART TICK
+    # ==========================================================
 
     @app.get("/api/chart/tick")
-    async def chart_tick(symbol: str = "EURUSD"):
+    async def chart_tick(
+        symbol: str = Query("EURUSD", min_length=6, max_length=10),
+    ):
         symbol = symbol.upper().strip()
 
         if symbol not in CHART_INSTRUMENTS:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported chart instrument",
+                detail="Instrument is not enabled for Vrotex V1"
             )
 
         try:
@@ -391,48 +454,48 @@ def create_app(bot: Any) -> FastAPI:
                     "symbol": symbol,
                     "bid": None,
                     "ask": None,
-                    "mid": None,
-                    "spread": None,
-                    "age_seconds": None,
                     "fresh": False,
                     "reason": "NO LIVE TICK",
                 }
 
-            tick = make_json_safe(tick)
+            safe_tick = make_json_safe(tick)
 
-            if not isinstance(tick, dict):
-                tick = {}
+            if not isinstance(safe_tick, dict):
+                safe_tick = {}
 
             return {
                 "symbol": symbol,
-                "bid": tick.get("bid"),
-                "ask": tick.get("ask"),
-                "mid": tick.get("mid"),
-                "spread": tick.get("spread"),
-                "age_seconds": tick.get(
-                    "age_seconds",
-                    tick.get("age"),
+                "bid": safe_tick.get("bid"),
+                "ask": safe_tick.get("ask"),
+                "mid": safe_tick.get("mid"),
+                "spread": safe_tick.get("spread"),
+                "age_seconds": safe_tick.get(
+                    "age_seconds", safe_tick.get("age")
                 ),
-                "fresh": bool(tick.get("fresh", False)),
-                "reason": tick.get("reason"),
+                "fresh": bool(safe_tick.get("fresh", False)),
+                "reason": (
+                    None if safe_tick.get("fresh")
+                    else "STALE / MARKET CLOSED"
+                ),
             }
-
-        except HTTPException:
-            raise
 
         except Exception as exc:
             logging.getLogger(__name__).exception(
-                "Chart live tick request failed for %s",
+                "Chart tick request failed for %s",
                 symbol,
             )
 
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Live chart tick is temporarily unavailable: "
+                    f"Live quote unavailable: "
                     f"{type(exc).__name__}: {exc}"
                 ),
-            )
+            ) from exc
+
+    # ==========================================================
+    # BOT CONTROL
+    # ==========================================================
 
     @app.post("/api/bot/start")
     async def start_bot():
@@ -441,6 +504,10 @@ def create_app(bot: Any) -> FastAPI:
     @app.post("/api/bot/stop")
     async def stop_bot():
         return await control(bot, "stop")
+
+    # ==========================================================
+    # WEBSOCKET LOGS
+    # ==========================================================
 
     @app.websocket("/ws/logs")
     async def log_socket(ws: WebSocket):
@@ -479,6 +546,7 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
     market_status = {}
     state = {}
     quotes = []
+    market_data_engine = None
 
     try:
         from engine import engine
@@ -487,22 +555,14 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             engine_status = engine.get_status()
 
         except Exception as exc:
-            errors["engine"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            errors["engine"] = f"{type(exc).__name__}: {exc}"
             engine_status = {
                 "available": False,
                 "error": errors["engine"],
             }
 
     except Exception as exc:
-        engine = None
-
-        errors["engine"] = (
-            f"{type(exc).__name__}: {exc}"
-        )
-
+        errors["engine"] = f"{type(exc).__name__}: {exc}"
         engine_status = {
             "available": False,
             "error": errors["engine"],
@@ -515,22 +575,14 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             market_status = market_data_engine.get_status()
 
         except Exception as exc:
-            errors["market_data"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            errors["market_data"] = f"{type(exc).__name__}: {exc}"
             market_status = {
                 "available": False,
                 "error": errors["market_data"],
             }
 
     except Exception as exc:
-        market_data_engine = None
-
-        errors["market_data"] = (
-            f"{type(exc).__name__}: {exc}"
-        )
-
+        errors["market_data"] = f"{type(exc).__name__}: {exc"
         market_status = {
             "available": False,
             "error": errors["market_data"],
@@ -543,20 +595,14 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             state = state_manager.get_state()
 
         except Exception as exc:
-            errors["state"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
-
+            errors["state"] = f"{type(exc).__name__}: {exc}"
             state = {
                 "available": False,
                 "error": errors["state"],
             }
 
     except Exception as exc:
-        errors["state"] = (
-            f"{type(exc).__name__}: {exc}"
-        )
-
+        errors["state"] = f"{type(exc).__name__}: {exc"
         state = {
             "available": False,
             "error": errors["state"],
