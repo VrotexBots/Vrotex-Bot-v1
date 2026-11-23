@@ -1,59 +1,31 @@
-
 """
-Vrotex Bot V1 - Market Scanner
-Version: 3.3 - Master SMC Evidence Integration
+Vrotex Bot V1
+Scanner V3.4
 
-Approved instruments:
-    EURUSD
-    GBPUSD
-    BTCUSD
+H1 -> M5 -> M1
+EURUSD, GBPUSD, BTCUSD
 
-Strategy timeframes:
-    H1 -> M5 -> M1
-
-Responsibilities:
-    - Continuous instrument scanning
-    - Async market-data collection
-    - Technical analysis
-    - Fundamental analysis
-    - Risk-check collection
-    - Seven-category score collection
-    - SMC evidence collection
-    - Master SMC analysis
-    - Setup-state reporting
-
-This module does NOT execute broker orders.
+Evidence collection and Master SMC analysis.
+No strategy changes.
 """
 
 import asyncio
 import inspect
 import logging
-import math
 import threading
 import time
-import traceback
-
+import math
 from datetime import datetime, timezone
-
 
 logger = logging.getLogger("vrotex.market_scanner")
 
 
 class MarketScanner:
 
-    VERSION = "3.3"
+    VERSION = "3.4"
 
-    INSTRUMENTS = (
-        "EURUSD",
-        "GBPUSD",
-        "BTCUSD",
-    )
-
-    TIMEFRAMES = (
-        "H1",
-        "M5",
-        "M1",
-    )
+    INSTRUMENTS = ("EURUSD", "GBPUSD", "BTCUSD")
+    TIMEFRAMES = ("H1", "M5", "M1")
 
     CATEGORIES = (
         "structure",
@@ -66,7 +38,7 @@ class MarketScanner:
     )
 
     CANDLE_COUNT = 1000
-    DEFAULT_SCAN_INTERVAL = 30
+    SCAN_INTERVAL = 30
 
     def __init__(
         self,
@@ -77,7 +49,6 @@ class MarketScanner:
         smc_engine=None,
         scan_interval=None,
     ):
-
         self.market_data_engine = market_data_engine
         self.technical_analysis_engine = technical_analysis_engine
         self.fundamental_analysis_engine = fundamental_analysis_engine
@@ -85,7 +56,7 @@ class MarketScanner:
         self.smc_engine = smc_engine
 
         self.scan_interval = (
-            scan_interval or self.DEFAULT_SCAN_INTERVAL
+            scan_interval or self.SCAN_INTERVAL
         )
 
         self.running = False
@@ -109,10 +80,7 @@ class MarketScanner:
                 "setup_type": None,
                 "a_plus_score": 0,
                 "category_scores": {},
-                "score_complete": False,
                 "execution_authorized": False,
-                "fundamental_status": "NOT_ANALYZED",
-                "risk_status": "NOT_ANALYZED",
             }
             for symbol in self.INSTRUMENTS
         }
@@ -120,29 +88,57 @@ class MarketScanner:
         self._initialize_engines()
 
         logger.info(
-            "Market Scanner V%s initialized | Instruments=%s | Timeframes=%s",
+            "Scanner V%s initialized | Symbols=%s | TF=%s",
             self.VERSION,
             self.INSTRUMENTS,
             self.TIMEFRAMES,
         )
 
     # =========================================================
-    # ASYNC COMPATIBILITY
+    # GENERAL HELPERS
     # =========================================================
 
     @staticmethod
+    def _now():
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _dict(value):
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _list(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
+    @staticmethod
+    def _number(value, default=None):
+        try:
+            result = float(value)
+            if math.isfinite(result):
+                return result
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return default
+
+    @staticmethod
+    def _has(value):
+        if value is None:
+            return False
+        if isinstance(value, (dict, list, tuple)):
+            return len(value) > 0
+        return bool(value)
+
+    @staticmethod
     async def _invoke(method, *args, **kwargs):
-
-        if not callable(method):
-            raise RuntimeError("Engine method is not callable")
-
         if inspect.iscoroutinefunction(method):
             return await method(*args, **kwargs)
 
         result = await asyncio.to_thread(
-            method,
-            *args,
-            **kwargs,
+            method, *args, **kwargs
         )
 
         if inspect.isawaitable(result):
@@ -150,29 +146,53 @@ class MarketScanner:
 
         return result
 
+    @staticmethod
+    def _supports_kwargs(method):
+        try:
+            sig = inspect.signature(method)
+            return any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _filter_kwargs(method, kwargs):
+        try:
+            sig = inspect.signature(method)
+            if any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
+                return kwargs
+
+            return {
+                key: value
+                for key, value in kwargs.items()
+                if key in sig.parameters
+            }
+        except (TypeError, ValueError):
+            return kwargs
+
     # =========================================================
     # ENGINE INITIALIZATION
     # =========================================================
 
     @staticmethod
     def _load_engine(module_name, names):
-
         try:
-
             module = __import__(
                 module_name,
                 fromlist=list(names),
             )
 
             for name in names:
-
-                engine = getattr(module, name, None)
-
-                if engine is not None:
-                    return engine
+                obj = getattr(module, name, None)
+                if obj is not None:
+                    return obj
 
         except Exception as exc:
-
             logger.warning(
                 "Engine import failed | %s | %s",
                 module_name,
@@ -205,23 +225,13 @@ class MarketScanner:
             )
 
         if self.risk_management_engine is None:
-
             self.risk_management_engine = self._load_engine(
-                "risk_management_engine",
+                "risk_manager",
                 (
-                    "risk_management_engine",
                     "risk_manager",
+                    "risk_management_engine",
                 ),
             )
-
-            if self.risk_management_engine is None:
-                self.risk_management_engine = self._load_engine(
-                    "risk_manager",
-                    (
-                        "risk_manager",
-                        "risk_management_engine",
-                    ),
-                )
 
         if self.smc_engine is None:
             self.smc_engine = self._load_engine(
@@ -233,351 +243,44 @@ class MarketScanner:
             )
 
     # =========================================================
-    # HELPERS
-    # =========================================================
-
-    @staticmethod
-    def _utc_now():
-
-        return datetime.now(
-            timezone.utc
-        ).isoformat()
-
-    @staticmethod
-    def _safe_float(value, default=None):
-
-        try:
-
-            if value is None:
-                return default
-
-            result = float(value)
-
-            if not math.isfinite(result):
-                return default
-
-            return result
-
-        except (ValueError, TypeError, OverflowError):
-            return default
-
-    @staticmethod
-    def _safe_dict(value):
-
-        return value if isinstance(value, dict) else {}
-
-    @staticmethod
-    def _safe_list(value):
-
-        if isinstance(value, list):
-            return value
-
-        if isinstance(value, tuple):
-            return list(value)
-
-        return []
-
-    @staticmethod
-    def _supports_keyword(method, keyword):
-
-        try:
-
-            signature = inspect.signature(method)
-            parameters = signature.parameters
-
-            if keyword in parameters:
-                return True
-
-            return any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
-
-        except (TypeError, ValueError):
-            return True
-
-    # =========================================================
-    # CATEGORY SCORE NORMALIZATION
-    # =========================================================
-
-    def _normalize_category_scores(self, value):
-
-        value = self._safe_dict(value)
-        normalized = {}
-
-        aliases = {
-            "structure": (
-                "structure",
-                "structure_score",
-            ),
-            "poi": (
-                "poi",
-                "poi_score",
-                "points_of_interest",
-            ),
-            "liquidity": (
-                "liquidity",
-                "liquidity_score",
-            ),
-            "entry_models": (
-                "entry_models",
-                "entry_model",
-                "entry_models_score",
-                "entry_score",
-            ),
-            "timeframe_alignment": (
-                "timeframe_alignment",
-                "timeframe_alignment_score",
-                "alignment",
-            ),
-            "fundamentals": (
-                "fundamentals",
-                "fundamental",
-                "fundamentals_score",
-                "fundamental_score",
-            ),
-            "trade_quality_risk": (
-                "trade_quality_risk",
-                "trade_quality",
-                "risk_quality",
-                "trade_quality_risk_score",
-            ),
-        }
-
-        for category, possible_names in aliases.items():
-
-            for name in possible_names:
-
-                if name not in value:
-                    continue
-
-                raw = value.get(name)
-
-                if isinstance(raw, dict):
-                    raw = raw.get(
-                        "score",
-                        raw.get("value"),
-                    )
-
-                score = self._safe_float(raw)
-
-                if score is not None and 0 <= score <= 100:
-                    normalized[category] = score
-                    break
-
-        return normalized
-
-    def _extract_category_scores(
-        self,
-        market_data,
-        fundamentals,
-        risk_checks,
-    ):
-        """
-        Collect only explicitly supplied numerical scores.
-
-        No scores are invented or inferred from the presence
-        of evidence.
-
-        Technical-analysis category scores are collected from
-        H1, M5 and M1. When a category is explicitly scored by
-        more than one timeframe, the available scores are
-        averaged.
-
-        Fundamental and risk categories may also be supplied
-        by their respective engines.
-        """
-
-        collected = {
-            category: []
-            for category in self.CATEGORIES
-        }
-
-        for timeframe in self.TIMEFRAMES:
-
-            technical = self._safe_dict(
-                market_data.get(timeframe)
-            )
-
-            technical = self._safe_dict(
-                technical.get("technical")
-            )
-
-            sources = (
-                technical.get("category_scores"),
-                technical.get("smc_category_scores"),
-                technical.get("scoring"),
-            )
-
-            for source in sources:
-
-                scores = self._normalize_category_scores(
-                    source
-                )
-
-                for category, score in scores.items():
-
-                    if score not in collected[category]:
-                        collected[category].append(score)
-
-        fundamentals = self._safe_dict(fundamentals)
-
-        fundamental_data = self._safe_dict(
-            fundamentals.get("data")
-        )
-
-        fundamental_sources = (
-            fundamentals.get("category_scores"),
-            fundamental_data.get("category_scores"),
-        )
-
-        for source in fundamental_sources:
-
-            scores = self._normalize_category_scores(
-                source
-            )
-
-            if "fundamentals" in scores:
-                collected["fundamentals"].append(
-                    scores["fundamentals"]
-                )
-
-        fundamental_score = self._safe_float(
-            fundamental_data.get(
-                "score",
-                fundamentals.get("score"),
-            )
-        )
-
-        if (
-            fundamental_score is not None
-            and 0 <= fundamental_score <= 100
-            and not collected["fundamentals"]
-        ):
-            collected["fundamentals"].append(
-                fundamental_score
-            )
-
-        risk_checks = self._safe_dict(risk_checks)
-        risk_data = self._safe_dict(
-            risk_checks.get("checks")
-        )
-
-        risk_sources = (
-            risk_checks.get("category_scores"),
-            risk_data.get("category_scores"),
-            risk_checks.get("scoring"),
-            risk_data.get("scoring"),
-        )
-
-        for source in risk_sources:
-
-            scores = self._normalize_category_scores(
-                source
-            )
-
-            if "trade_quality_risk" in scores:
-                collected["trade_quality_risk"].append(
-                    scores["trade_quality_risk"]
-                )
-
-        risk_score = self._safe_float(
-            risk_data.get(
-                "trade_quality_risk_score",
-                risk_data.get(
-                    "trade_quality_score",
-                    risk_checks.get(
-                        "trade_quality_risk_score"
-                    ),
-                ),
-            )
-        )
-
-        if (
-            risk_score is not None
-            and 0 <= risk_score <= 100
-            and not collected["trade_quality_risk"]
-        ):
-            collected["trade_quality_risk"].append(
-                risk_score
-            )
-
-        final_scores = {}
-
-        for category, values in collected.items():
-
-            if values:
-                final_scores[category] = round(
-                    sum(values) / len(values),
-                    2,
-                )
-
-        missing = [
-            category
-            for category in self.CATEGORIES
-            if category not in final_scores
-        ]
-
-        return {
-            "scores": final_scores,
-            "complete": not missing,
-            "missing_categories": missing,
-            "category_count": len(final_scores),
-            "required_category_count": len(self.CATEGORIES),
-            "source_values": {
-                category: list(values)
-                for category, values in collected.items()
-                if values
-            },
-        }
-
-    # =========================================================
     # MARKET DATA
     # =========================================================
 
-    async def _get_candles(
-        self,
-        symbol,
-        timeframe,
-        count=None,
-    ):
+    async def _get_candles(self, symbol, timeframe):
 
-        count = count or self.CANDLE_COUNT
         engine = self.market_data_engine
-
         if engine is None:
-            raise RuntimeError("Market Data Engine unavailable")
+            raise RuntimeError("Market data engine unavailable")
 
         method = getattr(
-            engine,
-            "get_recent_candles",
-            None,
+            engine, "get_recent_candles", None
         )
 
         if not callable(method):
-            raise RuntimeError("get_recent_candles() unavailable")
-
-        if self._supports_keyword(method, "price_type"):
-
-            candles = await self._invoke(
-                method,
-                symbol,
-                timeframe,
-                count,
-                price_type="bid",
+            raise RuntimeError(
+                "get_recent_candles method unavailable"
             )
+
+        kwargs = {}
+
+        if self._supports_kwargs(method):
+            kwargs["price_type"] = "bid"
 
         else:
+            try:
+                sig = inspect.signature(method)
+                if "price_type" in sig.parameters:
+                    kwargs["price_type"] = "bid"
+            except Exception:
+                pass
 
-            candles = await self._invoke(
-                method,
-                symbol,
-                timeframe,
-                count,
-            )
-
-        if candles is None:
-            return []
+        candles = await self._invoke(
+            method,
+            symbol,
+            timeframe,
+            self.CANDLE_COUNT,
+            **kwargs,
+        )
 
         if isinstance(candles, dict):
             candles = candles.get(
@@ -585,66 +288,46 @@ class MarketScanner:
                 candles.get("data", []),
             )
 
-        return self._safe_list(candles)
-
-    # =========================================================
-    # LIVE PRICE
-    # =========================================================
+        return self._list(candles)
 
     async def _get_live_price(self, symbol):
 
         engine = self.market_data_engine
-
         if engine is None:
             return None
 
-        methods = (
+        for name in (
             "get_live_tick",
             "get_latest_tick",
             "get_tick",
             "get_current_price",
-        )
-
-        for name in methods:
-
+        ):
             method = getattr(engine, name, None)
 
             if not callable(method):
                 continue
 
             try:
-
-                tick = await self._invoke(
-                    method,
-                    symbol,
-                )
-
-                if tick is None:
-                    continue
+                tick = await self._invoke(method, symbol)
 
                 if isinstance(tick, (int, float)):
-                    return self._safe_float(tick)
+                    return self._number(tick)
 
                 if isinstance(tick, dict):
-
-                    bid = self._safe_float(tick.get("bid"))
-                    ask = self._safe_float(tick.get("ask"))
+                    bid = self._number(tick.get("bid"))
+                    ask = self._number(tick.get("ask"))
 
                     if bid is not None and ask is not None:
-                        return (bid + ask) / 2.0
+                        return (bid + ask) / 2
 
-                    for key in ("last", "mid", "price"):
-                        price = self._safe_float(
-                            tick.get(key)
-                        )
-
-                        if price is not None:
-                            return price
+                    for key in ("price", "last", "mid", "close"):
+                        value = self._number(tick.get(key))
+                        if value is not None:
+                            return value
 
             except Exception:
-
                 logger.debug(
-                    "Live-price method failed: %s",
+                    "Price method failed: %s",
                     name,
                     exc_info=True,
                 )
@@ -655,12 +338,7 @@ class MarketScanner:
     # TECHNICAL ANALYSIS
     # =========================================================
 
-    async def _analyse_timeframe(
-        self,
-        symbol,
-        timeframe,
-        candles,
-    ):
+    async def _analyse(self, symbol, timeframe, candles):
 
         engine = self.technical_analysis_engine
 
@@ -669,14 +347,6 @@ class MarketScanner:
                 "Technical Analysis Engine unavailable"
             )
 
-        if not candles:
-            return {
-                "status": "NO_DATA",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": 0,
-            }
-
         method = getattr(engine, "analyze", None)
 
         if not callable(method):
@@ -684,334 +354,402 @@ class MarketScanner:
 
         if not callable(method):
             raise RuntimeError(
-                "Technical Analysis method unavailable"
+                "Technical analysis method unavailable"
             )
 
-        if (
-            self._supports_keyword(method, "symbol")
-            and self._supports_keyword(method, "timeframe")
-        ):
+        kwargs = self._filter_kwargs(
+            method,
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        )
 
-            result = await self._invoke(
-                method,
-                candles,
-                symbol=symbol,
-                timeframe=timeframe,
-            )
-
-        else:
-
-            result = await self._invoke(
-                method,
-                candles,
-            )
+        result = await self._invoke(
+            method,
+            candles,
+            **kwargs,
+        )
 
         if not isinstance(result, dict):
             raise RuntimeError(
-                "Technical Analysis returned invalid result"
+                "Technical analysis returned invalid output"
             )
 
         result.setdefault("symbol", symbol)
         result.setdefault("timeframe", timeframe)
-        result.setdefault("candles", len(candles))
-        result.setdefault("status", "ANALYZED")
 
         return result
 
-    # =========================================================
-    # MARKET DATA COLLECTION
-    # =========================================================
-
     async def _collect_market_data(self, symbol):
 
-        result = {}
+        data = {}
 
+        # Sequential collection preserves phone resources.
         for timeframe in self.TIMEFRAMES:
 
             if self._stop_event.is_set():
                 break
 
             try:
-
                 candles = await self._get_candles(
                     symbol,
                     timeframe,
-                    self.CANDLE_COUNT,
                 )
 
-                logger.info(
-                    "%s | %s | Candle retrieval successful | Count=%s",
-                    symbol,
-                    timeframe,
-                    len(candles),
-                )
+                if len(candles) < 50:
+                    data[timeframe] = {
+                        "candles": candles,
+                        "technical": {
+                            "success": False,
+                            "status": "INSUFFICIENT_DATA",
+                            "candles_analyzed": len(candles),
+                            "timeframe": timeframe,
+                            "symbol": symbol,
+                        },
+                    }
+                    continue
 
-            except Exception as exc:
-
-                logger.error(
-                    "%s | %s | Candle retrieval failed: %s",
-                    symbol,
-                    timeframe,
-                    exc,
-                    exc_info=True,
-                )
-
-                result[timeframe] = {
-                    "candles": [],
-                    "technical": {
-                        "status": "CANDLE_RETRIEVAL_ERROR",
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "candles": 0,
-                        "error": str(exc),
-                    },
-                }
-
-                continue
-
-            if len(candles) < 50:
-
-                result[timeframe] = {
-                    "candles": candles,
-                    "technical": {
-                        "status": "INSUFFICIENT_DATA",
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "candles": len(candles),
-                    },
-                }
-
-                continue
-
-            try:
-
-                technical = await self._analyse_timeframe(
+                technical = await self._analyse(
                     symbol,
                     timeframe,
                     candles,
                 )
 
-            except Exception as exc:
-
-                logger.error(
-                    "%s | %s | Technical analysis failed: %s",
-                    symbol,
-                    timeframe,
-                    exc,
-                    exc_info=True,
-                )
-
-                technical = {
-                    "status": "TECHNICAL_ANALYSIS_ERROR",
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "candles": len(candles),
-                    "error": str(exc),
+                data[timeframe] = {
+                    "candles": candles,
+                    "technical": technical,
                 }
 
-            result[timeframe] = {
-                "candles": candles,
-                "technical": technical,
-            }
+                logger.info(
+                    "%s | %s | TA completed | Candles=%s | Bias=%s | Breaks=%s | Sweeps=%s | FVG=%s | OB=%s",
+                    symbol,
+                    timeframe,
+                    len(candles),
+                    technical.get("bias"),
+                    len(self._list(technical.get("breaks"))),
+                    len(self._list(technical.get("liquidity_sweeps"))),
+                    len(self._list(technical.get("fvgs"))),
+                    len(self._list(technical.get("clean_order_blocks"))),
+                )
 
-        return result
+            except Exception as exc:
 
-    # =========================================================
-    # EVIDENCE COLLECTION
-    # =========================================================
+                logger.exception(
+                    "%s | %s | Data/TA error",
+                    symbol,
+                    timeframe,
+                )
 
-    def _extract_entry_evidence(self, market_data):
+                data[timeframe] = {
+                    "candles": [],
+                    "technical": {
+                        "success": False,
+                        "status": "ERROR",
+                        "error": str(exc),
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    },
+                }
 
-        technical = self._safe_dict(
-            market_data.get("M1", {}).get("technical")
+        return data
+
+    def _ta(self, market_data, timeframe):
+        return self._dict(
+            self._dict(market_data.get(timeframe)).get(
+                "technical"
+            )
         )
 
-        for key in (
-            "entry_models",
-            "entry_evidence",
-            "confirmed_entry_models",
-            "signals",
-        ):
+    # =========================================================
+    # STRUCTURE EVIDENCE
+    # =========================================================
 
-            candidate = technical.get(key)
+    def _structure_evidence(self, market_data):
 
-            if candidate:
-                return candidate
-
-        return None
-
-    def _extract_poi_evidence(self, market_data):
-
-        evidence = {}
+        output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            technical = self._safe_dict(
-                market_data.get(
-                    timeframe,
-                    {},
-                ).get("technical")
-            )
+            ta = self._ta(market_data, timeframe)
 
-            found = []
+            structure = ta.get("structure", {})
+            swings = ta.get("swings", {})
+            breaks = self._list(ta.get("breaks"))
 
-            for key in (
-                "poi_evidence",
-                "points_of_interest",
-                "order_blocks",
-                "ob_candidates",
-                "fvg",
-                "fvgs",
-                "fair_value_gaps",
-            ):
+            output[timeframe] = {
+                "bias": ta.get("bias"),
+                "direction": ta.get("direction"),
+                "structure": structure,
+                "swings": swings,
+                "breaks": breaks,
+                "latest_swing_high": self._dict(
+                    structure
+                ).get("latest_swing_high"),
+                "latest_swing_low": self._dict(
+                    structure
+                ).get("latest_swing_low"),
+            }
 
-                candidate = technical.get(key)
+        return output
 
-                if isinstance(candidate, list):
-                    found.extend(candidate)
+    # =========================================================
+    # POI EVIDENCE
+    # =========================================================
 
-                elif isinstance(candidate, dict):
-                    found.append(candidate)
+    def _poi_evidence(self, market_data):
 
-            if found:
-                evidence[timeframe] = found
-
-        return evidence or None
-
-    def _extract_displacement_evidence(self, market_data):
-
-        evidence = {}
+        output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            technical = self._safe_dict(
-                market_data.get(
-                    timeframe,
-                    {},
-                ).get("technical")
-            )
+            ta = self._ta(market_data, timeframe)
 
-            value = technical.get(
-                "displacement",
-                technical.get("displacement_evidence"),
-            )
-
-            if value:
-                evidence[timeframe] = value
-
-        return evidence or None
-
-    def _extract_fvg_evidence(self, market_data):
-
-        evidence = {}
-
-        for timeframe in self.TIMEFRAMES:
-
-            technical = self._safe_dict(
-                market_data.get(
-                    timeframe,
-                    {},
-                ).get("technical")
-            )
-
-            value = technical.get(
-                "fvg",
-                technical.get(
-                    "fvgs",
-                    technical.get("fair_value_gaps"),
+            output[timeframe] = {
+                "fvgs": self._list(
+                    ta.get(
+                        "fvgs",
+                        ta.get("fair_value_gaps", []),
+                    )
                 ),
-            )
+                "order_blocks": self._list(
+                    ta.get(
+                        "clean_order_blocks",
+                        ta.get("order_block_candidates", []),
+                    )
+                ),
+                "premium_discount": ta.get(
+                    "premium_discount"
+                ),
+                "support_resistance": ta.get(
+                    "support_resistance"
+                ),
+            }
 
-            if value:
-                evidence[timeframe] = value
+        return output
 
-        return evidence or None
+    # =========================================================
+    # LIQUIDITY EVIDENCE
+    # =========================================================
 
-    def _extract_structure_evidence(self, market_data):
+    def _liquidity_evidence(self, market_data):
 
-        evidence = {}
-
-        for timeframe in self.TIMEFRAMES:
-
-            technical = self._safe_dict(
-                market_data.get(
-                    timeframe,
-                    {},
-                ).get("technical")
-            )
-
-            structure = technical.get("structure")
-
-            if structure:
-                evidence[timeframe] = structure
-
-        return evidence or None
-
-    def _extract_liquidity_evidence(self, market_data):
-
-        evidence = {}
+        output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            technical = self._safe_dict(
-                market_data.get(
-                    timeframe,
-                    {},
-                ).get("technical")
+            ta = self._ta(market_data, timeframe)
+
+            output[timeframe] = {
+                "sweeps": self._list(
+                    ta.get("liquidity_sweeps")
+                ),
+                "equal_highs": self._list(
+                    ta.get("equal_highs")
+                ),
+                "equal_lows": self._list(
+                    ta.get("equal_lows")
+                ),
+                "swings": ta.get("swings"),
+            }
+
+        return output
+
+    # =========================================================
+    # DISPLACEMENT
+    # =========================================================
+
+    def _displacement_evidence(self, market_data):
+
+        output = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            ta = self._ta(market_data, timeframe)
+
+            displacement = ta.get(
+                "displacement",
+                ta.get("displacement_evidence"),
             )
 
-            liquidity = technical.get(
-                "liquidity",
-                technical.get("liquidity_evidence"),
-            )
+            if displacement is not None:
+                output[timeframe] = displacement
 
-            if liquidity:
-                evidence[timeframe] = liquidity
+        return output
 
-        return evidence or None
+    # =========================================================
+    # FVG EVIDENCE
+    # =========================================================
 
-    def _build_smc_analysis_evidence(
-        self,
-        market_data,
-        entry_evidence,
-        poi_evidence,
-        displacement_evidence,
-        fvg_evidence,
-        fundamentals,
-        risk_checks,
-        score_report,
-    ):
+    def _fvg_evidence(self, market_data):
 
         return {
-            "structure": self._extract_structure_evidence(
-                market_data
-            ),
-            "poi": poi_evidence,
-            "liquidity": self._extract_liquidity_evidence(
-                market_data
-            ),
-            "entry_models": entry_evidence,
-            "timeframe_alignment": {
-                "strategy_timeframes": list(self.TIMEFRAMES),
-                "H1": self._safe_dict(
-                    market_data.get("H1", {}).get("technical")
-                ),
-                "M5": self._safe_dict(
-                    market_data.get("M5", {}).get("technical")
-                ),
-                "M1": self._safe_dict(
-                    market_data.get("M1", {}).get("technical")
-                ),
-            },
-            "displacement": displacement_evidence,
-            "fvg": fvg_evidence,
-            "fundamentals": fundamentals,
-            "risk_checks": risk_checks,
-            "category_scores": score_report,
+            timeframe: self._list(
+                self._ta(market_data, timeframe).get(
+                    "fvgs",
+                    self._ta(market_data, timeframe).get(
+                        "fair_value_gaps",
+                        [],
+                    ),
+                )
+            )
+            for timeframe in self.TIMEFRAMES
         }
 
     # =========================================================
-    # FUNDAMENTAL ANALYSIS
+    # ENTRY EVIDENCE
+    # =========================================================
+
+    def _entry_evidence(self, market_data):
+
+        ta = self._ta(market_data, "M1")
+
+        return {
+            "timeframe": "M1",
+            "explicit_entry_models": ta.get(
+                "entry_models",
+                ta.get(
+                    "entry_evidence",
+                    ta.get("confirmed_entry_models"),
+                ),
+            ),
+            "structure_breaks": self._list(
+                ta.get("breaks")
+            ),
+            "liquidity_sweeps": self._list(
+                ta.get("liquidity_sweeps")
+            ),
+            "displacement": ta.get(
+                "displacement",
+                ta.get("displacement_evidence"),
+            ),
+            "fvgs": self._list(ta.get("fvgs")),
+            "order_blocks": self._list(
+                ta.get("clean_order_blocks")
+            ),
+            "candle_metrics": ta.get(
+                "candle_metrics"
+            ),
+            "momentum": ta.get("momentum"),
+            "bias": ta.get("bias"),
+            "direction": ta.get("direction"),
+        }
+
+    # =========================================================
+    # TIMEFRAME ALIGNMENT
+    # =========================================================
+
+    def _alignment_evidence(self, market_data):
+
+        biases = {}
+        details = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            ta = self._ta(market_data, timeframe)
+
+            bias = str(
+                ta.get("bias", "UNKNOWN")
+            ).upper()
+
+            biases[timeframe] = bias
+
+            details[timeframe] = {
+                "bias": bias,
+                "direction": ta.get("direction"),
+                "structure": ta.get("structure"),
+                "breaks": self._list(ta.get("breaks")),
+                "momentum": ta.get("momentum"),
+                "emas": ta.get("emas"),
+            }
+
+        h1 = biases["H1"]
+        m5 = biases["M5"]
+        m1 = biases["M1"]
+
+        directional = ("BULLISH", "BEARISH")
+
+        if (
+            h1 in directional
+            and m5 == h1
+            and m1 == h1
+        ):
+            state = "FULL_ALIGNMENT"
+
+        elif (
+            h1 in directional
+            and m5 == h1
+        ):
+            state = "H1_M5_ALIGNMENT"
+
+        elif (
+            h1 in directional
+            and m5 in directional
+            and h1 != m5
+        ):
+            state = "CONFLICT"
+
+        else:
+            state = "UNCONFIRMED"
+
+        return {
+            "strategy_timeframes": self.TIMEFRAMES,
+            "biases": biases,
+            "H1": details["H1"],
+            "M5": details["M5"],
+            "M1": details["M1"],
+            "alignment_state": state,
+            "aligned_direction": (
+                h1 if state == "FULL_ALIGNMENT" else None
+            ),
+            "evidence_only": True,
+        }
+
+    # =========================================================
+    # TRADE QUALITY / RISK EVIDENCE
+    # =========================================================
+
+    def _trade_quality_evidence(
+        self,
+        market_data,
+        current_price,
+        risk_checks,
+    ):
+
+        technical_metrics = {}
+
+        for timeframe in self.TIMEFRAMES:
+
+            ta = self._ta(market_data, timeframe)
+
+            technical_metrics[timeframe] = {
+                "atr": ta.get("atr"),
+                "rsi": ta.get("rsi"),
+                "emas": ta.get("emas"),
+                "momentum": ta.get("momentum"),
+                "candle_metrics": ta.get(
+                    "candle_metrics"
+                ),
+                "support_resistance": ta.get(
+                    "support_resistance"
+                ),
+                "premium_discount": ta.get(
+                    "premium_discount"
+                ),
+            }
+
+        return {
+            "current_price": current_price,
+            "technical_metrics": technical_metrics,
+            "risk_validation": risk_checks,
+            "risk_engine_available": (
+                self.risk_management_engine is not None
+            ),
+            "evidence_only": True,
+        }
+
+    # =========================================================
+    # FUNDAMENTALS
     # =========================================================
 
     async def _collect_fundamentals(
@@ -1025,14 +763,12 @@ class MarketScanner:
 
         if engine is None:
             return {
-                "status": "FUNDAMENTAL_ENGINE_UNAVAILABLE",
                 "available": False,
+                "status": "UNAVAILABLE",
                 "symbol": symbol,
-                "data": None,
             }
 
         method = None
-        method_name = None
 
         for name in (
             "analyze_instrument",
@@ -1040,80 +776,73 @@ class MarketScanner:
             "analyze",
             "analyse",
         ):
-
             candidate = getattr(engine, name, None)
 
             if callable(candidate):
                 method = candidate
-                method_name = name
                 break
 
         if method is None:
             return {
-                "status": "FUNDAMENTAL_METHOD_UNAVAILABLE",
                 "available": False,
+                "status": "METHOD_UNAVAILABLE",
                 "symbol": symbol,
-                "data": None,
             }
+
+        kwargs = self._filter_kwargs(
+            method,
+            {
+                "symbol": symbol,
+                "market_data": market_data,
+                "current_price": current_price,
+            },
+        )
 
         try:
 
-            try:
-
-                result = await self._invoke(
-                    method,
-                    symbol=symbol,
-                    market_data=market_data,
-                    current_price=current_price,
-                )
-
-            except TypeError:
-
-                result = await self._invoke(
-                    method,
-                    symbol,
-                )
+            result = await self._invoke(
+                method,
+                **kwargs,
+            )
 
             if isinstance(result, dict):
                 return {
-                    "status": result.get("status", "ANALYZED"),
                     "available": True,
+                    "status": result.get(
+                        "status",
+                        "ANALYZED",
+                    ),
                     "symbol": symbol,
                     "data": result,
+                    "score": result.get("score"),
                     "category_scores": result.get(
                         "category_scores",
                         {},
                     ),
-                    "score": result.get("score"),
-                    "engine_method": method_name,
                 }
 
             return {
-                "status": "INVALID_FUNDAMENTAL_RESULT",
                 "available": False,
+                "status": "INVALID_RESULT",
                 "symbol": symbol,
-                "data": None,
             }
 
         except Exception as exc:
 
-            logger.error(
-                "%s | Fundamental analysis failed: %s",
+            logger.exception(
+                "%s | Fundamental analysis error",
                 symbol,
-                exc,
-                exc_info=True,
             )
 
             return {
-                "status": "FUNDAMENTAL_ANALYSIS_ERROR",
                 "available": False,
+                "status": "ERROR",
                 "symbol": symbol,
                 "error": str(exc),
-                "data": None,
             }
 
     # =========================================================
-    # RISK MANAGEMENT
+    # RISK MANAGER
     # =========================================================
 
     async def _collect_risk_checks(
@@ -1127,13 +856,11 @@ class MarketScanner:
 
         if engine is None:
             return {
-                "status": "RISK_ENGINE_UNAVAILABLE",
                 "available": False,
-                "checks": None,
+                "status": "UNAVAILABLE",
             }
 
         method = None
-        method_name = None
 
         for name in (
             "check_trade",
@@ -1144,88 +871,342 @@ class MarketScanner:
             "analyse_risk",
             "get_risk_checks",
         ):
-
             candidate = getattr(engine, name, None)
 
             if callable(candidate):
                 method = candidate
-                method_name = name
                 break
 
         if method is None:
             return {
-                "status": "RISK_METHOD_UNAVAILABLE",
                 "available": False,
-                "checks": None,
+                "status": "METHOD_UNAVAILABLE",
             }
+
+        kwargs = self._filter_kwargs(
+            method,
+            {
+                "symbol": symbol,
+                "market_data": market_data,
+                "current_price": current_price,
+            },
+        )
 
         try:
 
-            try:
+            result = await self._invoke(
+                method,
+                **kwargs,
+            )
 
-                result = await self._invoke(
-                    method,
-                    symbol=symbol,
-                    market_data=market_data,
-                    current_price=current_price,
-                )
-
-            except TypeError:
-
-                result = await self._invoke(
-                    method,
-                    symbol,
-                    current_price,
-                )
-
-            if not isinstance(result, dict):
+            if isinstance(result, dict):
                 return {
-                    "status": "INVALID_RISK_RESULT",
-                    "available": False,
-                    "checks": None,
+                    "available": True,
+                    "status": result.get(
+                        "status",
+                        "CHECKS_RETURNED",
+                    ),
+                    "checks": result,
+                    "category_scores": result.get(
+                        "category_scores",
+                        {},
+                    ),
                 }
 
             return {
-                "status": result.get(
-                    "status",
-                    "CHECKS_RETURNED",
-                ),
-                "available": True,
-                "checks": result,
-                "category_scores": result.get(
-                    "category_scores",
-                    {},
-                ),
-                "engine_method": method_name,
+                "available": False,
+                "status": "INVALID_RESULT",
             }
 
         except Exception as exc:
 
-            logger.error(
-                "%s | Risk validation failed: %s",
+            logger.exception(
+                "%s | Risk manager check error",
                 symbol,
-                exc,
-                exc_info=True,
             )
 
             return {
-                "status": "RISK_VALIDATION_ERROR",
                 "available": False,
+                "status": "ERROR",
                 "error": str(exc),
-                "checks": None,
             }
 
     # =========================================================
-    # MASTER SMC ANALYSIS
+    # CATEGORY SCORES
     # =========================================================
 
-    async def _run_smc_analysis(
+    def _normalize_scores(self, source):
+
+        source = self._dict(source)
+
+        aliases = {
+            "structure": (
+                "structure",
+                "structure_score",
+            ),
+            "poi": (
+                "poi",
+                "poi_score",
+            ),
+            "liquidity": (
+                "liquidity",
+                "liquidity_score",
+            ),
+            "entry_models": (
+                "entry_models",
+                "entry_models_score",
+                "entry_score",
+            ),
+            "timeframe_alignment": (
+                "timeframe_alignment",
+                "timeframe_alignment_score",
+                "alignment_score",
+            ),
+            "fundamentals": (
+                "fundamentals",
+                "fundamental_score",
+                "fundamentals_score",
+            ),
+            "trade_quality_risk": (
+                "trade_quality_risk",
+                "trade_quality_score",
+                "risk_quality_score",
+            ),
+        }
+
+        scores = {}
+
+        for category, names in aliases.items():
+
+            for name in names:
+
+                if name not in source:
+                    continue
+
+                value = source[name]
+
+                if isinstance(value, dict):
+                    value = value.get("score")
+
+                value = self._number(value)
+
+                if value is not None and 0 <= value <= 100:
+                    scores[category] = value
+                    break
+
+        return scores
+
+    def _extract_category_scores(
+        self,
+        market_data,
+        fundamentals,
+        risk_checks,
+    ):
+
+        collected = {
+            category: []
+            for category in self.CATEGORIES
+        }
+
+        for timeframe in self.TIMEFRAMES:
+
+            ta = self._ta(market_data, timeframe)
+
+            for key in (
+                "category_scores",
+                "smc_category_scores",
+                "scoring",
+            ):
+
+                scores = self._normalize_scores(
+                    ta.get(key)
+                )
+
+                for category, score in scores.items():
+                    collected[category].append(score)
+
+        fundamental_data = self._dict(
+            fundamentals.get("data")
+        )
+
+        for source in (
+            fundamentals.get("category_scores"),
+            fundamental_data.get("category_scores"),
+        ):
+
+            scores = self._normalize_scores(source)
+
+            if "fundamentals" in scores:
+                collected["fundamentals"].append(
+                    scores["fundamentals"]
+                )
+
+        fundamental_score = self._number(
+            fundamentals.get(
+                "score",
+                fundamental_data.get("score"),
+            )
+        )
+
+        if (
+            fundamental_score is not None
+            and 0 <= fundamental_score <= 100
+            and not collected["fundamentals"]
+        ):
+            collected["fundamentals"].append(
+                fundamental_score
+            )
+
+        risk_data = self._dict(
+            risk_checks.get("checks")
+        )
+
+        for source in (
+            risk_checks.get("category_scores"),
+            risk_data.get("category_scores"),
+            risk_data.get("scoring"),
+        ):
+
+            scores = self._normalize_scores(source)
+
+            if "trade_quality_risk" in scores:
+                collected["trade_quality_risk"].append(
+                    scores["trade_quality_risk"]
+                )
+
+        final = {}
+
+        for category, values in collected.items():
+            if values:
+                final[category] = round(
+                    sum(values) / len(values),
+                    2,
+                )
+
+        missing = [
+            category
+            for category in self.CATEGORIES
+            if category not in final
+        ]
+
+        return {
+            "scores": final,
+            "category_count": len(final),
+            "required_category_count": len(
+                self.CATEGORIES
+            ),
+            "complete": not missing,
+            "missing_categories": missing,
+        }
+
+    # =========================================================
+    # EVIDENCE PACKAGE
+    # =========================================================
+
+    def _build_evidence_package(
+        self,
+        market_data,
+        current_price,
+        fundamentals,
+        risk_checks,
+    ):
+
+        structure = self._structure_evidence(
+            market_data
+        )
+
+        poi = self._poi_evidence(market_data)
+
+        liquidity = self._liquidity_evidence(
+            market_data
+        )
+
+        displacement = self._displacement_evidence(
+            market_data
+        )
+
+        fvg = self._fvg_evidence(market_data)
+
+        entry = self._entry_evidence(
+            market_data
+        )
+
+        alignment = self._alignment_evidence(
+            market_data
+        )
+
+        trade_quality_risk = (
+            self._trade_quality_evidence(
+                market_data,
+                current_price,
+                risk_checks,
+            )
+        )
+
+        category_evidence = {
+            "structure": structure,
+            "poi": poi,
+            "liquidity": liquidity,
+            "entry_models": entry,
+            "timeframe_alignment": alignment,
+            "fundamentals": fundamentals,
+            "trade_quality_risk": trade_quality_risk,
+        }
+
+        present = [
+            category
+            for category, evidence in category_evidence.items()
+            if self._has(evidence)
+        ]
+
+        missing = [
+            category
+            for category in self.CATEGORIES
+            if category not in present
+        ]
+
+        score_report = self._extract_category_scores(
+            market_data,
+            fundamentals,
+            risk_checks,
+        )
+
+        return {
+            "structure": structure,
+            "poi": poi,
+            "liquidity": liquidity,
+            "entry_models": entry,
+            "timeframe_alignment": alignment,
+            "fundamentals": fundamentals,
+            "trade_quality_risk": trade_quality_risk,
+
+            "displacement": displacement,
+            "fvg": fvg,
+
+            "risk_checks": risk_checks,
+            "category_scores": score_report,
+
+            "evidence_report": {
+                "present_categories": present,
+                "missing_categories": missing,
+                "category_count": len(present),
+                "required_category_count": 7,
+                "complete": not missing,
+            },
+        }
+
+    # =========================================================
+    # MASTER SMC ENGINE
+    # =========================================================
+
+    async def _run_smc(
         self,
         symbol,
         market_data,
         current_price,
         fundamentals,
         risk_checks,
+        evidence,
     ):
 
         engine = self.smc_engine
@@ -1237,159 +1218,86 @@ class MarketScanner:
                 "execution_authorized": False,
             }
 
-        method = getattr(engine, "analyse", None)
+        method = None
 
-        if not callable(method):
-            method = getattr(engine, "analyze", None)
+        for name in ("analyze", "analyse", "evaluate", "evaluate_setup"):
 
-        if not callable(method):
+            candidate = getattr(engine, name, None)
+
+            if callable(candidate):
+                method = candidate
+                break
+
+        if method is None:
             return {
                 "status": "SMC_METHOD_UNAVAILABLE",
                 "a_plus": False,
                 "execution_authorized": False,
             }
 
-        entry_evidence = self._extract_entry_evidence(
-            market_data
-        )
+        market_payload = dict(market_data)
 
-        poi_evidence = self._extract_poi_evidence(
-            market_data
-        )
+        market_payload["symbol"] = symbol
+        market_payload["current_price"] = current_price
+        market_payload["smc_analysis_evidence"] = evidence
 
-        displacement_evidence = (
-            self._extract_displacement_evidence(
-                market_data
-            )
-        )
-
-        fvg_evidence = self._extract_fvg_evidence(
-            market_data
-        )
-
-        score_report = self._extract_category_scores(
-            market_data,
-            fundamentals,
-            risk_checks,
-        )
-
-        category_scores = score_report["scores"]
-
-        analysis_evidence = self._build_smc_analysis_evidence(
-            market_data,
-            entry_evidence,
-            poi_evidence,
-            displacement_evidence,
-            fvg_evidence,
-            fundamentals,
-            risk_checks,
-            score_report,
-        )
-
-        # Attach symbol and complete evidence to the
-        # market-data payload for the Master SMC Engine.
-        smc_market_data = dict(market_data)
-        smc_market_data["symbol"] = symbol
-        smc_market_data["smc_analysis_evidence"] = (
-            analysis_evidence
-        )
-
-        # The SMC engine expects risk flags at the top level.
-        # Preserve the original risk report as well.
-        raw_risk_checks = self._safe_dict(
-            risk_checks.get("checks")
-        )
-
-        smc_risk_checks = dict(raw_risk_checks)
-
-        if not smc_risk_checks:
-            smc_risk_checks = dict(risk_checks)
-
-        smc_risk_checks["risk_engine_status"] = (
-            risk_checks.get("status")
-        )
-
-        smc_risk_checks["risk_engine_available"] = (
-            risk_checks.get("available", False)
-        )
-
-        smc_risk_checks["original_risk_report"] = (
-            risk_checks
-        )
-
-        logger.info(
-            "%s | SMC evidence prepared | "
-            "Categories=%s/7 | Missing=%s",
-            symbol,
-            score_report["category_count"],
-            score_report["missing_categories"],
-        )
-
-        logger.info(
-            "%s | SMC category scores: %s",
-            symbol,
-            category_scores,
-        )
-
-        arguments = {
-            "market_data": smc_market_data,
+        kwargs = {
+            "symbol": symbol,
+            "market_data": market_payload,
             "current_price": current_price,
-            "entry_evidence": entry_evidence,
-            "poi_evidence": poi_evidence,
-            "displacement_evidence": displacement_evidence,
-            "fvg_evidence": fvg_evidence,
-            "risk_checks": smc_risk_checks,
-            "category_scores": category_scores,
+            "entry_evidence": evidence["entry_models"],
+            "poi_evidence": evidence["poi"],
+            "displacement_evidence": evidence["displacement"],
+            "fvg_evidence": evidence["fvg"],
+            "liquidity_evidence": evidence["liquidity"],
+            "structure_evidence": evidence["structure"],
+            "timeframe_alignment": evidence["timeframe_alignment"],
+            "trade_quality_risk": evidence["trade_quality_risk"],
+            "risk_checks": risk_checks,
+            "category_scores": evidence["category_scores"],
             "fundamentals": fundamentals,
+            "evidence": evidence,
         }
+
+        filtered_kwargs = self._filter_kwargs(
+            method,
+            kwargs,
+        )
 
         try:
 
-            decision = await self._invoke(
+            result = await self._invoke(
                 method,
-                **arguments,
+                **filtered_kwargs,
             )
 
-            if not isinstance(decision, dict):
-                return {
-                    "status": "INVALID_SMC_RESPONSE",
-                    "a_plus": False,
-                    "execution_authorized": False,
-                    "category_scores": category_scores,
-                    "score_report": score_report,
-                }
+        except TypeError:
 
-            decision["scanner_category_scores"] = (
-                category_scores
+            # Compatibility with SMC engines that use
+            # positional market-data input.
+            result = await self._invoke(
+                method,
+                market_payload,
             )
 
-            decision["scanner_score_report"] = (
-                score_report
-            )
-
-            decision["smc_analysis_evidence"] = (
-                analysis_evidence
-            )
-
-            return decision
-
-        except Exception as exc:
-
-            logger.error(
-                "%s | SMC analysis failed: %s",
-                symbol,
-                exc,
-                exc_info=True,
-            )
-
-            return {
-                "status": "SMC_ANALYSIS_ERROR",
-                "error": str(exc),
-                "a_plus": False,
-                "execution_authorized": False,
-                "category_scores": category_scores,
-                "score_report": score_report,
+        if not isinstance(result, dict):
+            result = {
+                "status": "INVALID_SMC_RESULT",
+                "raw_result": result,
             }
+
+        result.setdefault("symbol", symbol)
+
+        result["scanner_version"] = self.VERSION
+        result["scanner_category_scores"] = (
+            evidence["category_scores"]
+        )
+        result["scanner_evidence_report"] = (
+            evidence["evidence_report"]
+        )
+        result["scanner_evidence"] = evidence
+
+        return result
 
     # =========================================================
     # SCAN ONE INSTRUMENT
@@ -1399,12 +1307,17 @@ class MarketScanner:
 
         if symbol not in self.INSTRUMENTS:
             raise ValueError(
-                "Instrument not approved for V1: " + str(symbol)
+                "Instrument is not approved for V1: "
+                + str(symbol)
             )
 
-        scan_started = time.time()
+        started = time.time()
 
-        logger.info("Scanning %s", symbol)
+        state = self.instrument_states[symbol]
+
+        state["status"] = "SCANNING"
+        state["last_error"] = None
+        state["last_scan"] = self._now()
 
         try:
 
@@ -1416,69 +1329,33 @@ class MarketScanner:
                 symbol
             )
 
-            valid_timeframes = []
-
-            for timeframe in self.TIMEFRAMES:
-
-                tf_data = market_data.get(
-                    timeframe,
-                    {},
+            # Require all approved strategy timeframes.
+            missing_tf = [
+                tf
+                for tf in self.TIMEFRAMES
+                if not self._list(
+                    self._dict(
+                        market_data.get(tf)
+                    ).get("candles")
                 )
+            ]
 
-                candles = tf_data.get("candles", [])
-
-                technical = self._safe_dict(
-                    tf_data.get("technical")
-                )
-
-                invalid_statuses = (
-                    "INSUFFICIENT_DATA",
-                    "NO_DATA",
-                    "ERROR",
-                    "FAILED",
-                    "CANDLE_RETRIEVAL_ERROR",
-                    "TECHNICAL_ANALYSIS_ERROR",
-                )
-
-                if (
-                    len(candles) >= 50
-                    and technical.get("status")
-                    not in invalid_statuses
-                ):
-                    valid_timeframes.append(timeframe)
-
-            if len(valid_timeframes) != 3:
+            if missing_tf:
 
                 result = {
                     "symbol": symbol,
-                    "status": "INSUFFICIENT_MARKET_DATA",
-                    "timestamp": self._utc_now(),
-                    "scan_duration": time.time() - scan_started,
+                    "status": "INCOMPLETE_MARKET_DATA",
+                    "missing_timeframes": missing_tf,
                     "current_price": current_price,
-                    "valid_timeframes": valid_timeframes,
                     "market_data": market_data,
-                    "setup_found": False,
                     "a_plus": False,
                     "execution_authorized": False,
+                    "timestamp": self._now(),
                 }
 
-                self._update_instrument_state(symbol, result)
-                return result
+                state["status"] = result["status"]
+                state["setup_found"] = False
 
-            if current_price is None:
-
-                result = {
-                    "symbol": symbol,
-                    "status": "LIVE_PRICE_UNAVAILABLE",
-                    "timestamp": self._utc_now(),
-                    "scan_duration": time.time() - scan_started,
-                    "market_data": market_data,
-                    "setup_found": False,
-                    "a_plus": False,
-                    "execution_authorized": False,
-                }
-
-                self._update_instrument_state(symbol, result)
                 return result
 
             fundamentals = await self._collect_fundamentals(
@@ -1493,93 +1370,117 @@ class MarketScanner:
                 current_price,
             )
 
-            decision = await self._run_smc_analysis(
-                symbol,
+            evidence = self._build_evidence_package(
                 market_data,
                 current_price,
                 fundamentals,
                 risk_checks,
             )
 
-            status = decision.get("status", "UNKNOWN")
+            report = evidence["category_scores"]
+            evidence_report = evidence["evidence_report"]
+
+            logger.info(
+                "%s | SMC evidence prepared | Evidence=%s/7 | Scores=%s/7 | Missing scores=%s | Missing evidence=%s",
+                symbol,
+                evidence_report["category_count"],
+                report["category_count"],
+                report["missing_categories"],
+                evidence_report["missing_categories"],
+            )
+
+            logger.info(
+                "%s | Category scores: %s",
+                symbol,
+                report["scores"],
+            )
+
+            smc_result = await self._run_smc(
+                symbol,
+                market_data,
+                current_price,
+                fundamentals,
+                risk_checks,
+                evidence,
+            )
+
+            status = str(
+                smc_result.get("status", "UNKNOWN")
+            ).upper()
 
             a_plus = (
                 status == "A_PLUS_SETUP"
-                and decision.get("a_plus") is True
+                and smc_result.get("a_plus") is True
             )
 
-            execution_authorized = (
-                decision.get("execution_authorized") is True
-            )
-
-            score_report = self._safe_dict(
-                decision.get("scanner_score_report")
-            )
-
-            category_scores = self._safe_dict(
-                decision.get("scanner_category_scores")
+            authorization = (
+                smc_result.get(
+                    "execution_authorized",
+                    smc_result.get(
+                        "trade_authorized",
+                        False,
+                    ),
+                )
+                is True
             )
 
             result = {
                 "symbol": symbol,
                 "status": status,
-                "timestamp": self._utc_now(),
-                "scan_duration": time.time() - scan_started,
+                "timestamp": self._now(),
+                "scan_duration": round(
+                    time.time() - started,
+                    3,
+                ),
                 "current_price": current_price,
                 "market_data": market_data,
                 "fundamentals": fundamentals,
                 "risk_checks": risk_checks,
-                "smc_decision": decision,
-                "smc_analysis_evidence": decision.get(
-                    "smc_analysis_evidence"
-                ),
-                "category_scores": category_scores,
-                "score_report": score_report,
-                "score_complete": score_report.get(
-                    "complete",
-                    False,
-                ),
-                "missing_score_categories": score_report.get(
-                    "missing_categories",
-                    [],
-                ),
-                "setup_found": a_plus,
+                "evidence": evidence,
+                "category_scores": report["scores"],
+                "category_score_report": report,
+                "evidence_report": evidence_report,
+                "smc_result": smc_result,
                 "a_plus": a_plus,
-                "a_plus_score": decision.get(
-                    "score",
-                    decision.get("a_plus_score", 0),
-                ),
-                "setup_direction": decision.get("direction"),
-                "setup_type": decision.get(
-                    "pathway",
-                    decision.get("setup_type"),
-                ),
-                "execution_authorized": execution_authorized,
-                "execution_payload": decision.get(
-                    "execution_payload"
-                ),
+                "setup_found": a_plus,
+                "execution_authorized": authorization,
             }
 
-            self._update_instrument_state(
-                symbol,
-                result,
-            )
+            state.update({
+                "status": status,
+                "last_scan": result["timestamp"],
+                "last_price": current_price,
+                "setup_found": a_plus,
+                "setup_direction": smc_result.get(
+                    "direction"
+                ),
+                "setup_type": smc_result.get(
+                    "setup_type"
+                ),
+                "a_plus_score": smc_result.get(
+                    "score",
+                    smc_result.get("a_plus_score", 0),
+                ),
+                "category_scores": report["scores"],
+                "evidence_complete": evidence_report[
+                    "complete"
+                ],
+                "execution_authorized": authorization,
+                "last_error": None,
+            })
 
             if a_plus:
-
-                logger.warning(
-                    "A+ SETUP | %s | Direction=%s "
-                    "| Pathway=%s | Score=%s "
-                    "| ExecutionAuthorized=%s",
+                logger.info(
+                    "%s | A+ SETUP | Direction=%s | Score=%s | Authorized=%s",
                     symbol,
-                    result["setup_direction"],
-                    result["setup_type"],
-                    result["a_plus_score"],
-                    execution_authorized,
+                    smc_result.get("direction"),
+                    smc_result.get(
+                        "score",
+                        smc_result.get("a_plus_score"),
+                    ),
+                    authorization,
                 )
-
             else:
-
                 logger.info(
                     "%s | Status=%s | No A+ setup",
                     symbol,
@@ -1588,116 +1489,49 @@ class MarketScanner:
 
             return result
 
-        except asyncio.CancelledError:
-            raise
-
         except Exception as exc:
 
             self.error_count += 1
 
-            logger.error(
-                "Scan failed for %s: %s",
+            logger.exception(
+                "%s | Instrument scan failed",
                 symbol,
-                exc,
-                exc_info=True,
             )
 
-            result = {
+            state.update({
+                "status": "SCAN_ERROR",
+                "last_error": str(exc),
+                "last_scan": self._now(),
+                "setup_found": False,
+                "execution_authorized": False,
+            })
+
+            return {
                 "symbol": symbol,
                 "status": "SCAN_ERROR",
-                "timestamp": self._utc_now(),
                 "error": str(exc),
-                "traceback": traceback.format_exc(),
-                "setup_found": False,
+                "traceback": traceback.format_exc()
+                if False else None,
+                "timestamp": self._now(),
                 "a_plus": False,
                 "execution_authorized": False,
             }
 
-            self._update_instrument_state(
-                symbol,
-                result,
-            )
-
-            return result
-
     # =========================================================
-    # STATE MANAGEMENT
-    # =========================================================
-
-    def _update_instrument_state(
-        self,
-        symbol,
-        result,
-    ):
-
-        with self._lock:
-
-            fundamentals = self._safe_dict(
-                result.get("fundamentals")
-            )
-
-            risk = self._safe_dict(
-                result.get("risk_checks")
-            )
-
-            self.instrument_states[symbol].update(
-                {
-                    "status": result.get("status"),
-                    "last_scan": result.get("timestamp"),
-                    "last_price": result.get("current_price"),
-                    "last_error": result.get("error"),
-                    "setup_found": result.get(
-                        "setup_found",
-                        False,
-                    ),
-                    "setup_direction": result.get(
-                        "setup_direction"
-                    ),
-                    "setup_type": result.get("setup_type"),
-                    "a_plus_score": result.get(
-                        "a_plus_score",
-                        0,
-                    ),
-                    "category_scores": result.get(
-                        "category_scores",
-                        {},
-                    ),
-                    "score_complete": result.get(
-                        "score_complete",
-                        False,
-                    ),
-                    "execution_authorized": result.get(
-                        "execution_authorized",
-                        False,
-                    ),
-                    "fundamental_status": fundamentals.get(
-                        "status",
-                        "NOT_ANALYZED",
-                    ),
-                    "risk_status": risk.get(
-                        "status",
-                        "NOT_ANALYZED",
-                    ),
-                }
-            )
-
-            self.last_scan_results[symbol] = result
-
-    # =========================================================
-    # SCAN ALL INSTRUMENTS
+    # SCAN ALL
     # =========================================================
 
     async def scan_all(self):
 
-        scan_started = time.time()
-
+        started = time.time()
         results = {}
 
-        logger.info("Starting Vrotex V1 full scan")
+        logger.info(
+            "Full scan started | Instruments=%s",
+            len(self.INSTRUMENTS),
+        )
 
-        # Sequential scanning is preserved to protect
-        # phone-hosted runtime resources.
-
+        # Sequential scanning is retained for the phone host.
         for symbol in self.INSTRUMENTS:
 
             if self._stop_event.is_set():
@@ -1707,12 +1541,14 @@ class MarketScanner:
                 symbol
             )
 
-        with self._lock:
+        duration = round(
+            time.time() - started,
+            3,
+        )
 
-            self.scan_count += 1
-            self.last_scan_time = self._utc_now()
-
-        duration = time.time() - scan_started
+        self.last_scan_time = self._now()
+        self.last_scan_results = results
+        self.scan_count += 1
 
         logger.info(
             "Full scan completed | Instruments=%s | Duration=%.2fs",
@@ -1720,27 +1556,13 @@ class MarketScanner:
             duration,
         )
 
-        return {
-            "timestamp": self._utc_now(),
-            "scan_number": self.scan_count,
-            "duration": duration,
-            "instruments_scanned": len(results),
-            "results": results,
-        }
+        return results
 
     # =========================================================
     # CONTINUOUS SCANNER
     # =========================================================
 
     async def run(self):
-
-        if self.running:
-
-            logger.warning(
-                "Scanner is already running"
-            )
-
-            return
 
         self.running = True
         self._stop_event.clear()
@@ -1752,63 +1574,41 @@ class MarketScanner:
 
         try:
 
-            while not self._stop_event.is_set():
+            while self.running and not self._stop_event.is_set():
 
-                scan_started = time.time()
+                cycle_started = time.time()
 
-                try:
+                await self.scan_all()
 
-                    await self.scan_all()
+                elapsed = time.time() - cycle_started
 
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception:
-
-                    self.error_count += 1
-
-                    logger.error(
-                        "Full scan cycle failed",
-                        exc_info=True,
-                    )
-
-                elapsed = time.time() - scan_started
-
-                remaining = max(
+                wait_time = max(
                     0,
                     self.scan_interval - elapsed,
                 )
 
-                if remaining > 0:
+                if self._stop_event.is_set():
+                    break
 
-                    try:
+                await asyncio.sleep(wait_time)
 
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self._stop_event.wait
-                            ),
-                            timeout=remaining,
-                        )
+        except asyncio.CancelledError:
+            logger.info("Market Scanner cancelled")
+            raise
 
-                    except asyncio.TimeoutError:
-                        pass
+        except Exception:
+            logger.exception("Scanner loop failure")
 
         finally:
-
             self.running = False
-
             logger.info("Market Scanner stopped")
 
-    # =========================================================
-    # STOP
-    # =========================================================
+    def stop(self):
 
-    async def stop(self):
-
-        logger.info("Stopping Market Scanner")
-
-        self._stop_event.set()
         self.running = False
+        self._stop_event.set()
+
+        logger.info("Market Scanner stop requested")
 
     # =========================================================
     # STATUS
@@ -1822,39 +1622,23 @@ class MarketScanner:
                 "version": self.VERSION,
                 "running": self.running,
                 "scan_interval": self.scan_interval,
-                "instruments": self.INSTRUMENTS,
-                "timeframes": self.TIMEFRAMES,
-                "categories": self.CATEGORIES,
+                "instruments": list(self.INSTRUMENTS),
+                "timeframes": list(self.TIMEFRAMES),
+                "last_scan_time": self.last_scan_time,
                 "scan_count": self.scan_count,
                 "error_count": self.error_count,
-                "last_scan_time": self.last_scan_time,
-                "instrument_states": {
-                    symbol: state.copy()
-                    for symbol, state in self.instrument_states.items()
-                },
+                "instrument_states": self.instrument_states,
             }
-
-    # =========================================================
-    # LAST RESULTS
-    # =========================================================
 
     def get_last_scan_results(self):
 
         with self._lock:
-
-            return {
-                symbol: result.copy()
-                for symbol, result in self.last_scan_results.items()
-            }
+            return self.last_scan_results
 
 
 # =============================================================
-# SINGLETON - PRESERVE EXISTING ENGINE INTERFACE
+# SHARED INSTANCE
 # =============================================================
 
 market_scanner = MarketScanner()
-
-# Existing engine.py requires:
-#     from scanner import scanner
-
 scanner = market_scanner
