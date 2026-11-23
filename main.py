@@ -3,6 +3,7 @@ import asyncio
 import os
 import signal
 import sys
+import inspect
 
 import uvicorn
 
@@ -23,6 +24,8 @@ class VrotexBot:
         self.engine_task = None
         self.http_server = None
         self.engine_control_lock = asyncio.Lock()
+
+        self.trade_manager_started = False
 
     async def initialize(self):
 
@@ -46,8 +49,90 @@ class VrotexBot:
 
         logger.info("Strategy: H1 -> M5 -> M1")
 
-        # Application lifecycle, independent of engine lifecycle.
         self.running = True
+
+    # ==========================================================
+    # TRADE MANAGER LIFECYCLE
+    # ==========================================================
+
+    async def start_trade_manager(self):
+
+        if self.trade_manager_started:
+            return True
+
+        try:
+
+            from trade_management import trade_manager
+
+            start_method = getattr(
+                trade_manager,
+                "start",
+                None,
+            )
+
+            if not callable(start_method):
+                raise RuntimeError(
+                    "Trade Manager start method unavailable"
+                )
+
+            result = start_method()
+
+            if inspect.isawaitable(result):
+                await result
+
+            self.trade_manager_started = True
+
+            logger.info(
+                "Trade Manager started successfully."
+            )
+
+            return True
+
+        except Exception:
+
+            logger.exception(
+                "Trade Manager startup failed."
+            )
+
+            return False
+
+    async def stop_trade_manager(self):
+
+        if not self.trade_manager_started:
+            return
+
+        try:
+
+            from trade_management import trade_manager
+
+            stop_method = getattr(
+                trade_manager,
+                "stop",
+                None,
+            )
+
+            if callable(stop_method):
+
+                result = stop_method()
+
+                if inspect.isawaitable(result):
+                    await result
+
+            self.trade_manager_started = False
+
+            logger.info(
+                "Trade Manager stopped successfully."
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Trade Manager shutdown failed."
+            )
+
+    # ==========================================================
+    # ENGINE STATUS
+    # ==========================================================
 
     def is_engine_running(self):
 
@@ -64,6 +149,10 @@ class VrotexBot:
         except Exception:
             return False
 
+    # ==========================================================
+    # ENGINE START
+    # ==========================================================
+
     async def start_engine(self):
 
         async with self.engine_control_lock:
@@ -77,10 +166,17 @@ class VrotexBot:
 
             if self.is_engine_running():
 
+                await self.start_trade_manager()
+
                 return {
                     "success": True,
                     "running": True,
                     "status": "RUNNING",
+                    "trade_manager": (
+                        "RUNNING"
+                        if self.trade_manager_started
+                        else "STARTUP_FAILED"
+                    ),
                     "message": "Trading engine is already running.",
                 }
 
@@ -100,7 +196,6 @@ class VrotexBot:
                 "Starting Vrotex trading engine."
             )
 
-            # Prevent an old startup result from being reused.
             engine.startup_event.clear()
 
             self.engine_task = asyncio.create_task(
@@ -110,8 +205,6 @@ class VrotexBot:
 
             try:
 
-                # Wait for actual engine initialization,
-                # not merely task creation.
                 await asyncio.wait_for(
                     engine.startup_event.wait(),
                     timeout=300,
@@ -133,7 +226,6 @@ class VrotexBot:
                     ),
                 }
 
-            # Check whether the task failed or exited.
             if self.engine_task.done():
 
                 exception = self.engine_task.exception()
@@ -180,12 +272,28 @@ class VrotexBot:
                     "engine": status,
                 }
 
+            # Start position monitoring after the engine
+            # has completed startup and its broker connection
+            # initialization.
+            manager_started = await self.start_trade_manager()
+
             return {
                 "success": True,
                 "running": True,
                 "status": "RUNNING",
-                "message": "Trading engine initialized successfully.",
+                "trade_manager": (
+                    "RUNNING"
+                    if manager_started
+                    else "STARTUP_FAILED"
+                ),
+                "message": (
+                    "Trading engine initialized successfully."
+                ),
             }
+
+    # ==========================================================
+    # ENGINE STOP
+    # ==========================================================
 
     async def stop_engine(self):
 
@@ -267,6 +375,10 @@ class VrotexBot:
                 "message": "Trading engine stopped.",
             }
 
+    # ==========================================================
+    # SERVICE START
+    # ==========================================================
+
     async def start(self):
 
         await self.initialize()
@@ -341,6 +453,10 @@ class VrotexBot:
 
             await self.stop()
 
+    # ==========================================================
+    # SERVICE STOP
+    # ==========================================================
+
     async def stop(self):
 
         if not self.running and self.http_server is None:
@@ -362,6 +478,9 @@ class VrotexBot:
             logger.exception(
                 "Engine shutdown failed."
             )
+
+        # Stop Trade Manager after engine shutdown.
+        await self.stop_trade_manager()
 
         if self.http_server:
 
