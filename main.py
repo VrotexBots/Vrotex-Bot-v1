@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import signal
@@ -45,16 +46,23 @@ class VrotexBot:
 
         logger.info("Strategy: H1 -> M5 -> M1")
 
-        # This flag represents the application/web-service lifecycle.
-        # The trading engine has its own independent lifecycle.
+        # Application lifecycle, independent of engine lifecycle.
         self.running = True
 
     def is_engine_running(self):
 
-        return bool(
-            self.engine_task
-            and not self.engine_task.done()
-        )
+        try:
+
+            from engine import engine
+
+            return bool(
+                self.engine_task is not None
+                and not self.engine_task.done()
+                and engine.running
+            )
+
+        except Exception:
+            return False
 
     async def start_engine(self):
 
@@ -65,37 +73,73 @@ class VrotexBot:
                     "The Vrotex service is shutting down."
                 )
 
-            if self.is_engine_running():
+            from engine import engine
 
-                logger.info(
-                    "Trading engine is already running."
-                )
+            if self.is_engine_running():
 
                 return {
                     "success": True,
                     "running": True,
+                    "status": "RUNNING",
                     "message": "Trading engine is already running.",
                 }
 
-            from engine import engine
+            if (
+                self.engine_task is not None
+                and not self.engine_task.done()
+            ):
+
+                return {
+                    "success": False,
+                    "running": False,
+                    "status": engine.status,
+                    "message": "Trading engine startup is already in progress.",
+                }
 
             logger.info(
                 "Starting Vrotex trading engine."
             )
+
+            # Prevent an old startup result from being reused.
+            engine.startup_event.clear()
 
             self.engine_task = asyncio.create_task(
                 engine.start(),
                 name="vrotex-trading-engine",
             )
 
-            # Allow the engine task to begin and surface immediate startup errors.
-            await asyncio.sleep(0)
+            try:
 
+                # Wait for actual engine initialization,
+                # not merely task creation.
+                await asyncio.wait_for(
+                    engine.startup_event.wait(),
+                    timeout=300,
+                )
+
+            except asyncio.TimeoutError:
+
+                logger.error(
+                    "Trading engine startup timed out."
+                )
+
+                return {
+                    "success": False,
+                    "running": False,
+                    "status": "STARTUP_TIMEOUT",
+                    "message": (
+                        "Engine initialization did not complete "
+                        "within 300 seconds. Check Live Logs."
+                    ),
+                }
+
+            # Check whether the task failed or exited.
             if self.engine_task.done():
 
                 exception = self.engine_task.exception()
 
                 if exception is not None:
+
                     logger.error(
                         "Trading engine failed during startup.",
                         exc_info=(
@@ -104,24 +148,43 @@ class VrotexBot:
                             exception.__traceback__,
                         ),
                     )
-                    raise RuntimeError(
-                        "Trading engine failed during startup."
-                    ) from exception
 
-                logger.warning(
-                    "Trading engine exited during startup."
-                )
+                    return {
+                        "success": False,
+                        "running": False,
+                        "status": "STARTUP_ERROR",
+                        "message": str(exception),
+                    }
+
+            status = engine.get_status()
+
+            successful = (
+                status.get("startup_success") is True
+                and status.get("running") is True
+                and self.is_engine_running()
+            )
+
+            if not successful:
 
                 return {
                     "success": False,
                     "running": False,
-                    "message": "Trading engine exited during startup. Check Live Logs.",
+                    "status": status.get(
+                        "status",
+                        "STARTUP_FAILED",
+                    ),
+                    "message": (
+                        status.get("startup_error")
+                        or "Trading engine initialization failed."
+                    ),
+                    "engine": status,
                 }
 
             return {
                 "success": True,
                 "running": True,
-                "message": "Trading engine start requested.",
+                "status": "RUNNING",
+                "message": "Trading engine initialized successfully.",
             }
 
     async def stop_engine(self):
@@ -130,18 +193,26 @@ class VrotexBot:
 
             from engine import engine
 
-            if not self.is_engine_running():
+            task = self.engine_task
 
-                logger.info(
-                    "Trading engine is already stopped."
-                )
+            if task is None:
+
+                return {
+                    "success": True,
+                    "running": False,
+                    "status": engine.status,
+                    "message": "Trading engine is already stopped.",
+                }
+
+            if task.done():
 
                 self.engine_task = None
 
                 return {
                     "success": True,
                     "running": False,
-                    "message": "Trading engine is already stopped.",
+                    "status": engine.status,
+                    "message": "Trading engine has exited.",
                 }
 
             logger.info(
@@ -152,6 +223,30 @@ class VrotexBot:
 
                 await engine.stop()
 
+                await asyncio.wait_for(
+                    task,
+                    timeout=15,
+                )
+
+            except asyncio.TimeoutError:
+
+                logger.warning(
+                    "Trading engine did not stop within 15 seconds; cancelling its task."
+                )
+
+                task.cancel()
+
+                await asyncio.gather(
+                    task,
+                    return_exceptions=True,
+                )
+
+            except asyncio.CancelledError:
+
+                logger.info(
+                    "Trading engine task cancelled."
+                )
+
             except Exception:
 
                 logger.exception(
@@ -160,40 +255,15 @@ class VrotexBot:
 
                 raise
 
-            if (
-                self.engine_task
-                and not self.engine_task.done()
-            ):
+            finally:
 
-                try:
-
-                    await asyncio.wait_for(
-                        self.engine_task,
-                        timeout=15,
-                    )
-
-                except asyncio.TimeoutError:
-
-                    logger.warning(
-                        "Trading engine did not stop within 15 seconds; cancelling its task."
-                    )
-
-                    self.engine_task.cancel()
-
-                    await asyncio.gather(
-                        self.engine_task,
-                        return_exceptions=True,
-                    )
-
-            self.engine_task = None
-
-            logger.info(
-                "Vrotex trading engine stopped."
-            )
+                if task.done():
+                    self.engine_task = None
 
             return {
                 "success": True,
                 "running": False,
+                "status": engine.status,
                 "message": "Trading engine stopped.",
             }
 
@@ -240,10 +310,10 @@ class VrotexBot:
 
         try:
 
-            # Preserve the existing automatic engine startup behavior.
+            # Preserve automatic engine startup.
+            # The dashboard server runs independently.
             await self.start_engine()
 
-            # The web server remains alive independently of the engine.
             done, _ = await asyncio.wait(
                 [
                     server_task,
@@ -254,7 +324,6 @@ class VrotexBot:
 
             if server_task in done:
 
-                # A web-server exit is a service-level event.
                 await server_task
 
                 logger.error(
