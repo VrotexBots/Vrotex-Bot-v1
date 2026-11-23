@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import logging
 import math
 
 from collections import deque
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -544,54 +545,55 @@ def create_app(bot: Any) -> FastAPI:
                 detail="Unsupported chart timeframe",
             )
 
-        timeframe_seconds = {
-            "M1": 60,
-            "M5": 300,
-            "M15": 900,
-            "M30": 1800,
-            "H1": 3600,
-            "H4": 14400,
-            "D1": 86400,
-        }
-
         try:
 
             from market_data_engine import market_data_engine
 
-            raw = await asyncio.to_thread(
-                market_data_engine._get_recent_candles,
-                symbol,
-                timeframe,
-                "bid",
-                count,
+            candle_method = getattr(
+                market_data_engine,
+                "get_recent_candles",
+                None,
             )
+
+            if not callable(candle_method):
+
+                raise RuntimeError(
+                    "Market-data engine does not provide "
+                    "get_recent_candles()"
+                )
+
+            # The actual market-data method accepts:
+            # symbol, timeframe, count, price_type.
+            #
+            # Support both synchronous and asynchronous
+            # implementations without blocking the API loop.
+
+            if inspect.iscoroutinefunction(candle_method):
+
+                raw = await candle_method(
+                    symbol,
+                    timeframe,
+                    count=count,
+                    price_type="bid",
+                )
+
+            else:
+
+                raw = await asyncio.to_thread(
+                    candle_method,
+                    symbol,
+                    timeframe,
+                    count=count,
+                    price_type="bid",
+                )
+
+                if inspect.isawaitable(raw):
+                    raw = await raw
 
             bars = normalize_chart_candles(raw)
 
-            if len(bars) < count:
-
-                end = datetime.now(timezone.utc)
-
-                start = end - timedelta(
-                    seconds=(
-                        timeframe_seconds[timeframe]
-                        * count
-                    )
-                )
-
-                fetched = await asyncio.to_thread(
-                    market_data_engine.get_historical_candles,
-                    symbol,
-                    timeframe,
-                    start,
-                    end,
-                    "bid",
-                )
-
-                bars = normalize_chart_candles(
-                    list(raw or [])
-                    + list(fetched or [])
-                )[-count:]
+            # Return only the requested number of candles.
+            bars = bars[-count:]
 
             return {
                 "symbol": symbol,
@@ -601,7 +603,7 @@ def create_app(bot: Any) -> FastAPI:
                 "count": len(bars),
 
                 "source": (
-                    "SQLITE_CACHE_AND_EXNESS"
+                    "MARKET_DATA_ENGINE"
                     if bars
                     else "UNAVAILABLE"
                 ),
@@ -609,7 +611,7 @@ def create_app(bot: Any) -> FastAPI:
                 "message": (
                     None
                     if bars
-                    else "No historical candles available from cache or Exness"
+                    else "No historical candles available from the market-data engine"
                 ),
             }
 
@@ -1238,8 +1240,16 @@ async def control(
 
             result = await start_method()
 
-            running = bool(
-                getattr(bot, "is_engine_running")()
+            is_running_method = getattr(
+                bot,
+                "is_engine_running",
+                None,
+            )
+
+            running = (
+                bool(is_running_method())
+                if callable(is_running_method)
+                else False
             )
 
             if isinstance(result, dict):
