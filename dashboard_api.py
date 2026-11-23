@@ -104,99 +104,209 @@ def make_json_safe(value: Any) -> Any:
 
 
 # ============================================================
-# LIVE TICK EXTRACTION
+# ENGINE METHOD EXECUTION
+# Supports synchronous and asynchronous engine methods.
 # ============================================================
 
-def get_engine_tick(engine, symbol: str):
+async def call_engine_method(
+    method,
+    *args,
+    **kwargs,
+):
 
-    ticks = getattr(
-        engine,
-        "last_tick_by_instrument",
+    if not callable(method):
+        raise RuntimeError(
+            "Requested market-data method is unavailable"
+        )
+
+    if inspect.iscoroutinefunction(method):
+
+        return await method(
+            *args,
+            **kwargs,
+        )
+
+    result = await asyncio.to_thread(
+        method,
+        *args,
+        **kwargs,
+    )
+
+    if inspect.isawaitable(result):
+        result = await result
+
+    return result
+
+
+# ============================================================
+# LIVE TICK EXTRACTION
+# Uses the actual MarketDataEngine live-tick interface.
+# ============================================================
+
+async def get_engine_tick(
+    market_engine,
+    symbol: str,
+):
+
+    symbol = symbol.upper().strip()
+
+    get_tick = getattr(
+        market_engine,
+        "get_live_tick",
         None,
     )
 
-    if isinstance(ticks, dict):
-
-        tick = (
-            ticks.get(symbol)
-            or ticks.get(symbol.upper())
+    if not callable(get_tick):
+        raise RuntimeError(
+            "MarketDataEngine.get_live_tick is unavailable"
         )
 
-        if isinstance(tick, dict):
+    raw_tick = await call_engine_method(
+        get_tick,
+        symbol,
+    )
 
-            result = dict(tick)
+    if raw_tick is None:
+        return None
 
-            stamp = result.get("timestamp")
+    tick = make_json_safe(raw_tick)
 
-            try:
+    if not isinstance(tick, dict):
+        raise RuntimeError(
+            "Live tick returned an unexpected payload"
+        )
 
-                if isinstance(stamp, str):
+    result = dict(tick)
 
-                    dt = datetime.fromisoformat(
-                        stamp.replace("Z", "+00:00")
-                    )
+    bid = result.get("bid")
+    ask = result.get("ask")
 
-                    if dt.tzinfo is None:
-                        dt = dt.replace(
-                            tzinfo=timezone.utc
-                        )
+    try:
 
-                    age = max(
-                        0.0,
-                        (
-                            datetime.now(timezone.utc)
-                            - dt.astimezone(timezone.utc)
-                        ).total_seconds(),
-                    )
+        bid = float(bid)
+        ask = float(ask)
 
-                elif isinstance(stamp, (int, float)):
-
-                    seconds = float(stamp)
-
-                    if seconds > 100_000_000_000:
-                        seconds /= 1000
-
-                    age = max(
-                        0.0,
-                        datetime.now(timezone.utc).timestamp()
-                        - seconds,
-                    )
-
-                else:
-                    age = None
-
-            except Exception:
-                age = None
-
-            result["age_seconds"] = age
-
-            result["fresh"] = (
-                age is not None and age <= 120
+        if not (
+            math.isfinite(bid)
+            and math.isfinite(ask)
+            and bid > 0
+            and ask > 0
+            and ask >= bid
+        ):
+            raise ValueError(
+                "Invalid bid/ask values"
             )
 
-            if (
-                result.get("bid") is not None
-                and result.get("ask") is not None
-            ):
+    except (TypeError, ValueError, OverflowError):
 
-                result["mid"] = (
-                    float(result["bid"])
-                    + float(result["ask"])
-                ) / 2
+        result["bid"] = None
+        result["ask"] = None
+        result["mid"] = None
+        result["spread"] = None
+        result["fresh"] = False
+        result["reason"] = "INVALID LIVE QUOTE"
 
-                result["spread"] = (
-                    float(result["ask"])
-                    - float(result["bid"])
+        return result
+
+    result["bid"] = bid
+    result["ask"] = ask
+
+    result["mid"] = (bid + ask) / 2
+    result["spread"] = ask - bid
+
+    # --------------------------------------------------------
+    # Determine quote age where a timestamp is available.
+    # --------------------------------------------------------
+
+    age = result.get(
+        "age_seconds",
+        result.get("age"),
+    )
+
+    stamp = result.get(
+        "timestamp",
+        result.get("time"),
+    )
+
+    if age is None and stamp is not None:
+
+        try:
+
+            if isinstance(stamp, str):
+
+                dt = datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00")
                 )
 
-            else:
+                if dt.tzinfo is None:
+                    dt = dt.replace(
+                        tzinfo=timezone.utc
+                    )
 
-                result["mid"] = None
-                result["spread"] = None
+                age = max(
+                    0.0,
+                    (
+                        datetime.now(timezone.utc)
+                        - dt.astimezone(timezone.utc)
+                    ).total_seconds(),
+                )
 
-            return result
+            elif isinstance(stamp, (int, float)):
 
-    return None
+                seconds = float(stamp)
+
+                if seconds > 100_000_000_000:
+                    seconds /= 1000.0
+
+                age = max(
+                    0.0,
+                    datetime.now(timezone.utc).timestamp()
+                    - seconds,
+                )
+
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            age = None
+
+    if age is not None:
+
+        try:
+            age = max(0.0, float(age))
+
+            if not math.isfinite(age):
+                age = None
+
+        except (TypeError, ValueError, OverflowError):
+            age = None
+
+    result["age_seconds"] = age
+
+    # Respect the market-data engine's freshness decision
+    # when it supplies one. Otherwise calculate from age.
+    source_fresh = result.get("fresh")
+
+    if source_fresh is not None:
+
+        fresh = bool(source_fresh)
+
+    else:
+
+        fresh = (
+            age is not None
+            and age <= 120
+        )
+
+    result["fresh"] = fresh
+
+    if not fresh:
+        result["reason"] = "STALE / MARKET CLOSED"
+    else:
+        result["reason"] = None
+
+    return result
 
 
 # ============================================================
@@ -549,51 +659,26 @@ def create_app(bot: Any) -> FastAPI:
 
             from market_data_engine import market_data_engine
 
-            candle_method = getattr(
+            get_candles = getattr(
                 market_data_engine,
                 "get_recent_candles",
                 None,
             )
 
-            if not callable(candle_method):
-
+            if not callable(get_candles):
                 raise RuntimeError(
-                    "Market-data engine does not provide "
-                    "get_recent_candles()"
+                    "MarketDataEngine.get_recent_candles is unavailable"
                 )
 
-            # The actual market-data method accepts:
-            # symbol, timeframe, count, price_type.
-            #
-            # Support both synchronous and asynchronous
-            # implementations without blocking the API loop.
+            raw = await call_engine_method(
+                get_candles,
+                symbol,
+                timeframe,
+                count=count,
+                price_type="bid",
+            )
 
-            if inspect.iscoroutinefunction(candle_method):
-
-                raw = await candle_method(
-                    symbol,
-                    timeframe,
-                    count=count,
-                    price_type="bid",
-                )
-
-            else:
-
-                raw = await asyncio.to_thread(
-                    candle_method,
-                    symbol,
-                    timeframe,
-                    count=count,
-                    price_type="bid",
-                )
-
-                if inspect.isawaitable(raw):
-                    raw = await raw
-
-            bars = normalize_chart_candles(raw)
-
-            # Return only the requested number of candles.
-            bars = bars[-count:]
+            bars = normalize_chart_candles(raw)[-count:]
 
             return {
                 "symbol": symbol,
@@ -807,7 +892,7 @@ def create_app(bot: Any) -> FastAPI:
 
             from market_data_engine import market_data_engine
 
-            tick = get_engine_tick(
+            tick = await get_engine_tick(
                 market_data_engine,
                 symbol,
             )
@@ -818,36 +903,22 @@ def create_app(bot: Any) -> FastAPI:
                     "symbol": symbol,
                     "bid": None,
                     "ask": None,
+                    "mid": None,
+                    "spread": None,
+                    "age_seconds": None,
                     "fresh": False,
                     "reason": "NO LIVE TICK",
                 }
 
-            safe_tick = make_json_safe(tick)
-
-            if not isinstance(safe_tick, dict):
-                safe_tick = {}
-
             return {
                 "symbol": symbol,
-                "bid": safe_tick.get("bid"),
-                "ask": safe_tick.get("ask"),
-                "mid": safe_tick.get("mid"),
-                "spread": safe_tick.get("spread"),
-
-                "age_seconds": safe_tick.get(
-                    "age_seconds",
-                    safe_tick.get("age"),
-                ),
-
-                "fresh": bool(
-                    safe_tick.get("fresh", False)
-                ),
-
-                "reason": (
-                    None
-                    if safe_tick.get("fresh")
-                    else "STALE / MARKET CLOSED"
-                ),
+                "bid": tick.get("bid"),
+                "ask": tick.get("ask"),
+                "mid": tick.get("mid"),
+                "spread": tick.get("spread"),
+                "age_seconds": tick.get("age_seconds"),
+                "fresh": bool(tick.get("fresh", False)),
+                "reason": tick.get("reason"),
             }
 
         except HTTPException:
@@ -1067,33 +1138,22 @@ async def dashboard_state(
 
             try:
 
-                tick = get_engine_tick(
+                tick = await get_engine_tick(
                     market_data_engine,
                     symbol,
                 )
 
                 if tick:
 
-                    tick = make_json_safe(tick)
-
-                    if not isinstance(tick, dict):
-                        tick = {}
-
-                    fresh = bool(
-                        tick.get("fresh", False)
-                    )
-
                     quotes.append({
                         "symbol": symbol,
                         "bid": tick.get("bid"),
                         "ask": tick.get("ask"),
-                        "fresh": fresh,
-
-                        "reason": (
-                            None
-                            if fresh
-                            else "STALE / MARKET CLOSED"
-                        ),
+                        "mid": tick.get("mid"),
+                        "spread": tick.get("spread"),
+                        "age_seconds": tick.get("age_seconds"),
+                        "fresh": bool(tick.get("fresh", False)),
+                        "reason": tick.get("reason"),
                     })
 
                 else:
@@ -1102,6 +1162,9 @@ async def dashboard_state(
                         "symbol": symbol,
                         "bid": None,
                         "ask": None,
+                        "mid": None,
+                        "spread": None,
+                        "age_seconds": None,
                         "fresh": False,
                         "reason": "NO LIVE TICK",
                     })
@@ -1116,6 +1179,9 @@ async def dashboard_state(
                     "symbol": symbol,
                     "bid": None,
                     "ask": None,
+                    "mid": None,
+                    "spread": None,
+                    "age_seconds": None,
                     "fresh": False,
                     "reason": "QUOTE UNAVAILABLE",
                 })
@@ -1127,6 +1193,9 @@ async def dashboard_state(
                 "symbol": symbol,
                 "bid": None,
                 "ask": None,
+                "mid": None,
+                "spread": None,
+                "age_seconds": None,
                 "fresh": False,
                 "reason": "MARKET DATA ENGINE UNAVAILABLE",
             }
