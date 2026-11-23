@@ -173,7 +173,6 @@ class ExnessConnection:
         if not value:
             return None
 
-        # Retry-After may be expressed in seconds.
         try:
 
             delay = float(value)
@@ -186,7 +185,6 @@ class ExnessConnection:
         except ValueError:
             pass
 
-        # Retry-After may also be an HTTP date.
         try:
 
             retry_date = parsedate_to_datetime(
@@ -267,7 +265,8 @@ class ExnessConnection:
         base_url,
         method,
         path,
-        body=None
+        body=None,
+        idempotency_key=""
     ):
 
         method = method.upper()
@@ -275,6 +274,10 @@ class ExnessConnection:
         if body is None:
 
             body_bytes = b""
+
+        elif isinstance(body, bytes):
+
+            body_bytes = body
 
         else:
 
@@ -284,16 +287,18 @@ class ExnessConnection:
                 ensure_ascii=False
             ).encode("utf-8")
 
-        idempotency_key = ""
+        # Preserve the caller-provided idempotency key
+        # across every retry attempt.
+        idempotency_key = (
+            idempotency_key or ""
+        )
 
         await self._ensure_client()
 
-        for attempt in range(
-            self.MAX_ATTEMPTS
-        ):
+        for attempt in range(self.MAX_ATTEMPTS):
 
-            # Re-sign every attempt so timestamps
-            # remain current.
+            # Re-sign every attempt to generate a fresh
+            # timestamp while retaining the same key.
             headers = self.sign_request(
                 method=method,
                 path=path,
@@ -330,10 +335,7 @@ class ExnessConnection:
                 httpx.RemoteProtocolError,
             ) as exc:
 
-                if (
-                    attempt
-                    >= self.MAX_ATTEMPTS - 1
-                ):
+                if attempt >= self.MAX_ATTEMPTS - 1:
 
                     self.last_error = (
                         f"Network failure: "
@@ -373,15 +375,9 @@ class ExnessConnection:
                     "raw_response": response.text
                 }
 
-            if (
-                response.status_code
-                in self.RETRYABLE_STATUS_CODES
-            ):
+            if response.status_code in self.RETRYABLE_STATUS_CODES:
 
-                if (
-                    attempt
-                    >= self.MAX_ATTEMPTS - 1
-                ):
+                if attempt >= self.MAX_ATTEMPTS - 1:
 
                     self.last_error = (
                         f"HTTP {response.status_code}"
@@ -418,8 +414,6 @@ class ExnessConnection:
                     f"HTTP {response.status_code}"
                 )
 
-                # Authentication and other non-retryable
-                # errors are not hammered repeatedly.
                 raise RuntimeError(
                     f"Exness API error "
                     f"{response.status_code}: "
@@ -445,10 +439,7 @@ class ExnessConnection:
         force=False
     ):
 
-        if (
-            self.access_point
-            and not force
-        ):
+        if self.access_point and not force:
 
             logger.info(
                 "Using cached Exness Access Point."
@@ -570,7 +561,6 @@ class ExnessConnection:
                 "Exness connection verified successfully."
             )
 
-            # FIX: Explicit success field for connector.
             return {
                 "success": True,
                 "connected": True,
