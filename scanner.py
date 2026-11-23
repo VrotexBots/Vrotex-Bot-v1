@@ -1,3 +1,4 @@
+
 """
 Vrotex Bot V1 - Market Scanner
 Version: 3.2
@@ -12,7 +13,7 @@ Strategy timeframes:
 
 Responsibilities:
     - Continuous instrument scanning
-    - Market-data collection
+    - Async market-data collection
     - Technical analysis
     - Fundamental analysis
     - Risk-check collection
@@ -24,10 +25,12 @@ This module does NOT execute orders.
 """
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
 import traceback
+
 from datetime import datetime, timezone
 
 logger = logging.getLogger("vrotex.market_scanner")
@@ -108,6 +111,43 @@ class MarketScanner:
             self.INSTRUMENTS,
             self.TIMEFRAMES,
         )
+
+    # =========================================================
+    # ASYNC COMPATIBILITY
+    # =========================================================
+
+    @staticmethod
+    async def _invoke(method, *args, **kwargs):
+        """
+        Safely execute either an async or synchronous engine method.
+
+        Async methods execute on the current event loop.
+        Synchronous methods execute in a worker thread.
+        If a synchronous method returns an awaitable,
+        that awaitable is also awaited.
+        """
+
+        if not callable(method):
+            raise RuntimeError("Engine method is not callable")
+
+        if inspect.iscoroutinefunction(method):
+
+            return await method(
+                *args,
+                **kwargs,
+            )
+
+        result = await asyncio.to_thread(
+            method,
+            *args,
+            **kwargs,
+        )
+
+        if inspect.isawaitable(result):
+
+            return await result
+
+        return result
 
     # =========================================================
     # ENGINE INITIALIZATION
@@ -231,9 +271,14 @@ class MarketScanner:
             if value is None:
                 return default
 
-            return float(value)
+            result = float(value)
 
-        except (ValueError, TypeError):
+            if not result == result:
+                return default
+
+            return result
+
+        except (ValueError, TypeError, OverflowError):
 
             return default
 
@@ -256,11 +301,38 @@ class MarketScanner:
 
         return []
 
+    @staticmethod
+    def _supports_keyword(method, keyword):
+        """
+        Determine whether a callable accepts a keyword,
+        including callables that accept **kwargs.
+        """
+
+        try:
+
+            signature = inspect.signature(method)
+
+            parameters = signature.parameters
+
+            if keyword in parameters:
+                return True
+
+            return any(
+                parameter.kind
+                == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+
+        except (TypeError, ValueError):
+
+            # Unknown signature: assume keyword is supported.
+            return True
+
     # =========================================================
-    # MARKET DATA
+    # MARKET DATA - ASYNC FIX
     # =========================================================
 
-    def _get_candles(
+    async def _get_candles(
         self,
         symbol,
         timeframe,
@@ -289,18 +361,31 @@ class MarketScanner:
                 "get_recent_candles() unavailable"
             )
 
-        try:
+        # Determine whether price_type is supported
+        # without swallowing TypeErrors raised internally
+        # by the market-data engine.
 
-            candles = method(
+        supports_price_type = (
+            self._supports_keyword(
+                method,
+                "price_type",
+            )
+        )
+
+        if supports_price_type:
+
+            candles = await self._invoke(
+                method,
                 symbol,
                 timeframe,
                 count,
                 price_type="bid",
             )
 
-        except TypeError:
+        else:
 
-            candles = method(
+            candles = await self._invoke(
+                method,
                 symbol,
                 timeframe,
                 count,
@@ -313,16 +398,21 @@ class MarketScanner:
 
             candles = candles.get(
                 "candles",
-                candles.get("data", []),
+                candles.get(
+                    "data",
+                    [],
+                ),
             )
 
-        return self._safe_list(candles)
+        candles = self._safe_list(candles)
+
+        return candles
 
     # =========================================================
-    # LIVE PRICE
+    # LIVE PRICE - ASYNC COMPATIBLE
     # =========================================================
 
-    def _get_live_price(self, symbol):
+    async def _get_live_price(self, symbol):
 
         engine = self.market_data_engine
 
@@ -349,13 +439,19 @@ class MarketScanner:
 
             try:
 
-                tick = method(symbol)
+                tick = await self._invoke(
+                    method,
+                    symbol,
+                )
 
                 if tick is None:
                     continue
 
                 if isinstance(tick, (int, float)):
-                    return float(tick)
+
+                    return self._safe_float(
+                        tick
+                    )
 
                 if isinstance(tick, dict):
 
@@ -376,7 +472,10 @@ class MarketScanner:
                     )
 
                     if bid is not None and ask is not None:
-                        return (bid + ask) / 2.0
+
+                        return (
+                            bid + ask
+                        ) / 2.0
 
                     if bid is not None:
                         return bid
@@ -401,10 +500,10 @@ class MarketScanner:
         return None
 
     # =========================================================
-    # TECHNICAL ANALYSIS
+    # TECHNICAL ANALYSIS - ASYNC COMPATIBLE
     # =========================================================
 
-    def _analyse_timeframe(
+    async def _analyse_timeframe(
         self,
         symbol,
         timeframe,
@@ -450,15 +549,39 @@ class MarketScanner:
 
         try:
 
-            result = method(
-                candles,
-                symbol=symbol,
-                timeframe=timeframe,
+            supports_kwargs = (
+                self._supports_keyword(
+                    method,
+                    "symbol",
+                )
+                and self._supports_keyword(
+                    method,
+                    "timeframe",
+                )
             )
+
+            if supports_kwargs:
+
+                result = await self._invoke(
+                    method,
+                    candles,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+
+            else:
+
+                result = await self._invoke(
+                    method,
+                    candles,
+                )
 
         except TypeError:
 
-            result = method(candles)
+            result = await self._invoke(
+                method,
+                candles,
+            )
 
         if not isinstance(result, dict):
 
@@ -473,25 +596,66 @@ class MarketScanner:
 
         return result
 
-    def _collect_market_data(self, symbol):
+    # =========================================================
+    # MARKET DATA COLLECTION - ASYNC
+    # =========================================================
+
+    async def _collect_market_data(self, symbol):
 
         result = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            candles = self._get_candles(
+            if self._stop_event.is_set():
+                break
+
+            try:
+
+                candles = await self._get_candles(
+                    symbol,
+                    timeframe,
+                    self.CANDLE_COUNT,
+                )
+
+            except Exception as exc:
+
+                logger.error(
+                    "%s | %s | Candle retrieval failed: %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                    exc_info=True,
+                )
+
+                result[timeframe] = {
+                    "candles": [],
+                    "technical": {
+                        "status": "CANDLE_RETRIEVAL_ERROR",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "candles": 0,
+                        "error": str(exc),
+                    },
+                }
+
+                continue
+
+            candle_count = len(candles)
+
+            logger.info(
+                "%s | %s | Candle retrieval successful | Count=%s",
                 symbol,
                 timeframe,
-                self.CANDLE_COUNT,
+                candle_count,
             )
 
-            if len(candles) < 50:
+            if candle_count < 50:
 
                 logger.warning(
                     "%s | %s | Insufficient candles: %s",
                     symbol,
                     timeframe,
-                    len(candles),
+                    candle_count,
                 )
 
                 result[timeframe] = {
@@ -500,17 +664,37 @@ class MarketScanner:
                         "status": "INSUFFICIENT_DATA",
                         "symbol": symbol,
                         "timeframe": timeframe,
-                        "candles": len(candles),
+                        "candles": candle_count,
                     },
                 }
 
                 continue
 
-            technical = self._analyse_timeframe(
-                symbol,
-                timeframe,
-                candles,
-            )
+            try:
+
+                technical = await self._analyse_timeframe(
+                    symbol,
+                    timeframe,
+                    candles,
+                )
+
+            except Exception as exc:
+
+                logger.error(
+                    "%s | %s | Technical analysis failed: %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                    exc_info=True,
+                )
+
+                technical = {
+                    "status": "TECHNICAL_ANALYSIS_ERROR",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": candle_count,
+                    "error": str(exc),
+                }
 
             result[timeframe] = {
                 "candles": candles,
@@ -646,10 +830,10 @@ class MarketScanner:
         return evidence or None
 
     # =========================================================
-    # FUNDAMENTAL ENGINE
+    # FUNDAMENTAL ENGINE - ASYNC COMPATIBLE
     # =========================================================
 
-    def _collect_fundamentals(
+    async def _collect_fundamentals(
         self,
         symbol,
         market_data,
@@ -702,7 +886,8 @@ class MarketScanner:
 
             try:
 
-                result = method(
+                result = await self._invoke(
+                    method,
                     symbol=symbol,
                     market_data=market_data,
                     current_price=current_price,
@@ -712,7 +897,8 @@ class MarketScanner:
 
                 try:
 
-                    result = method(
+                    result = await self._invoke(
+                        method,
                         symbol,
                         market_data=market_data,
                         current_price=current_price,
@@ -721,11 +907,17 @@ class MarketScanner:
                 except TypeError:
 
                     try:
-                        result = method(symbol)
+
+                        result = await self._invoke(
+                            method,
+                            symbol,
+                        )
 
                     except TypeError:
-                        result = method(
-                            instrument=symbol
+
+                        result = await self._invoke(
+                            method,
+                            instrument=symbol,
                         )
 
             if isinstance(result, dict):
@@ -776,10 +968,10 @@ class MarketScanner:
             }
 
     # =========================================================
-    # RISK MANAGEMENT ENGINE
+    # RISK MANAGEMENT ENGINE - ASYNC COMPATIBLE
     # =========================================================
 
-    def _collect_risk_checks(
+    async def _collect_risk_checks(
         self,
         symbol,
         market_data,
@@ -835,7 +1027,8 @@ class MarketScanner:
 
             try:
 
-                result = method(
+                result = await self._invoke(
+                    method,
                     symbol=symbol,
                     market_data=market_data,
                     current_price=current_price,
@@ -845,7 +1038,8 @@ class MarketScanner:
 
                 try:
 
-                    result = method(
+                    result = await self._invoke(
+                        method,
                         symbol,
                         market_data=market_data,
                         current_price=current_price,
@@ -855,14 +1049,18 @@ class MarketScanner:
 
                     try:
 
-                        result = method(
+                        result = await self._invoke(
+                            method,
                             symbol,
                             current_price,
                         )
 
                     except TypeError:
 
-                        result = method(symbol)
+                        result = await self._invoke(
+                            method,
+                            symbol,
+                        )
 
             if isinstance(result, dict):
 
@@ -899,10 +1097,10 @@ class MarketScanner:
             }
 
     # =========================================================
-    # MASTER SMC ANALYSIS
+    # MASTER SMC ANALYSIS - ASYNC COMPATIBLE
     # =========================================================
 
-    def _run_smc_analysis(
+    async def _run_smc_analysis(
         self,
         symbol,
         market_data,
@@ -967,8 +1165,9 @@ class MarketScanner:
 
         try:
 
-            decision = method(
-                **arguments
+            decision = await self._invoke(
+                method,
+                **arguments,
             )
 
             if not isinstance(decision, dict):
@@ -998,10 +1197,10 @@ class MarketScanner:
             }
 
     # =========================================================
-    # SCAN ONE INSTRUMENT
+    # SCAN ONE INSTRUMENT - ASYNC
     # =========================================================
 
-    def scan_instrument(self, symbol):
+    async def scan_instrument(self, symbol):
 
         if symbol not in self.INSTRUMENTS:
 
@@ -1019,11 +1218,11 @@ class MarketScanner:
 
         try:
 
-            current_price = self._get_live_price(
+            current_price = await self._get_live_price(
                 symbol
             )
 
-            market_data = self._collect_market_data(
+            market_data = await self._collect_market_data(
                 symbol
             )
 
@@ -1050,6 +1249,8 @@ class MarketScanner:
                     "NO_DATA",
                     "ERROR",
                     "FAILED",
+                    "CANDLE_RETRIEVAL_ERROR",
+                    "TECHNICAL_ANALYSIS_ERROR",
                 )
 
                 if (
@@ -1068,6 +1269,9 @@ class MarketScanner:
                     "symbol": symbol,
                     "status": "INSUFFICIENT_MARKET_DATA",
                     "timestamp": self._utc_now(),
+                    "scan_duration": (
+                        time.time() - scan_started
+                    ),
                     "current_price": current_price,
                     "valid_timeframes": valid_timeframes,
                     "market_data": market_data,
@@ -1089,6 +1293,9 @@ class MarketScanner:
                     "symbol": symbol,
                     "status": "LIVE_PRICE_UNAVAILABLE",
                     "timestamp": self._utc_now(),
+                    "scan_duration": (
+                        time.time() - scan_started
+                    ),
                     "market_data": market_data,
                     "setup_found": False,
                     "a_plus": False,
@@ -1103,21 +1310,24 @@ class MarketScanner:
                 return result
 
             # Fundamental analysis
-            fundamentals = self._collect_fundamentals(
+
+            fundamentals = await self._collect_fundamentals(
                 symbol,
                 market_data,
                 current_price,
             )
 
             # Actual risk engine validation
-            risk_checks = self._collect_risk_checks(
+
+            risk_checks = await self._collect_risk_checks(
                 symbol,
                 market_data,
                 current_price,
             )
 
             # Master SMC engine
-            decision = self._run_smc_analysis(
+
+            decision = await self._run_smc_analysis(
                 symbol,
                 market_data,
                 current_price,
@@ -1222,6 +1432,10 @@ class MarketScanner:
 
             return result
 
+        except asyncio.CancelledError:
+
+            raise
+
         except Exception as exc:
 
             self.error_count += 1
@@ -1299,10 +1513,10 @@ class MarketScanner:
             self.last_scan_results[symbol] = result
 
     # =========================================================
-    # SCAN ALL INSTRUMENTS
+    # SCAN ALL INSTRUMENTS - ASYNC
     # =========================================================
 
-    def scan_all(self):
+    async def scan_all(self):
 
         scan_started = time.time()
 
@@ -1313,13 +1527,14 @@ class MarketScanner:
         )
 
         # Sequential scanning preserves phone/runtime resources.
+        # Candle requests are now properly awaited.
 
         for symbol in self.INSTRUMENTS:
 
             if self._stop_event.is_set():
                 break
 
-            results[symbol] = self.scan_instrument(
+            results[symbol] = await self.scan_instrument(
                 symbol
             )
 
@@ -1347,7 +1562,7 @@ class MarketScanner:
         }
 
     # =========================================================
-    # CONTINUOUS SCANNER
+    # CONTINUOUS SCANNER - ASYNC
     # =========================================================
 
     async def run(self):
@@ -1378,9 +1593,13 @@ class MarketScanner:
 
                 try:
 
-                    await asyncio.to_thread(
-                        self.scan_all
-                    )
+                    # IMPORTANT:
+                    # No asyncio.to_thread(scan_all).
+                    #
+                    # scan_all is async and candle retrieval
+                    # must remain on the current event loop.
+
+                    await self.scan_all()
 
                 except asyncio.CancelledError:
 
@@ -1406,10 +1625,18 @@ class MarketScanner:
 
                 if remaining > 0:
 
-                    await asyncio.to_thread(
-                        self._stop_event.wait,
-                        remaining,
-                    )
+                    try:
+
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._stop_event.wait
+                            ),
+                            timeout=remaining,
+                        )
+
+                    except asyncio.TimeoutError:
+
+                        pass
 
         finally:
 
