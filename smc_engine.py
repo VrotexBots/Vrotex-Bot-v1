@@ -67,7 +67,11 @@ class SMCEngine:
     )
 
     def __init__(self, adapter=None):
-        self.adapter = adapter if adapter is not None else smc_integration_adapter
+        self.adapter = (
+            adapter
+            if adapter is not None
+            else smc_integration_adapter
+        )
         self.last_analysis = {}
         self.adapter_errors = 0
 
@@ -96,6 +100,7 @@ class SMCEngine:
     @staticmethod
     def _direction(value):
         value = str(value or "").upper().strip()
+
         aliases = {
             "BULL": "BULLISH",
             "BUY": "BULLISH",
@@ -109,12 +114,19 @@ class SMCEngine:
             "SIDEWAYS": "RANGING",
             "NEUTRAL": "RANGING",
         }
+
         value = aliases.get(value, value)
-        return value if value in ("BULLISH", "BEARISH", "RANGING") else None
+
+        return (
+            value
+            if value in ("BULLISH", "BEARISH", "RANGING")
+            else None
+        )
 
     @staticmethod
     def _event_type(event):
         event = SMCEngine._dict(event)
+
         raw = str(
             event.get(
                 "type",
@@ -135,6 +147,7 @@ class SMCEngine:
     @staticmethod
     def _body_close(event):
         event = SMCEngine._dict(event)
+
         confirmation = str(
             event.get("confirmation", "")
         ).upper().strip()
@@ -150,6 +163,7 @@ class SMCEngine:
     @staticmethod
     def _technical(data):
         data = SMCEngine._dict(data)
+
         return (
             data.get("technical")
             if isinstance(data.get("technical"), dict)
@@ -245,6 +259,7 @@ class SMCEngine:
         external_only=False,
     ):
         structure = self._dict(structure)
+
         external = self._dict(
             structure.get("external_structure")
         )
@@ -467,6 +482,7 @@ class SMCEngine:
 
         except Exception as exc:
             self.adapter_errors += 1
+
             logger.exception(
                 "SMC adapter normalization failed"
             )
@@ -595,6 +611,7 @@ class SMCEngine:
 
         else:
             entry = self._dict(entry_evidence)
+
             models = self._dict(
                 entry.get("models")
             )
@@ -755,7 +772,7 @@ class SMCEngine:
     # ---------------- Pathway helpers ----------------
 
     @staticmethod
-    def _reject(
+    def _reject_pathway(
         name,
         direction,
         reason,
@@ -785,7 +802,7 @@ class SMCEngine:
         m5 = self._tf(market_data, "M5")
 
         if self.determine_h1_direction(h1) != direction:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 "H1_DIRECTION_NOT_ALIGNED",
@@ -798,7 +815,7 @@ class SMCEngine:
         )
 
         if not h1poi["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 h1poi["reason"],
@@ -810,7 +827,7 @@ class SMCEngine:
         )
 
         if not br["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 br["reason"],
@@ -823,7 +840,7 @@ class SMCEngine:
         )
 
         if not m5poi["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 m5poi["reason"],
@@ -835,7 +852,7 @@ class SMCEngine:
         )
 
         if not conf["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 "CONFIRMATION_EVIDENCE_FAILED",
@@ -848,7 +865,7 @@ class SMCEngine:
         )
 
         if not ent["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_ALIGNED_CONTINUATION",
                 direction,
                 ent["reason"],
@@ -885,14 +902,14 @@ class SMCEngine:
         h1dir = self.determine_h1_direction(h1)
 
         if h1dir not in self.DIRECTIONS:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "H1_DIRECTION_UNAVAILABLE",
             )
 
         if h1dir == direction:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "NOT_COUNTERTREND",
@@ -904,7 +921,7 @@ class SMCEngine:
         )
 
         if not br["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "M5_EXTERNAL_REVERSAL_NOT_CONFIRMED",
@@ -917,7 +934,7 @@ class SMCEngine:
         )
 
         if not p["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 p["reason"],
@@ -929,7 +946,7 @@ class SMCEngine:
         )
 
         if not conf["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 "CONFIRMATION_EVIDENCE_FAILED",
@@ -942,7 +959,7 @@ class SMCEngine:
         )
 
         if not ent["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "H1_COUNTERTREND_REVERSAL",
                 direction,
                 ent["reason"],
@@ -997,21 +1014,21 @@ class SMCEngine:
         )
 
         if extdir not in self.DIRECTIONS:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "M5_EXTERNAL_STRUCTURE_UNAVAILABLE",
             )
 
         if intdir != direction:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "INTERNAL_DIRECTION_NOT_CONFIRMED",
             )
 
         if extdir == direction:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "NOT_COUNTERTREND_TO_EXTERNAL",
@@ -1023,7 +1040,7 @@ class SMCEngine:
         )
 
         if br is None:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "INTERNAL_BODY_CLOSE_BREAK_MISSING",
@@ -1036,7 +1053,7 @@ class SMCEngine:
         )
 
         if not p["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 p["reason"],
@@ -1048,7 +1065,7 @@ class SMCEngine:
         )
 
         if not conf["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 "CONFIRMATION_EVIDENCE_FAILED",
@@ -1061,7 +1078,7 @@ class SMCEngine:
         )
 
         if not ent["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "M5_INTERNAL_COUNTERTREND",
                 direction,
                 ent["reason"],
@@ -1114,14 +1131,14 @@ class SMCEngine:
         )
 
         if high is None or low is None or high <= low:
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 "RANGE_BOUNDARIES_MISSING_OR_INVALID",
             )
 
         if price is None or not low <= price <= high:
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 "PRICE_OUTSIDE_RANGE_OR_MISSING",
@@ -1136,7 +1153,7 @@ class SMCEngine:
             direction == "BEARISH"
             and price <= eq
         ):
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 "WRONG_RANGE_HALF",
@@ -1149,7 +1166,7 @@ class SMCEngine:
         )
 
         if not p["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 p["reason"],
@@ -1161,7 +1178,7 @@ class SMCEngine:
         )
 
         if not conf["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 "RANGE_CONFIRMATION_FAILED",
@@ -1174,7 +1191,7 @@ class SMCEngine:
         )
 
         if not ent["valid"]:
-            return self._reject(
+            return self._reject_pathway(
                 "RANGING_MARKET",
                 direction,
                 ent["reason"],
@@ -1200,6 +1217,7 @@ class SMCEngine:
 
     def _pathway_scores(self, scores, name):
         scores = self._dict(scores)
+
         return (
             self._dict(scores.get(name))
             if name in scores
@@ -1330,6 +1348,7 @@ class SMCEngine:
 
         for direction in self.DIRECTIONS:
             ar = adapter_results[direction]
+
             normalized = self._dict(
                 ar.get("evidence")
             )
