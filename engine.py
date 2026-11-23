@@ -30,6 +30,11 @@ class TradingEngine:
         self.live_ticks_ready = False
         self.live_tick_result = None
 
+        self.status = "STOPPED"
+        self.startup_success = False
+        self.startup_error = None
+        self.startup_event = asyncio.Event()
+
         self._stop_lock = asyncio.Lock()
         self._started = False
         self._shutdown_requested = False
@@ -104,18 +109,11 @@ class TradingEngine:
                     "Invalid live-tick engine status."
                 )
 
-            # ------------------------------------------
-            # CONNECTION READINESS
-            # ------------------------------------------
-
             connected = (
                 status.get("connected") is True
                 or status.get("stream_connected") is True
+                or status.get("ready") is True
             )
-
-            # A ready stream is also necessarily connected.
-            if status.get("ready") is True:
-                connected = True
 
             if not connected:
 
@@ -125,18 +123,9 @@ class TradingEngine:
                     f"Status: {status}"
                 )
 
-            # ------------------------------------------
-            # IMPORTANT:
-            # Connection readiness is NOT tick readiness.
-            #
-            # We allow the engine to start after the
-            # WebSocket connects and subscribes.
-            #
-            # Exness will push ticks asynchronously.
-            # ------------------------------------------
-
+            # Connection established does not mean
+            # all instrument ticks have arrived.
             self.live_ticks_ready = True
-
             self.live_tick_result = status
 
             logger.info(
@@ -205,26 +194,31 @@ class TradingEngine:
         )
 
         self.market_data_verified = (
-            self.market_data_result.get(
+            isinstance(self.market_data_result, dict)
+            and self.market_data_result.get(
                 "ready",
                 False,
             ) is True
         )
 
-        verified = self.market_data_result.get(
-            "verified",
-            0,
+        verified = (
+            self.market_data_result.get("verified", 0)
+            if isinstance(self.market_data_result, dict)
+            else 0
         )
 
-        expected = self.market_data_result.get(
-            "expected",
-            9,
+        expected = (
+            self.market_data_result.get("expected", 9)
+            if isinstance(self.market_data_result, dict)
+            else 9
         )
 
         if not self.market_data_verified:
 
+            self.status = "MARKET_DATA_UNAVAILABLE"
+
             state_manager.set_status(
-                "MARKET_DATA_UNAVAILABLE"
+                self.status
             )
 
             logger.critical(
@@ -232,6 +226,11 @@ class TradingEngine:
                 "failed: %s/%s strategy pairs.",
                 verified,
                 expected,
+            )
+
+            self.startup_error = (
+                f"Market data verification failed: "
+                f"{verified}/{expected} strategy pairs."
             )
 
             return False
@@ -246,16 +245,20 @@ class TradingEngine:
         # START EXNESS PUSH LIVE-TICK CONNECTION
         # ----------------------------------------------
 
+        self.status = "STARTING_LIVE_TICKS"
+
         state_manager.set_status(
-            "STARTING_LIVE_TICKS"
+            self.status
         )
 
         ticks_connected = await self.start_live_ticks()
 
         if not ticks_connected:
 
+            self.status = "LIVE_TICKS_UNAVAILABLE"
+
             state_manager.set_status(
-                "LIVE_TICKS_UNAVAILABLE"
+                self.status
             )
 
             logger.critical(
@@ -263,18 +266,26 @@ class TradingEngine:
                 "WebSocket connection failed."
             )
 
+            self.startup_error = (
+                self.live_tick_result.get("error")
+                if isinstance(self.live_tick_result, dict)
+                else "Exness live-tick connection failed."
+            )
+
             return False
 
         # ----------------------------------------------
         # INITIAL TICK CHECK
-        #
-        # Ticks are NOT required at startup.
-        # Exness pushes them after subscription.
         # ----------------------------------------------
 
         try:
 
-            ticks = market_data_engine.get_live_ticks()
+            ticks = await self._run_method(
+                market_data_engine.get_live_ticks
+            )
+
+            if not isinstance(ticks, dict):
+                ticks = {}
 
         except Exception:
 
@@ -369,14 +380,8 @@ class TradingEngine:
                     "Market data: %s | "
                     "Tick connection: %s | "
                     "Ticks received: %s",
-                    health.get(
-                        "status",
-                        "UNKNOWN",
-                    ),
-                    market_status.get(
-                        "verified_pairs",
-                        0,
-                    ),
+                    health.get("status", "UNKNOWN"),
+                    market_status.get("verified_pairs", 0),
                     tick_status.get(
                         "connected",
                         tick_status.get(
@@ -384,10 +389,7 @@ class TradingEngine:
                             False,
                         ),
                     ),
-                    tick_status.get(
-                        "ticks_received",
-                        0,
-                    ),
+                    tick_status.get("ticks_received", 0),
                 )
 
             except Exception:
@@ -472,7 +474,7 @@ class TradingEngine:
 
         if not pending and self.running:
 
-            logger.warning(
+            raise RuntimeError(
                 "All engine tasks stopped unexpectedly."
             )
 
@@ -490,56 +492,94 @@ class TradingEngine:
 
             return
 
-        initialized = await self.initialize()
+        self.startup_event.clear()
+        self.startup_success = False
+        self.startup_error = None
+        self.status = "STARTING"
 
-        if not initialized:
-
-            logger.error(
-                "Trading engine startup blocked."
-            )
-
-            await self.stop()
-
-            return
-
-        self.running = True
-        self._started = True
-
-        state_manager.set_status(
-            "RUNNING"
-        )
-
-        logger.info(
-            "Vrotex Trading Engine is running."
-        )
-
-        self.tasks = [
-            asyncio.create_task(
-                self.heartbeat_loop(),
-                name="vrotex-heartbeat",
-            ),
-            asyncio.create_task(
-                self.scanner_loop(),
-                name="vrotex-scanner",
-            ),
-        ]
+        self._shutdown_requested = False
 
         try:
 
-            await self.monitor_tasks()
+            initialized = await self.initialize()
+
+            if not initialized:
+
+                failure_status = self.status
+                failure_message = self.startup_error
+
+                logger.error(
+                    "Trading engine startup blocked | %s | %s",
+                    failure_status,
+                    failure_message,
+                )
+
+                # Clean up resources without losing
+                # the actual startup failure status.
+                await self.stop(
+                    preserve_status=True
+                )
+
+                self.status = failure_status
+
+                try:
+
+                    state_manager.set_status(
+                        failure_status
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "Could not preserve startup failure status."
+                    )
+
+                self.startup_error = failure_message
+
+                return
+
+            self.running = True
+            self._started = True
+            self.startup_success = True
+            self.status = "RUNNING"
+
+            state_manager.set_status(
+                "RUNNING"
+            )
+
+            logger.info(
+                "Vrotex Trading Engine is running."
+            )
+
+            self.tasks = [
+                asyncio.create_task(
+                    self.heartbeat_loop(),
+                    name="vrotex-heartbeat",
+                ),
+                asyncio.create_task(
+                    self.scanner_loop(),
+                    name="vrotex-scanner",
+                ),
+            ]
 
         except asyncio.CancelledError:
 
-            logger.info(
-                "Engine tasks cancelled."
+            self.startup_error = (
+                "Trading engine startup was cancelled."
             )
+
+            self.status = "STARTUP_CANCELLED"
 
             raise
 
         except Exception as exc:
 
+            self.startup_success = False
+            self.startup_error = str(exc)
+            self.status = "STARTUP_ERROR"
+
             logger.exception(
-                "Trading engine runtime failure."
+                "Trading engine startup/runtime failure."
             )
 
             try:
@@ -551,13 +591,28 @@ class TradingEngine:
             except Exception:
 
                 logger.exception(
-                    "Could not record engine runtime error."
+                    "Could not record engine error."
                 )
 
             try:
 
                 state_manager.set_status(
-                    "RUNTIME_ERROR"
+                    self.status
+                )
+
+            except Exception:
+                pass
+
+            await self.stop(
+                preserve_status=True
+            )
+
+            self.status = "STARTUP_ERROR"
+
+            try:
+
+                state_manager.set_status(
+                    self.status
                 )
 
             except Exception:
@@ -565,7 +620,59 @@ class TradingEngine:
 
         finally:
 
-            await self.stop()
+            # Always release main.py's startup waiter.
+            self.startup_event.set()
+
+        if self.startup_success:
+
+            try:
+
+                await self.monitor_tasks()
+
+            except asyncio.CancelledError:
+
+                logger.info(
+                    "Engine tasks cancelled."
+                )
+
+                raise
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Trading engine runtime failure."
+                )
+
+                self.status = "RUNTIME_ERROR"
+                self.startup_error = str(exc)
+
+                try:
+
+                    state_manager.add_error(
+                        str(exc)
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Could not record runtime error."
+                    )
+
+                try:
+
+                    state_manager.set_status(
+                        self.status
+                    )
+
+                except Exception:
+                    pass
+
+            finally:
+
+                await self.stop(
+                    preserve_status=(
+                        self.status == "RUNTIME_ERROR"
+                    )
+                )
 
     # --------------------------------------------------
     # STOP LIVE TICKS
@@ -606,7 +713,10 @@ class TradingEngine:
     # CLEAN SHUTDOWN
     # --------------------------------------------------
 
-    async def stop(self):
+    async def stop(
+        self,
+        preserve_status=False,
+    ):
 
         async with self._stop_lock:
 
@@ -651,7 +761,6 @@ class TradingEngine:
             ]
 
             for task in tasks_to_stop:
-
                 task.cancel()
 
             if tasks_to_stop:
@@ -665,17 +774,21 @@ class TradingEngine:
 
             await self.stop_live_ticks()
 
-            try:
+            if not preserve_status:
 
-                state_manager.set_status(
-                    "STOPPED"
-                )
+                self.status = "STOPPED"
 
-            except Exception:
+                try:
 
-                logger.exception(
-                    "Could not update engine stopped status."
-                )
+                    state_manager.set_status(
+                        "STOPPED"
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "Could not update engine stopped status."
+                    )
 
             self._started = False
 
@@ -704,14 +817,25 @@ class TradingEngine:
 
         return {
             "running": self.running,
+            "status": self.status,
+            "startup_success": self.startup_success,
+            "startup_complete": self.startup_event.is_set(),
+            "startup_error": self.startup_error,
+
             "market_data_verified": (
                 self.market_data_verified
             ),
+
             "market_data": self.market_data_result,
+
             "live_ticks_ready": self.live_ticks_ready,
+
             "live_tick_status": tick_status,
+
             "health": health_monitor.get_health(),
+
             "state": state_manager.get_state(),
+
             "scanner": scanner.get_status(),
         }
 
