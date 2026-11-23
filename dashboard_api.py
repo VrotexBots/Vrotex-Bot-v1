@@ -4,27 +4,63 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
+
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
+
 
 LOGS = deque(maxlen=500)
 CLIENTS: set[WebSocket] = set()
 _LOG_HANDLER = None
 
-CHART_INSTRUMENTS = {"EURUSD", "GBPUSD", "BTCUSD"}
-CHART_TIMEFRAMES = {"D1", "H4", "H1", "M30", "M15", "M5", "M1"}
+
+# ============================================================
+# VROTEX V1 DASHBOARD CONFIGURATION
+# ============================================================
+
+CHART_INSTRUMENTS = {
+    "EURUSD",
+    "GBPUSD",
+    "BTCUSD",
+}
+
+CHART_TIMEFRAMES = {
+    "D1",
+    "H4",
+    "H1",
+    "M30",
+    "M15",
+    "M5",
+    "M1",
+}
+
 MAX_CHART_CANDLES = 1000
 
 
+# ============================================================
+# JSON SERIALIZATION
+# ============================================================
+
 def make_json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+
+    if value is None or isinstance(
+        value,
+        (str, int, float, bool),
+    ):
         return value
 
     if isinstance(value, (datetime, date)):
@@ -34,145 +70,75 @@ def make_json_safe(value: Any) -> Any:
         return make_json_safe(value.value)
 
     if dataclasses.is_dataclass(value):
-        return make_json_safe(dataclasses.asdict(value))
+        return make_json_safe(
+            dataclasses.asdict(value)
+        )
 
     if isinstance(value, dict):
-        return {str(k): make_json_safe(v) for k, v in value.items()}
+        return {
+            str(key): make_json_safe(item)
+            for key, item in value.items()
+        }
 
     if isinstance(value, (list, tuple, set, deque)):
-        return [make_json_safe(v) for v in value]
+        return [
+            make_json_safe(item)
+            for item in value
+        ]
 
     try:
         attributes = vars(value)
+
         if attributes:
             return make_json_safe(attributes)
+
     except (TypeError, AttributeError):
         pass
 
     try:
         return jsonable_encoder(value)
+
     except Exception:
         return str(value)
 
 
-# ---------------------------------------------------------
-# MARKET DATA ENGINE RESOLUTION
-# ---------------------------------------------------------
-
-def resolve_market_data_engine(bot: Any):
-    """
-    Resolve the existing MarketDataEngine instance.
-
-    The running Vrotex runtime stores this instance in:
-        runtime["market_data_engine"]
-
-    Do not instantiate another MarketDataEngine here.
-    A second instance would not contain the live runtime's
-    candles, ticks, or connection state.
-    """
-
-    candidates = []
-
-    if isinstance(bot, dict):
-        candidates.append(bot.get("market_data_engine"))
-        candidates.append(bot.get("runtime"))
-        candidates.append(bot.get("engine"))
-
-    else:
-        candidates.append(getattr(bot, "market_data_engine", None))
-        candidates.append(getattr(bot, "runtime", None))
-        candidates.append(getattr(bot, "engine", None))
-
-    # Also inspect an existing engine module if available.
-    try:
-        import engine as engine_module
-
-        candidates.append(getattr(engine_module, "engine", None))
-        candidates.append(getattr(engine_module, "runtime", None))
-
-    except Exception:
-        pass
-
-    seen = set()
-    queue = list(candidates)
-
-    for _ in range(30):
-        if not queue:
-            break
-
-        obj = queue.pop(0)
-
-        if obj is None or id(obj) in seen:
-            continue
-
-        seen.add(id(obj))
-
-        # Runtime dictionary used by the Vrotex main application.
-        if isinstance(obj, dict):
-            market_engine = obj.get("market_data_engine")
-
-            if market_engine is not None:
-                queue.append(market_engine)
-
-            for key in ("runtime", "engine", "bot"):
-                child = obj.get(key)
-                if child is not None:
-                    queue.append(child)
-
-            continue
-
-        # Identify the actual market-data engine by its methods.
-        if (
-            callable(getattr(obj, "get_historical_candles", None))
-            and callable(getattr(obj, "get_status", None))
-        ):
-            return obj
-
-        for name in (
-            "market_data_engine",
-            "market_data",
-            "data_engine",
-            "market_engine",
-            "md_engine",
-            "runtime",
-        ):
-            try:
-                child = getattr(obj, name, None)
-                if child is not None:
-                    queue.append(child)
-            except Exception:
-                pass
-
-    raise RuntimeError(
-        "The running Vrotex runtime does not expose its existing "
-        "MarketDataEngine instance. No second engine was created."
-    )
-
-
-# ---------------------------------------------------------
+# ============================================================
 # LIVE TICK EXTRACTION
-# ---------------------------------------------------------
+# ============================================================
 
 def get_engine_tick(engine, symbol: str):
-    """Read the latest tick from the existing market-data engine."""
 
-    ticks = getattr(engine, "last_tick_by_instrument", None)
+    ticks = getattr(
+        engine,
+        "last_tick_by_instrument",
+        None,
+    )
 
     if isinstance(ticks, dict):
-        tick = ticks.get(symbol) or ticks.get(symbol.upper())
+
+        tick = (
+            ticks.get(symbol)
+            or ticks.get(symbol.upper())
+        )
 
         if isinstance(tick, dict):
+
             result = dict(tick)
+
             stamp = result.get("timestamp")
 
             try:
+
                 if isinstance(stamp, str):
+
                     dt = datetime.fromisoformat(
                         stamp.replace("Z", "+00:00")
                     )
 
                     if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
+                        dt = dt.replace(
+                            tzinfo=timezone.utc
+                        )
 
                     age = max(
                         0.0,
@@ -183,15 +149,16 @@ def get_engine_tick(engine, symbol: str):
                     )
 
                 elif isinstance(stamp, (int, float)):
-                    seconds = (
-                        float(stamp) / 1000
-                        if float(stamp) > 100_000_000_000
-                        else float(stamp)
-                    )
+
+                    seconds = float(stamp)
+
+                    if seconds > 100_000_000_000:
+                        seconds /= 1000
 
                     age = max(
                         0.0,
-                        datetime.now(timezone.utc).timestamp() - seconds,
+                        datetime.now(timezone.utc).timestamp()
+                        - seconds,
                     )
 
                 else:
@@ -201,44 +168,47 @@ def get_engine_tick(engine, symbol: str):
                 age = None
 
             result["age_seconds"] = age
-            result["fresh"] = age is not None and age <= 120
 
-            if result.get("bid") is not None and result.get("ask") is not None:
+            result["fresh"] = (
+                age is not None and age <= 120
+            )
+
+            if (
+                result.get("bid") is not None
+                and result.get("ask") is not None
+            ):
+
                 result["mid"] = (
-                    float(result["bid"]) + float(result["ask"])
+                    float(result["bid"])
+                    + float(result["ask"])
                 ) / 2
 
                 result["spread"] = (
-                    float(result["ask"]) - float(result["bid"])
+                    float(result["ask"])
+                    - float(result["bid"])
                 )
 
+            else:
+
+                result["mid"] = None
+                result["spread"] = None
+
             return result
-
-    # Support engines that expose a getter instead of a public dictionary.
-    getter = getattr(engine, "get_live_tick", None)
-
-    if callable(getter):
-        try:
-            tick = getter(symbol)
-            if isinstance(tick, dict):
-                return tick
-        except Exception:
-            pass
 
     return None
 
 
-# ---------------------------------------------------------
+# ============================================================
 # CANDLE NORMALIZATION
-# ---------------------------------------------------------
+# ============================================================
 
 def candle_time_to_unix(value: Any) -> int:
-    """Convert candle timestamps to Lightweight Charts Unix seconds."""
 
     if isinstance(value, datetime):
         dt = value
 
     elif isinstance(value, date):
+
         dt = datetime(
             value.year,
             value.month,
@@ -247,6 +217,7 @@ def candle_time_to_unix(value: Any) -> int:
         )
 
     elif isinstance(value, (int, float)):
+
         stamp = float(value)
 
         if stamp > 100_000_000_000:
@@ -255,12 +226,16 @@ def candle_time_to_unix(value: Any) -> int:
         return int(stamp)
 
     elif isinstance(value, str):
+
         raw = value.strip()
 
         if not raw:
-            raise ValueError("Candle is missing its time value")
+            raise ValueError(
+                "Candle is missing its time value"
+            )
 
         try:
+
             stamp = float(raw)
 
             if stamp > 100_000_000_000:
@@ -277,20 +252,26 @@ def candle_time_to_unix(value: Any) -> int:
         dt = datetime.fromisoformat(raw)
 
     else:
+
         raise ValueError(
-            f"Unsupported candle time type: {type(value).__name__}"
+            f"Unsupported candle time type: "
+            f"{type(value).__name__}"
         )
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
 
-    return int(dt.astimezone(timezone.utc).timestamp())
+    return int(
+        dt.astimezone(timezone.utc).timestamp()
+    )
 
 
-def normalize_chart_candles(raw_candles: Any) -> list[dict[str, Any]]:
-    """Return sorted, unique OHLC bars in Lightweight Charts format."""
+def normalize_chart_candles(
+    raw_candles: Any,
+) -> list[dict[str, Any]]:
 
     if isinstance(raw_candles, dict):
+
         raw_candles = raw_candles.get(
             "candles",
             raw_candles.get(
@@ -300,19 +281,25 @@ def normalize_chart_candles(raw_candles: Any) -> list[dict[str, Any]]:
         )
 
     if not isinstance(raw_candles, (list, tuple)):
+
         raise ValueError(
             "Market-data engine returned an unexpected candle payload"
         )
 
-    by_time: dict[int, dict[str, Any]] = {}
+    by_time = {}
 
     for candle in raw_candles:
+
         if not isinstance(candle, dict):
             continue
 
         try:
+
             stamp = candle_time_to_unix(
-                candle.get("time", candle.get("timestamp"))
+                candle.get(
+                    "time",
+                    candle.get("timestamp"),
+                )
             )
 
             bar = {
@@ -331,12 +318,8 @@ def normalize_chart_candles(raw_candles: Any) -> list[dict[str, Any]]:
             )
 
             if not all(
-                map(
-                    lambda number:
-                    number == number
-                    and abs(number) != float("inf"),
-                    values,
-                )
+                math.isfinite(number)
+                for number in values
             ):
                 continue
 
@@ -370,52 +353,23 @@ def normalize_chart_candles(raw_candles: Any) -> list[dict[str, Any]]:
     ]
 
 
-# ---------------------------------------------------------
-# CANDLE CACHE ACCESS
-# ---------------------------------------------------------
-
-def get_cached_candles(engine, symbol, timeframe, count):
-    """
-    Read the existing engine candle cache.
-
-    The Vrotex MarketDataEngine cache uses:
-        (instrument, timeframe, price_type)
-
-    This function does not create or replace the cache.
-    """
-
-    cache = getattr(engine, "candle_cache", None)
-
-    if not isinstance(cache, dict):
-        return []
-
-    keys = (
-        (symbol, timeframe, "bid"),
-        (symbol.upper(), timeframe.upper(), "bid"),
-    )
-
-    for key in keys:
-        candles = cache.get(key)
-
-        if isinstance(candles, (list, tuple)):
-            return list(candles)[-count:]
-
-    return []
-
-
-# ---------------------------------------------------------
+# ============================================================
 # DASHBOARD LOGGING
-# ---------------------------------------------------------
+# ============================================================
 
 class DashboardLogHandler(logging.Handler):
 
-    def emit(self, record: logging.LogRecord) -> None:
+    def emit(self, record: logging.LogRecord):
+
         try:
+
             entry = {
                 "timestamp": datetime.fromtimestamp(
                     record.created,
                     timezone.utc,
-                ).astimezone().isoformat(timespec="seconds"),
+                ).astimezone().isoformat(
+                    timespec="seconds"
+                ),
 
                 "level": record.levelname,
                 "logger": record.name,
@@ -425,6 +379,7 @@ class DashboardLogHandler(logging.Handler):
             LOGS.append(entry)
 
             try:
+
                 loop = asyncio.get_running_loop()
 
                 loop.create_task(
@@ -441,12 +396,16 @@ class DashboardLogHandler(logging.Handler):
             self.handleError(record)
 
 
-async def broadcast(payload: dict[str, Any]) -> None:
+async def broadcast(payload: dict[str, Any]):
+
     dead = []
 
     for ws in tuple(CLIENTS):
+
         try:
-            await ws.send_json(make_json_safe(payload))
+            await ws.send_json(
+                make_json_safe(payload)
+            )
 
         except Exception:
             dead.append(ws)
@@ -455,11 +414,12 @@ async def broadcast(payload: dict[str, Any]) -> None:
         CLIENTS.discard(ws)
 
 
-# ---------------------------------------------------------
-# FASTAPI APPLICATION
-# ---------------------------------------------------------
+# ============================================================
+# DASHBOARD APPLICATION
+# ============================================================
 
 def create_app(bot: Any) -> FastAPI:
+
     global _LOG_HANDLER
 
     app = FastAPI(
@@ -469,16 +429,25 @@ def create_app(bot: Any) -> FastAPI:
     static_dir = Path(__file__).resolve().parent
 
     if _LOG_HANDLER is None:
+
         _LOG_HANDLER = DashboardLogHandler()
         _LOG_HANDLER.setLevel(logging.INFO)
 
-        logging.getLogger().addHandler(_LOG_HANDLER)
+        logging.getLogger().addHandler(
+            _LOG_HANDLER
+        )
+
+    # --------------------------------------------------------
+    # HOMEPAGE
+    # --------------------------------------------------------
 
     @app.get("/", include_in_schema=False)
     async def home():
+
         dashboard_file = static_dir / "index.html"
 
         if not dashboard_file.is_file():
+
             raise HTTPException(
                 status_code=404,
                 detail="Dashboard file not found",
@@ -488,9 +457,11 @@ def create_app(bot: Any) -> FastAPI:
 
     @app.head("/", include_in_schema=False)
     async def home_head():
+
         dashboard_file = static_dir / "index.html"
 
         if not dashboard_file.is_file():
+
             raise HTTPException(
                 status_code=404,
                 detail="Dashboard file not found",
@@ -498,26 +469,44 @@ def create_app(bot: Any) -> FastAPI:
 
         return FileResponse(dashboard_file)
 
+    # --------------------------------------------------------
+    # HEALTH
+    # --------------------------------------------------------
+
     @app.get("/health")
     async def health():
+
         return await dashboard_state(bot)
+
+    # --------------------------------------------------------
+    # DASHBOARD STATUS
+    # --------------------------------------------------------
 
     @app.get("/api/dashboard")
     async def dashboard():
+
         return await dashboard_state(bot)
+
+    # --------------------------------------------------------
+    # LIVE LOGS
+    # --------------------------------------------------------
 
     @app.get("/api/logs")
     async def logs():
+
         return {
-            "logs": make_json_safe(list(LOGS))
+            "logs": make_json_safe(
+                list(LOGS)
+            )
         }
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # HISTORICAL CHART CANDLES
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     @app.get("/api/chart/candles")
     async def chart_candles(
+
         symbol: str = Query(
             "EURUSD",
             min_length=6,
@@ -535,18 +524,21 @@ def create_app(bot: Any) -> FastAPI:
             ge=1,
             le=MAX_CHART_CANDLES,
         ),
+
     ):
 
         symbol = symbol.upper().strip()
         timeframe = timeframe.upper().strip()
 
         if symbol not in CHART_INSTRUMENTS:
+
             raise HTTPException(
                 status_code=400,
                 detail="Instrument is not enabled for Vrotex V1",
             )
 
         if timeframe not in CHART_TIMEFRAMES:
+
             raise HTTPException(
                 status_code=400,
                 detail="Unsupported chart timeframe",
@@ -563,31 +555,32 @@ def create_app(bot: Any) -> FastAPI:
         }
 
         try:
-            # Resolve the actual running engine from the bot runtime.
-            market_engine = resolve_market_data_engine(bot)
 
-            # First read the existing in-memory candle cache.
+            from market_data_engine import market_data_engine
+
             raw = await asyncio.to_thread(
-                get_cached_candles,
-                market_engine,
+                market_data_engine._get_recent_candles,
                 symbol,
                 timeframe,
+                "bid",
                 count,
             )
 
             bars = normalize_chart_candles(raw)
 
-            # Request additional history only when the cache is short.
             if len(bars) < count:
 
                 end = datetime.now(timezone.utc)
 
                 start = end - timedelta(
-                    seconds=timeframe_seconds[timeframe] * count
+                    seconds=(
+                        timeframe_seconds[timeframe]
+                        * count
+                    )
                 )
 
                 fetched = await asyncio.to_thread(
-                    market_engine.get_historical_candles,
+                    market_data_engine.get_historical_candles,
                     symbol,
                     timeframe,
                     start,
@@ -595,12 +588,10 @@ def create_app(bot: Any) -> FastAPI:
                     "bid",
                 )
 
-                # Merge cache and fetched candles without duplicates.
                 bars = normalize_chart_candles(
-                    list(raw or []) + list(fetched or [])
-                )
-
-            bars = bars[-count:]
+                    list(raw or [])
+                    + list(fetched or [])
+                )[-count:]
 
             return {
                 "symbol": symbol,
@@ -610,7 +601,7 @@ def create_app(bot: Any) -> FastAPI:
                 "count": len(bars),
 
                 "source": (
-                    "ENGINE_CACHE_AND_EXNESS"
+                    "SQLITE_CACHE_AND_EXNESS"
                     if bars
                     else "UNAVAILABLE"
                 ),
@@ -626,6 +617,7 @@ def create_app(bot: Any) -> FastAPI:
             raise
 
         except Exception as exc:
+
             logging.getLogger(__name__).exception(
                 "Chart candle request failed for %s %s",
                 symbol,
@@ -640,14 +632,15 @@ def create_app(bot: Any) -> FastAPI:
                 ),
             ) from exc
 
-    # -----------------------------------------------------
-    # EXNESS ACCOUNT API
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # EXNESS ACCOUNT SNAPSHOT
+    # --------------------------------------------------------
 
     @app.get("/api/account")
     async def account_snapshot():
 
         try:
+
             from exness_connection import (
                 get_account_details,
                 engine_status,
@@ -662,6 +655,7 @@ def create_app(bot: Any) -> FastAPI:
             )
 
             if not isinstance(details, dict):
+
                 raise RuntimeError(
                     "Exness account endpoint returned an unexpected payload"
                 )
@@ -671,6 +665,7 @@ def create_app(bot: Any) -> FastAPI:
                 if isinstance(data, dict):
 
                     for key, value in data.items():
+
                         if (
                             str(key).lower() in aliases
                             and value is not None
@@ -678,6 +673,7 @@ def create_app(bot: Any) -> FastAPI:
                             return value
 
                     for value in data.values():
+
                         found = find_value(
                             value,
                             aliases,
@@ -689,6 +685,7 @@ def create_app(bot: Any) -> FastAPI:
                 elif isinstance(data, (list, tuple)):
 
                     for item in data:
+
                         found = find_value(
                             item,
                             aliases,
@@ -746,9 +743,11 @@ def create_app(bot: Any) -> FastAPI:
 
             return {
                 "status": "ok",
-                "connected": bool(
-                    connection.get("connected")
-                ) if isinstance(connection, dict) else False,
+                "connected": (
+                    bool(connection.get("connected"))
+                    if isinstance(connection, dict)
+                    else False
+                ),
 
                 "account_id": (
                     connection.get("account_id")
@@ -757,15 +756,15 @@ def create_app(bot: Any) -> FastAPI:
                 ),
 
                 "account": normalized,
-
                 "raw": make_json_safe(details),
 
-                "updated_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
+                "updated_at": (
+                    datetime.now(timezone.utc).isoformat()
+                ),
             }
 
         except Exception as exc:
+
             logging.getLogger(__name__).exception(
                 "Exness account snapshot failed"
             )
@@ -778,36 +777,41 @@ def create_app(bot: Any) -> FastAPI:
                 ),
             ) from exc
 
-    # -----------------------------------------------------
-    # LIVE TICK API
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # LIVE CHART TICK
+    # --------------------------------------------------------
 
     @app.get("/api/chart/tick")
     async def chart_tick(
+
         symbol: str = Query(
             "EURUSD",
             min_length=6,
             max_length=10,
         ),
+
     ):
 
         symbol = symbol.upper().strip()
 
         if symbol not in CHART_INSTRUMENTS:
+
             raise HTTPException(
                 status_code=400,
                 detail="Instrument is not enabled for Vrotex V1",
             )
 
         try:
-            market_engine = resolve_market_data_engine(bot)
+
+            from market_data_engine import market_data_engine
 
             tick = get_engine_tick(
-                market_engine,
+                market_data_engine,
                 symbol,
             )
 
             if not tick:
+
                 return {
                     "symbol": symbol,
                     "bid": None,
@@ -848,6 +852,7 @@ def create_app(bot: Any) -> FastAPI:
             raise
 
         except Exception as exc:
+
             logging.getLogger(__name__).exception(
                 "Chart tick request failed for %s",
                 symbol,
@@ -861,30 +866,45 @@ def create_app(bot: Any) -> FastAPI:
                 ),
             ) from exc
 
-    # -----------------------------------------------------
-    # BOT CONTROL — EXISTING SECURITY GATE
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # START BOT
+    # --------------------------------------------------------
 
     @app.post("/api/bot/start")
     async def start_bot():
-        return await control(bot, "start")
+
+        return await control(
+            bot,
+            "start",
+        )
+
+    # --------------------------------------------------------
+    # STOP BOT
+    # --------------------------------------------------------
 
     @app.post("/api/bot/stop")
     async def stop_bot():
-        return await control(bot, "stop")
 
-    # -----------------------------------------------------
+        return await control(
+            bot,
+            "stop",
+        )
+
+    # --------------------------------------------------------
     # LIVE LOG WEBSOCKET
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     @app.websocket("/ws/logs")
     async def log_socket(ws: WebSocket):
 
         await ws.accept()
+
         CLIENTS.add(ws)
 
         try:
+
             for item in list(LOGS)[-100:]:
+
                 await ws.send_json(
                     make_json_safe({
                         "type": "log",
@@ -899,6 +919,7 @@ def create_app(bot: Any) -> FastAPI:
             pass
 
         except Exception:
+
             logging.getLogger(__name__).exception(
                 "Dashboard log WebSocket failed"
             )
@@ -909,27 +930,37 @@ def create_app(bot: Any) -> FastAPI:
     return app
 
 
-# ---------------------------------------------------------
+# ============================================================
 # DASHBOARD STATE
-# ---------------------------------------------------------
+# ============================================================
 
-async def dashboard_state(bot: Any) -> dict[str, Any]:
+async def dashboard_state(
+    bot: Any,
+) -> dict[str, Any]:
 
     errors = {}
+
     engine_status = {}
     market_status = {}
     state = {}
     quotes = []
-    market_engine = None
 
-    # Trading engine status.
+    market_data_engine = None
+
+    # --------------------------------------------------------
+    # TRADING ENGINE STATUS
+    # --------------------------------------------------------
+
     try:
+
         from engine import engine
 
         try:
+
             engine_status = engine.get_status()
 
         except Exception as exc:
+
             errors["engine"] = (
                 f"{type(exc).__name__}: {exc}"
             )
@@ -940,6 +971,7 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             }
 
     except Exception as exc:
+
         errors["engine"] = (
             f"{type(exc).__name__}: {exc}"
         )
@@ -949,15 +981,33 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             "error": errors["engine"],
         }
 
-    # Resolve the actual market-data instance.
-    try:
-        market_engine = resolve_market_data_engine(bot)
+    # --------------------------------------------------------
+    # MARKET DATA STATUS
+    # --------------------------------------------------------
 
-        market_status = await asyncio.to_thread(
-            market_engine.get_status
-        )
+    try:
+
+        from market_data_engine import market_data_engine
+
+        try:
+
+            market_status = (
+                market_data_engine.get_status()
+            )
+
+        except Exception as exc:
+
+            errors["market_data"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            market_status = {
+                "available": False,
+                "error": errors["market_data"],
+            }
 
     except Exception as exc:
+
         errors["market_data"] = (
             f"{type(exc).__name__}: {exc}"
         )
@@ -967,14 +1017,20 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             "error": errors["market_data"],
         }
 
-    # State manager.
+    # --------------------------------------------------------
+    # STATE MANAGER
+    # --------------------------------------------------------
+
     try:
+
         from state_manager import state_manager
 
         try:
+
             state = state_manager.get_state()
 
         except Exception as exc:
+
             errors["state"] = (
                 f"{type(exc).__name__}: {exc}"
             )
@@ -985,6 +1041,7 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             }
 
     except Exception as exc:
+
         errors["state"] = (
             f"{type(exc).__name__}: {exc}"
         )
@@ -994,81 +1051,103 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
             "error": errors["state"],
         }
 
-    # Live quotes.
-    for symbol in (
-        "EURUSD",
-        "GBPUSD",
-        "BTCUSD",
-    ):
+    # --------------------------------------------------------
+    # LIVE QUOTES
+    # --------------------------------------------------------
 
-        try:
-            if market_engine is None:
-                raise RuntimeError(
-                    "Market-data engine unavailable"
+    if market_data_engine is not None:
+
+        for symbol in (
+            "EURUSD",
+            "GBPUSD",
+            "BTCUSD",
+        ):
+
+            try:
+
+                tick = get_engine_tick(
+                    market_data_engine,
+                    symbol,
                 )
 
-            tick = get_engine_tick(
-                market_engine,
-                symbol,
-            )
+                if tick:
 
-            if tick:
-                tick = make_json_safe(tick)
+                    tick = make_json_safe(tick)
 
-                if not isinstance(tick, dict):
-                    tick = {}
+                    if not isinstance(tick, dict):
+                        tick = {}
 
-                fresh = bool(
-                    tick.get("fresh", False)
+                    fresh = bool(
+                        tick.get("fresh", False)
+                    )
+
+                    quotes.append({
+                        "symbol": symbol,
+                        "bid": tick.get("bid"),
+                        "ask": tick.get("ask"),
+                        "fresh": fresh,
+
+                        "reason": (
+                            None
+                            if fresh
+                            else "STALE / MARKET CLOSED"
+                        ),
+                    })
+
+                else:
+
+                    quotes.append({
+                        "symbol": symbol,
+                        "bid": None,
+                        "ask": None,
+                        "fresh": False,
+                        "reason": "NO LIVE TICK",
+                    })
+
+            except Exception as exc:
+
+                errors[f"quote_{symbol}"] = (
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-                quotes.append({
-                    "symbol": symbol,
-                    "bid": tick.get("bid"),
-                    "ask": tick.get("ask"),
-                    "fresh": fresh,
-
-                    "reason": (
-                        None
-                        if fresh
-                        else "STALE / MARKET CLOSED"
-                    ),
-                })
-
-            else:
                 quotes.append({
                     "symbol": symbol,
                     "bid": None,
                     "ask": None,
                     "fresh": False,
-                    "reason": "NO LIVE TICK",
+                    "reason": "QUOTE UNAVAILABLE",
                 })
 
-        except Exception as exc:
-            errors[f"quote_{symbol}"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
+    else:
 
-            quotes.append({
+        quotes = [
+            {
                 "symbol": symbol,
                 "bid": None,
                 "ask": None,
                 "fresh": False,
-                "reason": "QUOTE UNAVAILABLE",
-            })
+                "reason": "MARKET DATA ENGINE UNAVAILABLE",
+            }
 
-    # Engine task state.
+            for symbol in (
+                "EURUSD",
+                "GBPUSD",
+                "BTCUSD",
+            )
+        ]
+
+    # --------------------------------------------------------
+    # ENGINE RUNNING STATE
+    # --------------------------------------------------------
+
     engine_task = getattr(
         bot,
         "engine_task",
         None,
     )
 
-    # Support a runtime dictionary without assuming it has an asyncio task.
-    if isinstance(bot, dict):
-        engine_task = bot.get("engine_task")
-
     try:
+
         running = bool(
             engine_task is not None
             and not engine_task.done()
@@ -1109,20 +1188,172 @@ async def dashboard_state(bot: Any) -> dict[str, Any]:
     return response
 
 
-# ---------------------------------------------------------
-# CONTROL SECURITY
-# ---------------------------------------------------------
+# ============================================================
+# FUNCTIONAL BOT CONTROL
+# ============================================================
 
-async def control(bot: Any, action: str) -> dict[str, Any]:
+async def control(
+    bot: Any,
+    action: str,
+) -> dict[str, Any]:
 
-    # Preserve the existing security gate.
-    # Remote bot control remains disabled.
+    action = action.lower().strip()
 
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Dashboard control is not enabled yet. "
-            "Secure control setup is required before "
-            "remote start/stop can be activated."
-        ),
+    logger = logging.getLogger(__name__)
+
+    if action not in ("start", "stop"):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid bot control action",
+        )
+
+    # --------------------------------------------------------
+    # START EXISTING TRADING ENGINE
+    # --------------------------------------------------------
+
+    if action == "start":
+
+        start_method = getattr(
+            bot,
+            "start_engine",
+            None,
+        )
+
+        if not callable(start_method):
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The existing Vrotex start_engine "
+                    "method is unavailable."
+                ),
+            )
+
+        try:
+
+            logger.info(
+                "Dashboard requested Vrotex Bot V1 START."
+            )
+
+            result = await start_method()
+
+            running = bool(
+                getattr(bot, "is_engine_running")()
+            )
+
+            if isinstance(result, dict):
+
+                response = dict(result)
+
+                response["running"] = running
+
+                response["action"] = "start"
+
+                return response
+
+            return {
+                "success": running,
+                "running": running,
+                "action": "start",
+                "message": (
+                    "Vrotex trading engine started."
+                    if running
+                    else "Vrotex trading engine did not start."
+                ),
+            }
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+
+            logger.exception(
+                "Dashboard START command failed."
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Vrotex engine startup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+
+    # --------------------------------------------------------
+    # STOP EXISTING TRADING ENGINE
+    # --------------------------------------------------------
+
+    stop_method = getattr(
+        bot,
+        "stop_engine",
+        None,
     )
+
+    if not callable(stop_method):
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The existing Vrotex stop_engine "
+                "method is unavailable."
+            ),
+        )
+
+    try:
+
+        logger.warning(
+            "Dashboard requested Vrotex Bot V1 STOP."
+        )
+
+        result = await stop_method()
+
+        is_running_method = getattr(
+            bot,
+            "is_engine_running",
+            None,
+        )
+
+        running = (
+            bool(is_running_method())
+            if callable(is_running_method)
+            else False
+        )
+
+        if isinstance(result, dict):
+
+            response = dict(result)
+
+            response["running"] = running
+
+            response["action"] = "stop"
+
+            return response
+
+        return {
+            "success": not running,
+            "running": running,
+            "action": "stop",
+            "message": (
+                "Vrotex trading engine stopped."
+                if not running
+                else "Vrotex trading engine is still running."
+            ),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        logger.exception(
+            "Dashboard STOP command failed."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Vrotex engine shutdown failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
