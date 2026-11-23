@@ -4,7 +4,8 @@
 # Autonomous Exness Order Execution
 #
 # Opens market positions, checks operation status,
-# and verifies opened positions through Exness.
+# verifies opened positions, and registers confirmed
+# positions with Trade Manager.
 
 import asyncio
 import hashlib
@@ -19,7 +20,7 @@ logger = get_logger("broker.exness_order_executor")
 
 class ExnessOrderExecutor:
 
-    VERSION = "2.1"
+    VERSION = "2.2"
 
     ALLOWED_INSTRUMENTS = {
         "EURUSD",
@@ -445,15 +446,96 @@ class ExnessOrderExecutor:
         return f"vrotex-{digest[:48]}"
 
     # ==========================================================
+    # TRADE MANAGER INTEGRATION
+    # ==========================================================
+
+    async def _register_with_trade_manager(
+        self,
+        result,
+        setup,
+    ):
+
+        """
+        Register a broker-confirmed position with Trade Manager.
+
+        This is called only after the Exness snapshot confirms
+        that the position is actually open.
+        """
+
+        if not isinstance(result, dict):
+            return False
+
+        if result.get("status") != "CONFIRMED":
+            return False
+
+        if result.get("trade_manager_registered") is True:
+            return True
+
+        verification = result.get("verification")
+
+        if not isinstance(verification, dict):
+            return False
+
+        if not isinstance(
+            verification.get("position"),
+            dict,
+        ):
+            return False
+
+        try:
+
+            from trade_management import trade_manager
+
+            register = getattr(
+                trade_manager,
+                "register_confirmed_position",
+                None,
+            )
+
+            if not callable(register):
+
+                raise RuntimeError(
+                    "Trade Manager registration method unavailable"
+                )
+
+            registration_result = register(
+                result,
+                setup=setup,
+            )
+
+            if asyncio.iscoroutine(registration_result):
+                registration_result = await registration_result
+
+            result["trade_manager_registered"] = True
+            result["trade_manager_result"] = (
+                registration_result
+            )
+
+            logger.info(
+                "TRADE MANAGER REGISTERED POSITION | "
+                "%s | Position ID=%s",
+                setup.get("instrument"),
+                verification.get("position_id"),
+            )
+
+            return True
+
+        except Exception as exc:
+
+            result["trade_manager_registered"] = False
+            result["trade_manager_error"] = str(exc)
+
+            logger.exception(
+                "Trade Manager registration failed"
+            )
+
+            return False
+
+    # ==========================================================
     # OPEN MARKET POSITION
     # ==========================================================
 
     async def _submit_order(self, setup, request_id):
-
-        """
-        Submit an actual market position through the
-        ExnessConnection.open_position() method.
-        """
 
         response = await self.connection.open_position(
             instrument=setup["instrument"],
@@ -548,11 +630,6 @@ class ExnessOrderExecutor:
     # ==========================================================
 
     def _find_open_position(self, snapshot, setup):
-
-        """
-        Find the actual matching position in the Exness
-        trading snapshot.
-        """
 
         if not isinstance(snapshot, (dict, list)):
             return None
@@ -815,6 +892,7 @@ class ExnessOrderExecutor:
                     "entry_price": normalized["entry_price"],
                     "stop_loss_price": normalized["stop_loss_price"],
                     "take_profit_price": normalized["take_profit_price"],
+                    "risk_percent": normalized["risk_percent"],
                     "score": normalized["score"],
                     "acknowledgement": acknowledgement,
                 }
@@ -827,7 +905,6 @@ class ExnessOrderExecutor:
                 )
 
                 result["verification"] = verification
-
                 result["status"] = verification["status"]
 
                 if result["status"] == "CONFIRMED":
@@ -835,6 +912,11 @@ class ExnessOrderExecutor:
                     result["success"] = True
 
                     self.orders_confirmed += 1
+
+                    await self._register_with_trade_manager(
+                        result,
+                        normalized,
+                    )
 
                     self.completed_orders[request_id] = result
 
@@ -869,6 +951,10 @@ class ExnessOrderExecutor:
 
                     self.orders_pending += 1
 
+                    # Keep the original normalized setup so
+                    # reconciliation can verify and register it.
+                    result["_setup"] = dict(normalized)
+
                     self.pending_orders[request_id] = result
 
                     logger.warning(
@@ -888,15 +974,18 @@ class ExnessOrderExecutor:
                 )
 
                 # The request may have reached Exness before
-                # a network error occurred. Preserve its ID.
+                # a network error occurred. Preserve its ID
+                # and setup for later reconciliation.
                 result = {
                     "success": False,
                     "status": "ERROR",
                     "request_id": request_id,
                     "instrument": normalized["instrument"],
                     "side": normalized["side"],
+                    "volume": normalized["volume"],
                     "reason": str(exc),
                     "reconciliation_required": True,
+                    "_setup": dict(normalized),
                 }
 
                 self.pending_orders[request_id] = result
@@ -916,20 +1005,9 @@ class ExnessOrderExecutor:
             self.pending_orders.items()
         ):
 
-            setup = {
-                "instrument": previous.get("instrument"),
-                "side": previous.get("side"),
-                "volume": previous.get("volume"),
-            }
-
-            # Recover the full setup from the original order
-            # when available.
             full_setup = previous.get("_setup")
 
-            if isinstance(full_setup, dict):
-                setup = full_setup
-
-            else:
+            if not isinstance(full_setup, dict):
                 continue
 
             try:
@@ -940,7 +1018,7 @@ class ExnessOrderExecutor:
                 )
 
                 verification = await self._verify_execution(
-                    setup,
+                    full_setup,
                     acknowledgement,
                 )
 
@@ -953,11 +1031,25 @@ class ExnessOrderExecutor:
 
                     self.orders_confirmed += 1
 
+                    await self._register_with_trade_manager(
+                        previous,
+                        full_setup,
+                    )
+
+                    previous.pop("_setup", None)
+
                     self.completed_orders[request_id] = previous
 
                     self.pending_orders.pop(
                         request_id,
                         None,
+                    )
+
+                    logger.info(
+                        "PENDING POSITION CONFIRMED AND "
+                        "REGISTERED | %s | Position ID=%s",
+                        previous.get("instrument"),
+                        verification.get("position_id"),
                     )
 
                 elif verification["status"] == "FAILED":
