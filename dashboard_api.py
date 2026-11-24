@@ -728,18 +728,14 @@ def create_app(bot: Any) -> FastAPI:
 
         try:
 
-            from exness_connection import (
-                get_account_details,
-                engine_status,
-            )
+            from exness_connection import exness_connection
 
-            details = await asyncio.to_thread(
-                get_account_details
-            )
+if not exness_connection.connected:
+    raise RuntimeError("No Exness account is connected.")
 
-            connection = await asyncio.to_thread(
-                engine_status
-            )
+details = await exness_connection.get_trading_snapshot()
+
+connection = exness_connection.get_connection_status()
 
             if not isinstance(details, dict):
 
