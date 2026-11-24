@@ -1380,5 +1380,95 @@ document.getElementById('stop').addEventListener('click',()=>{ previewRunning=fa
 })();
 </script>
 
+<!-- VROTEX AI CHAT API CONNECTION -->
+<script>
+(function () {
+    const input = document.getElementById("vai-input");
+    const sendButton = document.getElementById("vai-send-button");
+    const messages = document.getElementById("vai-messages");
+    const newChatButton = document.getElementById("vai-new-chat");
+
+    if (!input || !sendButton || !messages) {
+        console.error("Vrotex AI chat elements not found.");
+        return;
+    }
+
+    let conversationId = null;
+    let sending = false;
+
+    async function sendVrotexMessage() {
+        const message = input.value.trim();
+
+        if (!message || sending) return;
+
+        sending = true;
+        sendButton.disabled = true;
+
+        const userMessage = document.createElement("div");
+        userMessage.className = "vai-message vai-user-message";
+        userMessage.textContent = message;
+        messages.appendChild(userMessage);
+
+        input.value = "";
+
+        const reply = document.createElement("div");
+        reply.className = "vai-message vai-assistant-message";
+        reply.textContent = "Vrotex is thinking...";
+        messages.appendChild(reply);
+
+        messages.scrollTop = messages.scrollHeight;
+
+        try {
+            const response = await fetch("/api/ai/chat", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    message: message,
+                    conversation_id: conversationId
+                })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(
+                    data.detail || "AI request failed."
+                );
+            }
+
+            conversationId = data.conversation_id;
+            reply.textContent = data.reply;
+
+        } catch (error) {
+            reply.textContent =
+                "Vrotex AI connection error: " + error.message;
+        } finally {
+            sending = false;
+            sendButton.disabled = false;
+            messages.scrollTop = messages.scrollHeight;
+            input.focus();
+        }
+    }
+
+    sendButton.addEventListener("click", sendVrotexMessage);
+
+    input.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            sendVrotexMessage();
+        }
+    });
+
+    if (newChatButton) {
+        newChatButton.addEventListener("click", function () {
+            conversationId = null;
+        });
+    }
+})();
+</script>
+
+  
 </body>
 </html>
