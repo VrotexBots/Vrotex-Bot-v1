@@ -212,6 +212,42 @@ class ExecutionManager:
 
         return True, decision
 
+    async def execute_automatic_demo_once(self):
+        """
+        Trigger the one-time automatic Exness DEMO order.
+        This bypasses normal strategy approval and risk checks
+        for this specific demonstration only.
+        """
+
+        if not self.execution_enabled:
+            return {
+                "success": False,
+                "status": "DISABLED",
+                "reason": "Execution switch disabled",
+            }
+
+        if not self.auto_execution:
+            return {
+                "success": False,
+                "status": "DISABLED",
+                "reason": "Automatic execution switch disabled",
+            }
+
+        try:
+            from exness_order_executor import exness_order_executor
+
+            result = await exness_order_executor.execute_automatic_demo_once()
+
+            return result
+
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "EXECUTION_ERROR",
+                "reason": str(exc),
+            }
+
+    
     async def execute(self, setup):
 
         if not self.execution_enabled:
