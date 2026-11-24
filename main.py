@@ -277,6 +277,26 @@ class VrotexBot:
             # initialization.
             manager_started = await self.start_trade_manager()
 
+            # ONE-TIME AUTOMATIC EXNESS DEMO EXECUTION
+            if manager_started:
+                try:
+                    from execution_manager import execution_manager
+
+                    demo_result = await (
+                        execution_manager.execute_automatic_demo_once()
+                    )
+
+                    logger.info(
+                        "AUTOMATIC DEMO ORDER RESULT: %s",
+                        demo_result,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Automatic demo execution failed."
+                    )
+
+            
             return {
                 "success": True,
                 "running": True,
