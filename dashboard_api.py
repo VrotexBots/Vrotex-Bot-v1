@@ -999,6 +999,88 @@ def create_app(bot: Any) -> FastAPI:
         finally:
             CLIENTS.discard(ws)
 
+    # --------------------------------------------------------
+    # EXNESS BROKER CONNECTION
+    # --------------------------------------------------------
+
+    @app.post("/api/broker/connect")
+    async def connect_broker(request: Request):
+
+        try:
+            payload = await request.json()
+
+            api_key = payload.get("api_key") or payload.get("apiKey")
+            private_key = (
+                payload.get("private_key")
+                or payload.get("privateKey")
+                or payload.get("secret")
+            )
+            account_id = (
+                payload.get("account_id")
+                or payload.get("accountId")
+            )
+            gateway = (
+                payload.get("gateway_host")
+                or payload.get("gateway")
+                or payload.get("server")
+            )
+            account_type = str(
+                payload.get("account_type")
+                or payload.get("account_mode")
+                or payload.get("mode")
+                or ""
+            ).strip().upper()
+
+            if account_type not in {"DEMO", "LIVE"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select DEMO or LIVE."
+                )
+
+            if not all((api_key, private_key, account_id, gateway)):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Complete all Exness connection fields."
+                )
+
+            from exness_connection import exness_connection
+
+            await exness_connection.disconnect()
+
+            exness_connection.api_key = str(api_key).strip()
+            exness_connection.private_key_text = str(private_key)
+            exness_connection.account_id = str(account_id).strip()
+            exness_connection.gateway_host = str(gateway).strip().rstrip("/")
+
+            exness_connection.access_point = None
+            exness_connection.account_info = None
+            exness_connection.account_type = account_type
+
+            result = await exness_connection.connect()
+
+            return {
+                "success": True,
+                "connected": True,
+                "broker": "Exness",
+                "account_type": account_type,
+                "account_id": exness_connection.account_id,
+                "account": make_json_safe(result.get("account")),
+                "connection": exness_connection.get_connection_status(),
+            }
+
+        except HTTPException:
+            raise
+
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Exness Broker connection failed."
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=f"Exness connection failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
     return app
 
 
