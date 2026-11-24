@@ -804,7 +804,7 @@ class ExnessOrderExecutor:
 
         async with self._execution_lock:
 
-            acknowledgement = "vrotex-auto-demo-eurusd-buy-001"
+            request_id = "vrotex-auto-demo-eurusd-buy-001"
 
             setup = {
                 "instrument": "EURUSD",
