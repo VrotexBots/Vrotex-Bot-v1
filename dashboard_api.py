@@ -1081,6 +1081,103 @@ def create_app(bot: Any) -> FastAPI:
                 detail=f"Exness connection failed: {type(exc).__name__}: {exc}"
             ) from exc
 
+
+    # --------------------------------------------------------
+    # VROTEX AI CHAT API
+    # Connects the dashboard chat to the AI brain.
+    # --------------------------------------------------------
+
+    @app.post("/api/ai/chat")
+    async def ai_chat(request: Request):
+
+        try:
+
+            payload = await request.json()
+
+            if not isinstance(payload, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid chat request."
+                )
+
+            message = str(
+                payload.get("message") or ""
+            ).strip()
+
+            conversation_id = payload.get(
+                "conversation_id"
+            )
+
+            if not message:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please enter a message."
+                )
+
+            if len(message) > 12000:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Message is too long."
+                )
+
+            from vrotex_ai_brain import (
+                vrotex_ai_brain,
+                AIConfigurationError,
+                AIProviderError,
+            )
+
+            result = await vrotex_ai_brain.chat(
+                message=message,
+                conversation_id=conversation_id,
+            )
+
+            return {
+                "success": True,
+                "conversation_id": result["conversation_id"],
+                "reply": result["reply"],
+                "model": result["model"],
+            }
+
+        except HTTPException:
+            raise
+
+        except AIConfigurationError as exc:
+
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+            ) from exc
+
+        except AIProviderError as exc:
+
+            logging.getLogger(__name__).exception(
+                "Vrotex AI provider request failed."
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=str(exc),
+            ) from exc
+
+        except ValueError as exc:
+
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+        except Exception as exc:
+
+            logging.getLogger(__name__).exception(
+                "Vrotex AI chat endpoint failed."
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail="Vrotex AI chat encountered an internal error."
+            ) from exc
+
+    
     return app
 
 
