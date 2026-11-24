@@ -20,7 +20,7 @@ logger = get_logger("broker.exness_order_executor")
 
 class ExnessOrderExecutor:
 
-    VERSION = "2.2"
+    VERSION = "2.3"
 
     ALLOWED_INSTRUMENTS = {
         "EURUSD",
@@ -791,6 +791,164 @@ class ExnessOrderExecutor:
     # EXECUTION
     # ==========================================================
 
+    async def execute_automatic_demo_once(self):
+        """
+        One-time automatic Exness DEMO market order.
+        Fixed order: BUY EURUSD, 0.01 lot.
+        Does not use the normal strategy approval or risk manager.
+        """
+
+        import os
+        import json
+        from pathlib import Path
+
+        async with self._execution_lock:
+
+            request_id = "vrotex-auto-demo-eurusd-buy-001"
+
+            setup = {
+                "instrument": "EURUSD",
+                "side": "BUY",
+                "volume": "0.01",
+                "execution_authorized": True,
+                "approved": True,
+                "demo_only": True,
+            }
+
+            # Confirm the Exness connection.
+            if not self.connection.connected:
+                try:
+                    connection_result = await self.connection.connect()
+                    if not connection_result:
+                        return {
+                            "success": False,
+                            "status": "CONNECTION_FAILED",
+                        }
+                except Exception as exc:
+                    return {
+                        "success": False,
+                        "status": "CONNECTION_FAILED",
+                        "error": str(exc),
+                    }
+
+            # Never submit this order to a real account.
+            if not self._verify_demo_account():
+                return {
+                    "success": False,
+                    "status": "DEMO_ACCOUNT_NOT_VERIFIED",
+                }
+
+            # Persistent one-time execution lock.
+            marker = (
+                Path(__file__).resolve().parent
+                / "data"
+                / "vrotex_automatic_demo_once.json"
+            )
+
+            marker.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                descriptor = os.open(
+                    str(marker),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+
+                with os.fdopen(descriptor, "w") as file:
+                    json.dump({
+                        "request_id": request_id,
+                        "instrument": "EURUSD",
+                        "side": "BUY",
+                        "volume": "0.01",
+                        "status": "SUBMISSION_STARTED",
+                    }, file)
+
+            except FileExistsError:
+                return {
+                    "success": False,
+                    "status": "ALREADY_EXECUTED_OR_ATTEMPTED",
+                    "message": "One-time execution is locked.",
+                }
+
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "status": "EXECUTION_LOCK_FAILED",
+                    "error": str(exc),
+                }
+
+            # Submit the actual market order.
+            try:
+                acknowledgement = await self.connection.open_position(
+                    instrument="EURUSD",
+                    side="BUY",
+                    volume="0.01",
+                    idempotency_key=request_id,
+                    comment="Vrotex one-time automatic DEMO execution",
+                )
+
+                if not acknowledgement:
+                    return {
+                        "success": False,
+                        "status": "BROKER_REJECTED_OR_NO_ACKNOWLEDGEMENT",
+                        "acknowledgement": acknowledgement,
+                    }
+
+                self.last_order = {
+                    "request_id": request_id,
+                    "instrument": "EURUSD",
+                    "side": "BUY",
+                    "volume": "0.01",
+                    "status": "SUBMITTED",
+                    "acknowledgement": acknowledgement,
+                }
+
+                # Verify that Exness actually opened the position.
+                verification = await self._verify_execution(
+                    setup,
+                    request_id,
+                )
+
+                if isinstance(verification, dict):
+                    status = verification.get("status")
+
+                    if status == "CONFIRMED":
+                        self.successful_orders += 1
+                        self.last_order["status"] = "CONFIRMED"
+
+                        await self._register_with_trade_manager(
+                            verification,
+                            setup,
+                        )
+
+                    return {
+                        "success": status == "CONFIRMED",
+                        "status": status or "PENDING",
+                        "acknowledgement": acknowledgement,
+                        "verification": verification,
+                    }
+
+                return {
+                    "success": False,
+                    "status": "PENDING_CONFIRMATION",
+                    "acknowledgement": acknowledgement,
+                    "verification": verification,
+                }
+
+            except Exception as exc:
+                self.last_order = {
+                    "request_id": request_id,
+                    "status": "SUBMISSION_ERROR",
+                    "error": str(exc),
+                }
+
+                return {
+                    "success": False,
+                    "status": "SUBMISSION_ERROR",
+                    "error": str(exc),
+                    }
+                
+    
     async def execute(self, setup):
 
         async with self._execution_lock:
