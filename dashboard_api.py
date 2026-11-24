@@ -730,12 +730,14 @@ def create_app(bot: Any) -> FastAPI:
 
             from exness_connection import exness_connection
 
-if not exness_connection.connected:
-    raise RuntimeError("No Exness account is connected.")
 
-details = await exness_connection.get_trading_snapshot()
+            if not exness_connection.connected:
+                raise RuntimeError("No Exness account is connected.")
 
-connection = exness_connection.get_connection_status()
+            details = await exness_connection.get_trading_snapshot()
+
+            connection = exness_connection.get_connection_status()
+
 
             if not isinstance(details, dict):
 
