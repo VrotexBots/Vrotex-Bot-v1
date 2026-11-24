@@ -1266,23 +1266,374 @@ document.getElementById('stop').addEventListener('click',()=>{ previewRunning=fa
  observer.observe(page,{attributes:true,attributeFilter:['class']});if(page.classList.contains('active'))activate();
 })();
 
-
-// Vrotex AI interface-only chat. The backend engine is intentionally not connected in this stage.
+// Vrotex AI chat connected to the Vrotex backend API.
 (function initVrotexAIChat(){
- const page=document.getElementById('vrotex-ai-page');if(!page)return;
- const messages=document.getElementById('vai-messages'),welcome=document.getElementById('vai-welcome'),input=document.getElementById('vai-input'),fileInput=document.getElementById('vai-file-input'),galleryInput=document.getElementById('vai-gallery-input'),preview=document.getElementById('vai-attach-preview'),recordBtn=document.getElementById('vai-record-button'),recordStatus=document.getElementById('vai-record-status');
- let pending=[],mediaRecorder=null,recordChunks=[],recordedBlob=null,recording=false;
- function scrollBottom(){messages.scrollTop=messages.scrollHeight;}
- function clearPending(){pending.forEach(x=>{if(x.url)URL.revokeObjectURL(x.url);});pending=[];recordedBlob=null;preview.innerHTML='';recordStatus.hidden=true;recordStatus.textContent='';}
- function showPending(){preview.innerHTML='';pending.forEach(item=>{const node=document.createElement('div');node.className='vai-pending';node.textContent=item.name;preview.appendChild(node);});if(recordedBlob){const node=document.createElement('div');node.className='vai-pending';node.textContent='Voice recording ready';preview.appendChild(node);}}
- function attachFiles(files){for(const file of Array.from(files||[])){const url=URL.createObjectURL(file);pending.push({file,name:file.name,url,type:file.type});}showPending();}
- document.getElementById('vai-attach-button').addEventListener('click',()=>{if(!pending.length){fileInput.click();}else{const useGallery=confirm('Choose images from your gallery?\nPress OK for gallery images, Cancel for files.');(useGallery?galleryInput:fileInput).click();}});
- fileInput.addEventListener('change',()=>{attachFiles(fileInput.files);fileInput.value='';});galleryInput.addEventListener('change',()=>{attachFiles(galleryInput.files);galleryInput.value='';});
- function addMessage(role,text,items=[],voice=null){welcome.hidden=true;const block=document.createElement('article');block.className='vai-message '+role;const label=document.createElement('div');label.className='vai-message-label';label.textContent=role==='user'?'You':'Vrotex AI';block.appendChild(label);if(text){const content=document.createElement('div');content.className='vai-message-content';content.textContent=text;block.appendChild(content);}if(items.length){const wrap=document.createElement('div');wrap.className='vai-attachments';items.forEach(item=>{const card=document.createElement('div');card.className='vai-attachment';if(item.type&&item.type.startsWith('image/')){const img=document.createElement('img');img.src=item.url;img.alt=item.name;card.appendChild(img);}else{card.textContent='📎 '+item.name;}wrap.appendChild(card);});block.appendChild(wrap);}if(voice){const card=document.createElement('div');card.className='vai-attachment';const audio=document.createElement('audio');audio.controls=true;audio.src=URL.createObjectURL(voice);card.appendChild(audio);block.appendChild(card);}messages.appendChild(block);scrollBottom();}
- function send(){const text=input.value.trim();if(!text&&!pending.length&&!recordedBlob)return;const items=pending.slice(),voice=recordedBlob;addMessage('user',text,items,voice);input.value='';input.style.height='auto';clearPending();addMessage('assistant','I’m ready to communicate with you here. The Vrotex AI engine has not been connected yet, so I can display your messages and attachments, but I can’t generate AI replies until the engine is deployed.');}
- document.getElementById('vai-send-button').addEventListener('click',send);input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,140)+'px';});
- document.getElementById('vai-new-chat').addEventListener('click',()=>{messages.querySelectorAll('.vai-message').forEach(n=>n.remove());welcome.hidden=false;clearPending();input.value='';input.focus();});
- recordBtn.addEventListener('click',async()=>{if(recording){mediaRecorder.stop();return;}if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){notify('Voice recording is not supported by this browser.');return;}try{const stream=await navigator.mediaDevices.getUserMedia({audio:true});recordChunks=[];mediaRecorder=new MediaRecorder(stream);mediaRecorder.ondataavailable=e=>{if(e.data.size)recordChunks.push(e.data);};mediaRecorder.onstop=()=>{recordedBlob=new Blob(recordChunks,{type:mediaRecorder.mimeType||'audio/webm'});stream.getTracks().forEach(t=>t.stop());recording=false;recordBtn.classList.remove('recording');recordBtn.textContent='🎙';recordBtn.setAttribute('aria-label','Record voice message');recordStatus.hidden=false;recordStatus.textContent='Voice recording ready. Press Send to add it to the chat.';showPending();};mediaRecorder.start();recording=true;recordBtn.classList.add('recording');recordBtn.textContent='■';recordBtn.setAttribute('aria-label','Stop recording');recordStatus.hidden=false;recordStatus.textContent='Recording… tap the microphone button to stop.';}catch(err){notify('Microphone permission was not granted or is unavailable.');console.warn('[Vrotex AI microphone]',err);}});
+
+    const page = document.getElementById('vrotex-ai-page');
+    if (!page) return;
+
+    const messages = document.getElementById('vai-messages');
+    const welcome = document.getElementById('vai-welcome');
+    const input = document.getElementById('vai-input');
+    const fileInput = document.getElementById('vai-file-input');
+    const galleryInput = document.getElementById('vai-gallery-input');
+    const preview = document.getElementById('vai-attach-preview');
+    const recordBtn = document.getElementById('vai-record-button');
+    const recordStatus = document.getElementById('vai-record-status');
+    const sendButton = document.getElementById('vai-send-button');
+    const attachButton = document.getElementById('vai-attach-button');
+    const newChatButton = document.getElementById('vai-new-chat');
+
+    if (
+        !messages || !input || !fileInput || !galleryInput ||
+        !preview || !recordBtn || !recordStatus ||
+        !sendButton || !attachButton || !newChatButton
+    ) {
+        console.error('[Vrotex AI] Required chat elements are missing.');
+        return;
+    }
+
+    let pending = [];
+    let mediaRecorder = null;
+    let recordChunks = [];
+    let recordedBlob = null;
+    let recording = false;
+
+    let conversationId = null;
+    let sending = false;
+
+    function scrollBottom() {
+        messages.scrollTop = messages.scrollHeight;
+    }
+
+    function clearPending() {
+        pending.forEach(item => {
+            if (item.url) URL.revokeObjectURL(item.url);
+        });
+
+        pending = [];
+        recordedBlob = null;
+        preview.innerHTML = '';
+        recordStatus.hidden = true;
+        recordStatus.textContent = '';
+    }
+
+    function showPending() {
+        preview.innerHTML = '';
+
+        pending.forEach(item => {
+            const node = document.createElement('div');
+            node.className = 'vai-pending';
+            node.textContent = item.name;
+            preview.appendChild(node);
+        });
+
+        if (recordedBlob) {
+            const node = document.createElement('div');
+            node.className = 'vai-pending';
+            node.textContent = 'Voice recording ready';
+            preview.appendChild(node);
+        }
+    }
+
+    function attachFiles(files) {
+        for (const file of Array.from(files || [])) {
+            const url = URL.createObjectURL(file);
+
+            pending.push({
+                file: file,
+                name: file.name,
+                url: url,
+                type: file.type
+            });
+        }
+
+        showPending();
+    }
+
+    function addMessage(role, text, items = [], voice = null) {
+        welcome.hidden = true;
+
+        const block = document.createElement('article');
+        block.className = 'vai-message ' + role;
+
+        const label = document.createElement('div');
+        label.className = 'vai-message-label';
+        label.textContent = role === 'user' ? 'You' : 'Vrotex AI';
+
+        block.appendChild(label);
+
+        if (text) {
+            const content = document.createElement('div');
+            content.className = 'vai-message-content';
+            content.textContent = text;
+            block.appendChild(content);
+        }
+
+        if (items.length) {
+            const wrap = document.createElement('div');
+            wrap.className = 'vai-attachments';
+
+            items.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'vai-attachment';
+
+                if (item.type && item.type.startsWith('image/')) {
+                    const img = document.createElement('img');
+                    img.src = item.url;
+                    img.alt = item.name;
+                    card.appendChild(img);
+                } else {
+                    card.textContent = '📎 ' + item.name;
+                }
+
+                wrap.appendChild(card);
+            });
+
+            block.appendChild(wrap);
+        }
+
+        if (voice) {
+            const card = document.createElement('div');
+            card.className = 'vai-attachment';
+
+            const audio = document.createElement('audio');
+            audio.controls = true;
+            audio.src = URL.createObjectURL(voice);
+
+            card.appendChild(audio);
+            block.appendChild(card);
+        }
+
+        messages.appendChild(block);
+        scrollBottom();
+
+        return block;
+    }
+
+    async function send() {
+        const text = input.value.trim();
+
+        if (sending) return;
+
+        if (!text && !pending.length && !recordedBlob) return;
+
+        const items = pending.slice();
+        const voice = recordedBlob;
+
+        addMessage('user', text, items, voice);
+
+        input.value = '';
+        input.style.height = 'auto';
+
+        clearPending();
+
+        if (!text) {
+            addMessage(
+                'assistant',
+                'I can display your attachments and voice recording here, but the current chat API accepts text messages only. Please send a text message.'
+            );
+            return;
+        }
+
+        sending = true;
+        sendButton.disabled = true;
+
+        const waitingMessage = addMessage(
+            'assistant',
+            'Vrotex is thinking...'
+        );
+
+        const waitingContent = waitingMessage.querySelector(
+            '.vai-message-content'
+        );
+
+        try {
+            const response = await fetch('/api/ai/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    message: text,
+                    conversation_id: conversationId
+                })
+            });
+
+            let data;
+
+            try {
+                data = await response.json();
+            } catch (parseError) {
+                throw new Error('The server returned an invalid response.');
+            }
+
+            if (!response.ok) {
+                throw new Error(
+                    data.detail ||
+                    data.error ||
+                    'AI request failed. HTTP ' + response.status
+                );
+            }
+
+            if (!data.reply) {
+                throw new Error('The AI server returned an empty reply.');
+            }
+
+            conversationId = data.conversation_id || conversationId;
+
+            waitingContent.textContent = data.reply;
+
+        } catch (error) {
+            waitingContent.textContent =
+                'Vrotex AI connection error: ' + error.message;
+
+            console.error('[Vrotex AI chat]', error);
+
+        } finally {
+            sending = false;
+            sendButton.disabled = false;
+            scrollBottom();
+        }
+    }
+
+    attachButton.addEventListener('click', () => {
+        if (!pending.length) {
+            fileInput.click();
+        } else {
+            const useGallery = confirm(
+                'Choose images from your gallery?\nPress OK for gallery images, Cancel for files.'
+            );
+
+            (useGallery ? galleryInput : fileInput).click();
+        }
+    });
+
+    fileInput.addEventListener('change', () => {
+        attachFiles(fileInput.files);
+        fileInput.value = '';
+    });
+
+    galleryInput.addEventListener('change', () => {
+        attachFiles(galleryInput.files);
+        galleryInput.value = '';
+    });
+
+    sendButton.addEventListener('click', send);
+
+    input.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            send();
+        }
+    });
+
+    input.addEventListener('input', () => {
+        input.style.height = 'auto';
+        input.style.height =
+            Math.min(input.scrollHeight, 140) + 'px';
+    });
+
+    newChatButton.addEventListener('click', () => {
+        messages.querySelectorAll('.vai-message').forEach(node => {
+            node.remove();
+        });
+
+        welcome.hidden = false;
+
+        clearPending();
+
+        input.value = '';
+        input.style.height = 'auto';
+
+        conversationId = null;
+        sending = false;
+        sendButton.disabled = false;
+
+        input.focus();
+    });
+
+    recordBtn.addEventListener('click', async () => {
+
+        if (recording) {
+            mediaRecorder.stop();
+            return;
+        }
+
+        if (
+            !navigator.mediaDevices?.getUserMedia ||
+            !window.MediaRecorder
+        ) {
+            notify('Voice recording is not supported by this browser.');
+            return;
+        }
+
+        try {
+            const stream =
+                await navigator.mediaDevices.getUserMedia({
+                    audio: true
+                });
+
+            recordChunks = [];
+
+            mediaRecorder = new MediaRecorder(stream);
+
+            mediaRecorder.ondataavailable = event => {
+                if (event.data.size) {
+                    recordChunks.push(event.data);
+                }
+            };
+
+            mediaRecorder.onstop = () => {
+                recordedBlob = new Blob(recordChunks, {
+                    type: mediaRecorder.mimeType || 'audio/webm'
+                });
+
+                stream.getTracks().forEach(track => track.stop());
+
+                recording = false;
+
+                recordBtn.classList.remove('recording');
+                recordBtn.textContent = '🎙';
+                recordBtn.setAttribute(
+                    'aria-label',
+                    'Record voice message'
+                );
+
+                recordStatus.hidden = false;
+                recordStatus.textContent =
+                    'Voice recording ready. Press Send to add it to the chat.';
+
+                showPending();
+            };
+
+            mediaRecorder.start();
+
+            recording = true;
+
+            recordBtn.classList.add('recording');
+            recordBtn.textContent = '■';
+            recordBtn.setAttribute(
+                'aria-label',
+                'Stop recording'
+            );
+
+            recordStatus.hidden = false;
+            recordStatus.textContent =
+                'Recording… tap the microphone button to stop.';
+
+        } catch (error) {
+            notify(
+                'Microphone permission was not granted or is unavailable.'
+            );
+
+            console.warn(
+                '[Vrotex AI microphone]',
+                error
+            );
+        }
+    });
+
 })();
 
 // Live Logs: REST history + WebSocket stream with automatic reconnect and REST fallback.
