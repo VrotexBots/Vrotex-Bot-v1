@@ -973,6 +973,7 @@ function showPage(target){
   document.getElementById('bot-controls').hidden=target!=='home-page';
   document.getElementById('broker-bottom-actions').hidden=target!=='broker-page' || brokerFormOpen;
   document.getElementById('page-container').scrollTop=0;
+  if (target === 'trade-page') refreshTradeData();
 }
 
 
