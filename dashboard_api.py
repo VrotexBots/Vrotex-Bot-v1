@@ -862,7 +862,62 @@ def create_app(bot: Any) -> FastAPI:
                     f"{type(exc).__name__}: {exc}"
                 ),
             ) from exc
+    # --------------------------------------------------------
+    # EXNESS OPEN POSITIONS AND PENDING ORDERS
+    # --------------------------------------------------------
 
+    @app.get("/api/positions")
+    async def positions_snapshot():
+
+        try:
+            from exness_connection import exness_connection
+
+            if not exness_connection.connected:
+                raise RuntimeError("No Exness account is connected.")
+
+            details = await exness_connection.get_trading_snapshot()
+
+            if not isinstance(details, dict):
+                raise RuntimeError(
+                    "Exness trading snapshot returned an unexpected payload"
+                )
+
+            positions = details.get("positions", [])
+            orders = details.get("orders", [])
+
+            if not isinstance(positions, list):
+                positions = []
+
+            if not isinstance(orders, list):
+                orders = []
+
+            connection = exness_connection.get_connection_status()
+
+            return {
+                "status": "ok",
+                "connected": (
+                    bool(connection.get("connected"))
+                    if isinstance(connection, dict)
+                    else False
+                ),
+                "positions": make_json_safe(positions),
+                "orders": make_json_safe(orders),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        except Exception as exc:
+            logging.getLogger(__name__).exception(
+                "Exness positions snapshot failed"
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Position data unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+    
     # --------------------------------------------------------
     # LIVE CHART TICK
     # --------------------------------------------------------
