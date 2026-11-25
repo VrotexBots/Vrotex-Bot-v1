@@ -1,12 +1,25 @@
+
 """
 Vrotex Bot V1
-Scanner V3.4
+Market Scanner V3.5
+Autonomous Strategy Recognition Integration
 
 H1 -> M5 -> M1
 EURUSD, GBPUSD, BTCUSD
 
-Evidence collection and Master SMC analysis.
-No strategy changes.
+Recognizes:
+- technical_analysis_pro_trend.py
+- technical_analysis_counter_trend.py
+
+Responsibilities:
+- Collect market candles and live prices.
+- Run both strategy engines independently.
+- Preserve strategy evidence.
+- Collect fundamental and risk information.
+- Prepare evidence for the Master SMC Engine.
+- Preserve Master SMC authorization.
+
+This scanner does not independently authorize or execute trades.
 """
 
 import asyncio
@@ -15,6 +28,7 @@ import logging
 import threading
 import time
 import math
+
 from datetime import datetime, timezone
 
 logger = logging.getLogger("vrotex.market_scanner")
@@ -22,7 +36,7 @@ logger = logging.getLogger("vrotex.market_scanner")
 
 class MarketScanner:
 
-    VERSION = "3.4"
+    VERSION = "3.5"
 
     INSTRUMENTS = ("EURUSD", "GBPUSD", "BTCUSD")
     TIMEFRAMES = ("H1", "M5", "M1")
@@ -43,16 +57,26 @@ class MarketScanner:
     def __init__(
         self,
         market_data_engine=None,
-        technical_analysis_engine=None,
+        pro_trend_engine=None,
+        counter_trend_engine=None,
         fundamental_analysis_engine=None,
         risk_management_engine=None,
         smc_engine=None,
         scan_interval=None,
     ):
+
         self.market_data_engine = market_data_engine
-        self.technical_analysis_engine = technical_analysis_engine
-        self.fundamental_analysis_engine = fundamental_analysis_engine
-        self.risk_management_engine = risk_management_engine
+        self.pro_trend_engine = pro_trend_engine
+        self.counter_trend_engine = counter_trend_engine
+
+        self.fundamental_analysis_engine = (
+            fundamental_analysis_engine
+        )
+
+        self.risk_management_engine = (
+            risk_management_engine
+        )
+
         self.smc_engine = smc_engine
 
         self.scan_interval = (
@@ -65,6 +89,7 @@ class MarketScanner:
 
         self.last_scan_time = None
         self.last_scan_results = {}
+
         self.scan_count = 0
         self.error_count = 0
 
@@ -81,6 +106,8 @@ class MarketScanner:
                 "a_plus_score": 0,
                 "category_scores": {},
                 "execution_authorized": False,
+                "pro_trend_status": "NOT_ANALYZED",
+                "counter_trend_status": "NOT_ANALYZED",
             }
             for symbol in self.INSTRUMENTS
         }
@@ -94,9 +121,9 @@ class MarketScanner:
             self.TIMEFRAMES,
         )
 
-    # =========================================================
+    # =====================================================
     # GENERAL HELPERS
-    # =========================================================
+    # =====================================================
 
     @staticmethod
     def _now():
@@ -110,35 +137,47 @@ class MarketScanner:
     def _list(value):
         if isinstance(value, list):
             return value
+
         if isinstance(value, tuple):
             return list(value)
+
         return []
 
     @staticmethod
     def _number(value, default=None):
+
         try:
             result = float(value)
+
             if math.isfinite(result):
                 return result
+
         except (TypeError, ValueError, OverflowError):
             pass
+
         return default
 
     @staticmethod
     def _has(value):
+
         if value is None:
             return False
+
         if isinstance(value, (dict, list, tuple)):
             return len(value) > 0
+
         return bool(value)
 
     @staticmethod
     async def _invoke(method, *args, **kwargs):
+
         if inspect.iscoroutinefunction(method):
             return await method(*args, **kwargs)
 
         result = await asyncio.to_thread(
-            method, *args, **kwargs
+            method,
+            *args,
+            **kwargs,
         )
 
         if inspect.isawaitable(result):
@@ -147,40 +186,30 @@ class MarketScanner:
         return result
 
     @staticmethod
-    def _supports_kwargs(method):
-        try:
-            sig = inspect.signature(method)
-            return any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
-            )
-        except (TypeError, ValueError):
-            return False
-
-    @staticmethod
     def _filter_kwargs(method, kwargs):
+
         try:
-            sig = inspect.signature(method)
+            signature = inspect.signature(method)
+
             if any(
-                p.kind == inspect.Parameter.VAR_KEYWORD
-                for p in sig.parameters.values()
+                parameter.kind
+                == inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
             ):
                 return kwargs
 
             return {
                 key: value
                 for key, value in kwargs.items()
-                if key in sig.parameters
+                if key in signature.parameters
             }
+
         except (TypeError, ValueError):
             return kwargs
 
-    # =========================================================
-    # ENGINE INITIALIZATION
-    # =========================================================
-
     @staticmethod
     def _load_engine(module_name, names):
+
         try:
             module = __import__(
                 module_name,
@@ -188,11 +217,14 @@ class MarketScanner:
             )
 
             for name in names:
+
                 obj = getattr(module, name, None)
+
                 if obj is not None:
                     return obj
 
         except Exception as exc:
+
             logger.warning(
                 "Engine import failed | %s | %s",
                 module_name,
@@ -201,30 +233,59 @@ class MarketScanner:
 
         return None
 
+    # =====================================================
+    # ENGINE INITIALIZATION
+    # =====================================================
+
     def _initialize_engines(self):
 
         if self.market_data_engine is None:
+
             self.market_data_engine = self._load_engine(
                 "market_data_engine",
                 ("market_data_engine",),
             )
 
-        if self.technical_analysis_engine is None:
-            self.technical_analysis_engine = self._load_engine(
-                "technical_analysis_engine",
-                ("technical_analysis_engine",),
-            )
+        if self.pro_trend_engine is None:
 
-        if self.fundamental_analysis_engine is None:
-            self.fundamental_analysis_engine = self._load_engine(
-                "fundamental_analysis_engine",
+            self.pro_trend_engine = self._load_engine(
+                "technical_analysis_pro_trend",
                 (
-                    "fundamental_analysis_engine",
-                    "fundamental_engine",
+                    "pro_trend_strategy",
+                    "technical_analysis_pro_trend",
                 ),
             )
 
+        if self.counter_trend_engine is None:
+
+            self.counter_trend_engine = self._load_engine(
+                "technical_analysis_counter_trend",
+                (
+                    "technical_analysis_counter_trend",
+                    "TechnicalAnalysisCounterTrend",
+                ),
+            )
+
+            if inspect.isclass(self.counter_trend_engine):
+
+                self.counter_trend_engine = (
+                    self.counter_trend_engine()
+                )
+
+        if self.fundamental_analysis_engine is None:
+
+            self.fundamental_analysis_engine = (
+                self._load_engine(
+                    "fundamental_analysis_engine",
+                    (
+                        "fundamental_analysis_engine",
+                        "fundamental_engine",
+                    ),
+                )
+            )
+
         if self.risk_management_engine is None:
+
             self.risk_management_engine = self._load_engine(
                 "risk_manager",
                 (
@@ -234,6 +295,7 @@ class MarketScanner:
             )
 
         if self.smc_engine is None:
+
             self.smc_engine = self._load_engine(
                 "smc_engine",
                 (
@@ -242,18 +304,33 @@ class MarketScanner:
                 ),
             )
 
-    # =========================================================
+        logger.info(
+            "Strategy initialization | "
+            "Pro-Trend=%s | Counter-Trend=%s | "
+            "MarketData=%s | MasterSMC=%s",
+            self.pro_trend_engine is not None,
+            self.counter_trend_engine is not None,
+            self.market_data_engine is not None,
+            self.smc_engine is not None,
+        )
+
+    # =====================================================
     # MARKET DATA
-    # =========================================================
+    # =====================================================
 
     async def _get_candles(self, symbol, timeframe):
 
         engine = self.market_data_engine
+
         if engine is None:
-            raise RuntimeError("Market data engine unavailable")
+            raise RuntimeError(
+                "Market data engine unavailable"
+            )
 
         method = getattr(
-            engine, "get_recent_candles", None
+            engine,
+            "get_recent_candles",
+            None,
         )
 
         if not callable(method):
@@ -261,18 +338,10 @@ class MarketScanner:
                 "get_recent_candles method unavailable"
             )
 
-        kwargs = {}
-
-        if self._supports_kwargs(method):
-            kwargs["price_type"] = "bid"
-
-        else:
-            try:
-                sig = inspect.signature(method)
-                if "price_type" in sig.parameters:
-                    kwargs["price_type"] = "bid"
-            except Exception:
-                pass
+        kwargs = self._filter_kwargs(
+            method,
+            {"price_type": "bid"},
+        )
 
         candles = await self._invoke(
             method,
@@ -283,6 +352,7 @@ class MarketScanner:
         )
 
         if isinstance(candles, dict):
+
             candles = candles.get(
                 "candles",
                 candles.get("data", []),
@@ -293,6 +363,7 @@ class MarketScanner:
     async def _get_live_price(self, symbol):
 
         engine = self.market_data_engine
+
         if engine is None:
             return None
 
@@ -302,30 +373,46 @@ class MarketScanner:
             "get_tick",
             "get_current_price",
         ):
+
             method = getattr(engine, name, None)
 
             if not callable(method):
                 continue
 
             try:
-                tick = await self._invoke(method, symbol)
+
+                tick = await self._invoke(
+                    method,
+                    symbol,
+                )
 
                 if isinstance(tick, (int, float)):
                     return self._number(tick)
 
                 if isinstance(tick, dict):
+
                     bid = self._number(tick.get("bid"))
                     ask = self._number(tick.get("ask"))
 
                     if bid is not None and ask is not None:
                         return (bid + ask) / 2
 
-                    for key in ("price", "last", "mid", "close"):
-                        value = self._number(tick.get(key))
+                    for key in (
+                        "price",
+                        "last",
+                        "mid",
+                        "close",
+                    ):
+
+                        value = self._number(
+                            tick.get(key)
+                        )
+
                         if value is not None:
                             return value
 
             except Exception:
+
                 logger.debug(
                     "Price method failed: %s",
                     name,
@@ -334,70 +421,25 @@ class MarketScanner:
 
         return None
 
-    # =========================================================
-    # TECHNICAL ANALYSIS
-    # =========================================================
-
-    async def _analyse(self, symbol, timeframe, candles):
-
-        engine = self.technical_analysis_engine
-
-        if engine is None:
-            raise RuntimeError(
-                "Technical Analysis Engine unavailable"
-            )
-
-        method = getattr(engine, "analyze", None)
-
-        if not callable(method):
-            method = getattr(engine, "analyse", None)
-
-        if not callable(method):
-            raise RuntimeError(
-                "Technical analysis method unavailable"
-            )
-
-        kwargs = self._filter_kwargs(
-            method,
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-            },
-        )
-
-        result = await self._invoke(
-            method,
-            candles,
-            **kwargs,
-        )
-
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "Technical analysis returned invalid output"
-            )
-
-        result.setdefault("symbol", symbol)
-        result.setdefault("timeframe", timeframe)
-
-        return result
-
     async def _collect_market_data(self, symbol):
 
         data = {}
 
-        # Sequential collection preserves phone resources.
+        # Sequential candle collection preserves phone resources.
         for timeframe in self.TIMEFRAMES:
 
             if self._stop_event.is_set():
                 break
 
             try:
+
                 candles = await self._get_candles(
                     symbol,
                     timeframe,
                 )
 
                 if len(candles) < 50:
+
                     data[timeframe] = {
                         "candles": candles,
                         "technical": {
@@ -408,35 +450,38 @@ class MarketScanner:
                             "symbol": symbol,
                         },
                     }
-                    continue
 
-                technical = await self._analyse(
-                    symbol,
-                    timeframe,
-                    candles,
-                )
+                    logger.warning(
+                        "%s | %s | Insufficient candles=%s",
+                        symbol,
+                        timeframe,
+                        len(candles),
+                    )
+
+                    continue
 
                 data[timeframe] = {
                     "candles": candles,
-                    "technical": technical,
+                    "technical": {
+                        "success": True,
+                        "status": "RAW_CANDLES_COLLECTED",
+                        "candles_analyzed": len(candles),
+                        "timeframe": timeframe,
+                        "symbol": symbol,
+                    },
                 }
 
                 logger.info(
-                    "%s | %s | TA completed | Candles=%s | Bias=%s | Breaks=%s | Sweeps=%s | FVG=%s | OB=%s",
+                    "%s | %s | Candles collected=%s",
                     symbol,
                     timeframe,
                     len(candles),
-                    technical.get("bias"),
-                    len(self._list(technical.get("breaks"))),
-                    len(self._list(technical.get("liquidity_sweeps"))),
-                    len(self._list(technical.get("fvgs"))),
-                    len(self._list(technical.get("clean_order_blocks"))),
                 )
 
             except Exception as exc:
 
                 logger.exception(
-                    "%s | %s | Data/TA error",
+                    "%s | %s | Candle collection failed",
                     symbol,
                     timeframe,
                 )
@@ -454,16 +499,328 @@ class MarketScanner:
 
         return data
 
-    def _ta(self, market_data, timeframe):
-        return self._dict(
-            self._dict(market_data.get(timeframe)).get(
-                "technical"
+    # =====================================================
+    # STRATEGY INVOCATION
+    # =====================================================
+
+    async def _run_pro_trend(self, market_data, symbol):
+
+        engine = self.pro_trend_engine
+
+        if engine is None:
+
+            return {
+                "available": False,
+                "status": "PRO_TREND_UNAVAILABLE",
+            }
+
+        method = getattr(engine, "analyze", None)
+
+        if not callable(method):
+
+            method = getattr(
+                engine,
+                "analyze_pro_trend",
+                None,
             )
+
+        if not callable(method):
+
+            return {
+                "available": False,
+                "status": "PRO_TREND_METHOD_UNAVAILABLE",
+            }
+
+        h1 = market_data["H1"]["candles"]
+        m5 = market_data["M5"]["candles"]
+        m1 = market_data["M1"]["candles"]
+
+        kwargs = self._filter_kwargs(
+            method,
+            {
+                "symbol": symbol,
+            },
         )
 
-    # =========================================================
-    # STRUCTURE EVIDENCE
-    # =========================================================
+        try:
+
+            result = await self._invoke(
+                method,
+                h1,
+                m5,
+                m1,
+                **kwargs,
+            )
+
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Invalid Pro-Trend response"
+                )
+
+            logger.info(
+                "%s | Pro-Trend analysis completed",
+                symbol,
+            )
+
+            return {
+                "available": True,
+                "status": "ANALYZED",
+                "result": result,
+            }
+
+        except Exception as exc:
+
+            logger.exception(
+                "%s | Pro-Trend analysis failed",
+                symbol,
+            )
+
+            return {
+                "available": False,
+                "status": "PRO_TREND_ERROR",
+                "error": str(exc),
+            }
+
+    async def _run_counter_trend(
+        self,
+        market_data,
+        symbol,
+    ):
+
+        engine = self.counter_trend_engine
+
+        if engine is None:
+
+            return {
+                "available": False,
+                "status": "COUNTER_TREND_UNAVAILABLE",
+            }
+
+        method = getattr(engine, "analyze", None)
+
+        if not callable(method):
+
+            method = getattr(
+                engine,
+                "analyze_counter_trend",
+                None,
+            )
+
+        if not callable(method):
+
+            return {
+                "available": False,
+                "status": "COUNTER_TREND_METHOD_UNAVAILABLE",
+            }
+
+        h1 = market_data["H1"]["candles"]
+        m5 = market_data["M5"]["candles"]
+        m1 = market_data["M1"]["candles"]
+
+        values = {
+            "h1_candles": h1,
+            "m5_candles": m5,
+            "m1_candles": m1,
+            "h1": h1,
+            "m5": m5,
+            "m1": m1,
+            "symbol": symbol,
+        }
+
+        try:
+
+            signature = inspect.signature(method)
+
+            parameters = signature.parameters
+
+            accepts_kwargs = any(
+                parameter.kind
+                == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+
+            if accepts_kwargs:
+
+                kwargs = {
+                    "h1_candles": h1,
+                    "m5_candles": m5,
+                    "m1_candles": m1,
+                    "symbol": symbol,
+                }
+
+                result = await self._invoke(
+                    method,
+                    **kwargs,
+                )
+
+            else:
+
+                kwargs = {
+                    name: values[name]
+                    for name in parameters
+                    if name in values
+                }
+
+                required = [
+                    parameter
+                    for parameter in parameters.values()
+                    if (
+                        parameter.default
+                        is inspect.Parameter.empty
+                        and parameter.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    )
+                ]
+
+                if all(
+                    parameter.name in kwargs
+                    for parameter in required
+                ):
+
+                    result = await self._invoke(
+                        method,
+                        **kwargs,
+                    )
+
+                else:
+
+                    # Compatibility with a three-positional-candle
+                    # analyze(h1, m5, m1) interface.
+                    positional = [
+                        parameter
+                        for parameter in parameters.values()
+                        if parameter.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+
+                    if len(positional) < 3:
+                        raise RuntimeError(
+                            "Counter-Trend method signature "
+                            "does not accept H1/M5/M1 candles"
+                        )
+
+                    result = await self._invoke(
+                        method,
+                        h1,
+                        m5,
+                        m1,
+                    )
+
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Invalid Counter-Trend response"
+                )
+
+            logger.info(
+                "%s | Counter-Trend analysis completed",
+                symbol,
+            )
+
+            return {
+                "available": True,
+                "status": "ANALYZED",
+                "result": result,
+            }
+
+        except Exception as exc:
+
+            logger.exception(
+                "%s | Counter-Trend analysis failed",
+                symbol,
+            )
+
+            return {
+                "available": False,
+                "status": "COUNTER_TREND_ERROR",
+                "error": str(exc),
+            }
+
+    async def _run_strategies(self, market_data, symbol):
+
+        required = ("H1", "M5", "M1")
+
+        missing = [
+            timeframe
+            for timeframe in required
+            if (
+                not isinstance(market_data.get(timeframe), dict)
+                or len(
+                    self._list(
+                        market_data[timeframe].get("candles")
+                    )
+                ) < 50
+            )
+        ]
+
+        if missing:
+
+            return {
+                "symbol": symbol,
+                "status": "INCOMPLETE_STRATEGY_DATA",
+                "missing_timeframes": missing,
+                "pro_trend": {
+                    "available": False,
+                    "status": "INCOMPLETE_DATA",
+                },
+                "counter_trend": {
+                    "available": False,
+                    "status": "INCOMPLETE_DATA",
+                },
+                "both_strategies_available": False,
+                "evidence_only": True,
+            }
+
+        # Both strategies receive the same market data.
+        # They run independently and cannot authorize execution.
+        pro_result, counter_result = await asyncio.gather(
+            self._run_pro_trend(
+                market_data,
+                symbol,
+            ),
+            self._run_counter_trend(
+                market_data,
+                symbol,
+            ),
+        )
+
+        result = {
+            "symbol": symbol,
+            "status": "ANALYZED",
+            "pro_trend": pro_result,
+            "counter_trend": counter_result,
+            "both_strategies_available": (
+                pro_result.get("available") is True
+                and counter_result.get("available") is True
+            ),
+            "evidence_only": True,
+        }
+
+        logger.info(
+            "%s | Strategy cycle | Pro=%s | Counter=%s",
+            symbol,
+            pro_result.get("status"),
+            counter_result.get("status"),
+        )
+
+        return result
+
+    # =====================================================
+    # TECHNICAL EVIDENCE COMPATIBILITY
+    # =====================================================
+
+    def _ta(self, market_data, timeframe):
+
+        return self._dict(
+            self._dict(
+                market_data.get(timeframe)
+            ).get("technical")
+        )
 
     def _structure_evidence(self, market_data):
 
@@ -471,18 +828,22 @@ class MarketScanner:
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             structure = ta.get("structure", {})
             swings = ta.get("swings", {})
-            breaks = self._list(ta.get("breaks"))
 
             output[timeframe] = {
                 "bias": ta.get("bias"),
                 "direction": ta.get("direction"),
                 "structure": structure,
                 "swings": swings,
-                "breaks": breaks,
+                "breaks": self._list(
+                    ta.get("breaks")
+                ),
                 "latest_swing_high": self._dict(
                     structure
                 ).get("latest_swing_high"),
@@ -493,17 +854,16 @@ class MarketScanner:
 
         return output
 
-    # =========================================================
-    # POI EVIDENCE
-    # =========================================================
-
     def _poi_evidence(self, market_data):
 
         output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             output[timeframe] = {
                 "fvgs": self._list(
@@ -515,7 +875,10 @@ class MarketScanner:
                 "order_blocks": self._list(
                     ta.get(
                         "clean_order_blocks",
-                        ta.get("order_block_candidates", []),
+                        ta.get(
+                            "order_block_candidates",
+                            [],
+                        ),
                     )
                 ),
                 "premium_discount": ta.get(
@@ -528,17 +891,16 @@ class MarketScanner:
 
         return output
 
-    # =========================================================
-    # LIQUIDITY EVIDENCE
-    # =========================================================
-
     def _liquidity_evidence(self, market_data):
 
         output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             output[timeframe] = {
                 "sweeps": self._list(
@@ -555,17 +917,16 @@ class MarketScanner:
 
         return output
 
-    # =========================================================
-    # DISPLACEMENT
-    # =========================================================
-
     def _displacement_evidence(self, market_data):
 
         output = {}
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             displacement = ta.get(
                 "displacement",
@@ -577,17 +938,19 @@ class MarketScanner:
 
         return output
 
-    # =========================================================
-    # FVG EVIDENCE
-    # =========================================================
-
     def _fvg_evidence(self, market_data):
 
         return {
             timeframe: self._list(
-                self._ta(market_data, timeframe).get(
+                self._ta(
+                    market_data,
+                    timeframe,
+                ).get(
                     "fvgs",
-                    self._ta(market_data, timeframe).get(
+                    self._ta(
+                        market_data,
+                        timeframe,
+                    ).get(
                         "fair_value_gaps",
                         [],
                     ),
@@ -596,13 +959,12 @@ class MarketScanner:
             for timeframe in self.TIMEFRAMES
         }
 
-    # =========================================================
-    # ENTRY EVIDENCE
-    # =========================================================
-
     def _entry_evidence(self, market_data):
 
-        ta = self._ta(market_data, "M1")
+        ta = self._ta(
+            market_data,
+            "M1",
+        )
 
         return {
             "timeframe": "M1",
@@ -623,7 +985,9 @@ class MarketScanner:
                 "displacement",
                 ta.get("displacement_evidence"),
             ),
-            "fvgs": self._list(ta.get("fvgs")),
+            "fvgs": self._list(
+                ta.get("fvgs")
+            ),
             "order_blocks": self._list(
                 ta.get("clean_order_blocks")
             ),
@@ -635,10 +999,6 @@ class MarketScanner:
             "direction": ta.get("direction"),
         }
 
-    # =========================================================
-    # TIMEFRAME ALIGNMENT
-    # =========================================================
-
     def _alignment_evidence(self, market_data):
 
         biases = {}
@@ -646,7 +1006,10 @@ class MarketScanner:
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             bias = str(
                 ta.get("bias", "UNKNOWN")
@@ -658,7 +1021,9 @@ class MarketScanner:
                 "bias": bias,
                 "direction": ta.get("direction"),
                 "structure": ta.get("structure"),
-                "breaks": self._list(ta.get("breaks")),
+                "breaks": self._list(
+                    ta.get("breaks")
+                ),
                 "momentum": ta.get("momentum"),
                 "emas": ta.get("emas"),
             }
@@ -705,9 +1070,9 @@ class MarketScanner:
             "evidence_only": True,
         }
 
-    # =========================================================
+    # =====================================================
     # TRADE QUALITY / RISK EVIDENCE
-    # =========================================================
+    # =====================================================
 
     def _trade_quality_evidence(
         self,
@@ -720,7 +1085,10 @@ class MarketScanner:
 
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             technical_metrics[timeframe] = {
                 "atr": ta.get("atr"),
@@ -748,9 +1116,9 @@ class MarketScanner:
             "evidence_only": True,
         }
 
-    # =========================================================
+    # =====================================================
     # FUNDAMENTALS
-    # =========================================================
+    # =====================================================
 
     async def _collect_fundamentals(
         self,
@@ -762,6 +1130,7 @@ class MarketScanner:
         engine = self.fundamental_analysis_engine
 
         if engine is None:
+
             return {
                 "available": False,
                 "status": "UNAVAILABLE",
@@ -776,13 +1145,19 @@ class MarketScanner:
             "analyze",
             "analyse",
         ):
-            candidate = getattr(engine, name, None)
+
+            candidate = getattr(
+                engine,
+                name,
+                None,
+            )
 
             if callable(candidate):
                 method = candidate
                 break
 
         if method is None:
+
             return {
                 "available": False,
                 "status": "METHOD_UNAVAILABLE",
@@ -806,6 +1181,7 @@ class MarketScanner:
             )
 
             if isinstance(result, dict):
+
                 return {
                     "available": True,
                     "status": result.get(
@@ -841,9 +1217,9 @@ class MarketScanner:
                 "error": str(exc),
             }
 
-    # =========================================================
+    # =====================================================
     # RISK MANAGER
-    # =========================================================
+    # =====================================================
 
     async def _collect_risk_checks(
         self,
@@ -855,6 +1231,7 @@ class MarketScanner:
         engine = self.risk_management_engine
 
         if engine is None:
+
             return {
                 "available": False,
                 "status": "UNAVAILABLE",
@@ -871,13 +1248,19 @@ class MarketScanner:
             "analyse_risk",
             "get_risk_checks",
         ):
-            candidate = getattr(engine, name, None)
+
+            candidate = getattr(
+                engine,
+                name,
+                None,
+            )
 
             if callable(candidate):
                 method = candidate
                 break
 
         if method is None:
+
             return {
                 "available": False,
                 "status": "METHOD_UNAVAILABLE",
@@ -900,6 +1283,7 @@ class MarketScanner:
             )
 
             if isinstance(result, dict):
+
                 return {
                     "available": True,
                     "status": result.get(
@@ -931,9 +1315,9 @@ class MarketScanner:
                 "error": str(exc),
             }
 
-    # =========================================================
+    # =====================================================
     # CATEGORY SCORES
-    # =========================================================
+    # =====================================================
 
     def _normalize_scores(self, source):
 
@@ -990,7 +1374,10 @@ class MarketScanner:
 
                 value = self._number(value)
 
-                if value is not None and 0 <= value <= 100:
+                if (
+                    value is not None
+                    and 0 <= value <= 100
+                ):
                     scores[category] = value
                     break
 
@@ -1008,9 +1395,15 @@ class MarketScanner:
             for category in self.CATEGORIES
         }
 
+        # Strategy score outputs are preserved separately.
+        # They are not silently converted into SMC category scores.
+
         for timeframe in self.TIMEFRAMES:
 
-            ta = self._ta(market_data, timeframe)
+            ta = self._ta(
+                market_data,
+                timeframe,
+            )
 
             for key in (
                 "category_scores",
@@ -1037,6 +1430,7 @@ class MarketScanner:
             scores = self._normalize_scores(source)
 
             if "fundamentals" in scores:
+
                 collected["fundamentals"].append(
                     scores["fundamentals"]
                 )
@@ -1053,6 +1447,7 @@ class MarketScanner:
             and 0 <= fundamental_score <= 100
             and not collected["fundamentals"]
         ):
+
             collected["fundamentals"].append(
                 fundamental_score
             )
@@ -1070,6 +1465,7 @@ class MarketScanner:
             scores = self._normalize_scores(source)
 
             if "trade_quality_risk" in scores:
+
                 collected["trade_quality_risk"].append(
                     scores["trade_quality_risk"]
                 )
@@ -1077,7 +1473,9 @@ class MarketScanner:
         final = {}
 
         for category, values in collected.items():
+
             if values:
+
                 final[category] = round(
                     sum(values) / len(values),
                     2,
@@ -1099,9 +1497,9 @@ class MarketScanner:
             "missing_categories": missing,
         }
 
-    # =========================================================
+    # =====================================================
     # EVIDENCE PACKAGE
-    # =========================================================
+    # =====================================================
 
     def _build_evidence_package(
         self,
@@ -1109,13 +1507,16 @@ class MarketScanner:
         current_price,
         fundamentals,
         risk_checks,
+        strategy_results,
     ):
 
         structure = self._structure_evidence(
             market_data
         )
 
-        poi = self._poi_evidence(market_data)
+        poi = self._poi_evidence(
+            market_data
+        )
 
         liquidity = self._liquidity_evidence(
             market_data
@@ -1125,7 +1526,9 @@ class MarketScanner:
             market_data
         )
 
-        fvg = self._fvg_evidence(market_data)
+        fvg = self._fvg_evidence(
+            market_data
+        )
 
         entry = self._entry_evidence(
             market_data
@@ -1155,8 +1558,8 @@ class MarketScanner:
 
         present = [
             category
-            for category, evidence in category_evidence.items()
-            if self._has(evidence)
+            for category, item in category_evidence.items()
+            if self._has(item)
         ]
 
         missing = [
@@ -1186,6 +1589,8 @@ class MarketScanner:
             "risk_checks": risk_checks,
             "category_scores": score_report,
 
+            "strategy_analysis": strategy_results,
+
             "evidence_report": {
                 "present_categories": present,
                 "missing_categories": missing,
@@ -1195,9 +1600,9 @@ class MarketScanner:
             },
         }
 
-    # =========================================================
+    # =====================================================
     # MASTER SMC ENGINE
-    # =========================================================
+    # =====================================================
 
     async def _run_smc(
         self,
@@ -1212,6 +1617,7 @@ class MarketScanner:
         engine = self.smc_engine
 
         if engine is None:
+
             return {
                 "status": "SMC_ENGINE_UNAVAILABLE",
                 "a_plus": False,
@@ -1220,15 +1626,25 @@ class MarketScanner:
 
         method = None
 
-        for name in ("analyze", "analyse", "evaluate", "evaluate_setup"):
+        for name in (
+            "analyse",
+            "analyze",
+            "evaluate",
+            "evaluate_setup",
+        ):
 
-            candidate = getattr(engine, name, None)
+            candidate = getattr(
+                engine,
+                name,
+                None,
+            )
 
             if callable(candidate):
                 method = candidate
                 break
 
         if method is None:
+
             return {
                 "status": "SMC_METHOD_UNAVAILABLE",
                 "a_plus": False,
@@ -1239,6 +1655,7 @@ class MarketScanner:
 
         market_payload["symbol"] = symbol
         market_payload["current_price"] = current_price
+
         market_payload["smc_analysis_evidence"] = evidence
 
         kwargs = {
@@ -1273,39 +1690,43 @@ class MarketScanner:
 
         except TypeError:
 
-            # Compatibility with SMC engines that use
-            # positional market-data input.
+            # Compatibility with positional market-data interfaces.
             result = await self._invoke(
                 method,
                 market_payload,
             )
 
         if not isinstance(result, dict):
+
             result = {
                 "status": "INVALID_SMC_RESULT",
-                "raw_result": result,
+                "raw_result": str(result),
             }
 
         result.setdefault("symbol", symbol)
 
         result["scanner_version"] = self.VERSION
+
         result["scanner_category_scores"] = (
             evidence["category_scores"]
         )
+
         result["scanner_evidence_report"] = (
             evidence["evidence_report"]
         )
+
         result["scanner_evidence"] = evidence
 
         return result
 
-    # =========================================================
+    # =====================================================
     # SCAN ONE INSTRUMENT
-    # =========================================================
+    # =====================================================
 
     async def scan_instrument(self, symbol):
 
         if symbol not in self.INSTRUMENTS:
+
             raise ValueError(
                 "Instrument is not approved for V1: "
                 + str(symbol)
@@ -1329,15 +1750,16 @@ class MarketScanner:
                 symbol
             )
 
-            # Require all approved strategy timeframes.
             missing_tf = [
-                tf
-                for tf in self.TIMEFRAMES
-                if not self._list(
-                    self._dict(
-                        market_data.get(tf)
-                    ).get("candles")
-                )
+                timeframe
+                for timeframe in self.TIMEFRAMES
+                if len(
+                    self._list(
+                        self._dict(
+                            market_data.get(timeframe)
+                        ).get("candles")
+                    )
+                ) < 50
             ]
 
             if missing_tf:
@@ -1353,10 +1775,23 @@ class MarketScanner:
                     "timestamp": self._now(),
                 }
 
-                state["status"] = result["status"]
-                state["setup_found"] = False
+                state.update({
+                    "status": result["status"],
+                    "setup_found": False,
+                    "execution_authorized": False,
+                })
 
                 return result
+
+            # Run both strategies before preparing SMC evidence.
+            strategy_results = await self._run_strategies(
+                market_data,
+                symbol,
+            )
+
+            market_data["strategy_analysis"] = (
+                strategy_results
+            )
 
             fundamentals = await self._collect_fundamentals(
                 symbol,
@@ -1375,24 +1810,27 @@ class MarketScanner:
                 current_price,
                 fundamentals,
                 risk_checks,
+                strategy_results,
             )
 
             report = evidence["category_scores"]
             evidence_report = evidence["evidence_report"]
 
             logger.info(
-                "%s | SMC evidence prepared | Evidence=%s/7 | Scores=%s/7 | Missing scores=%s | Missing evidence=%s",
+                "%s | SMC evidence prepared | "
+                "Evidence=%s/7 | Scores=%s/7 | "
+                "Missing scores=%s",
                 symbol,
                 evidence_report["category_count"],
                 report["category_count"],
                 report["missing_categories"],
-                evidence_report["missing_categories"],
             )
 
             logger.info(
-                "%s | Category scores: %s",
+                "%s | Strategy availability | Pro=%s | Counter=%s",
                 symbol,
-                report["scores"],
+                strategy_results["pro_trend"].get("available"),
+                strategy_results["counter_trend"].get("available"),
             )
 
             smc_result = await self._run_smc(
@@ -1405,7 +1843,10 @@ class MarketScanner:
             )
 
             status = str(
-                smc_result.get("status", "UNKNOWN")
+                smc_result.get(
+                    "status",
+                    "UNKNOWN",
+                )
             ).upper()
 
             a_plus = (
@@ -1424,6 +1865,10 @@ class MarketScanner:
                 is True
             )
 
+            # Do not treat strategy readiness as SMC authorization.
+            if not authorization:
+                a_plus = False
+
             result = {
                 "symbol": symbol,
                 "status": status,
@@ -1434,6 +1879,7 @@ class MarketScanner:
                 ),
                 "current_price": current_price,
                 "market_data": market_data,
+                "strategy_analysis": strategy_results,
                 "fundamentals": fundamentals,
                 "risk_checks": risk_checks,
                 "evidence": evidence,
@@ -1455,7 +1901,8 @@ class MarketScanner:
                     "direction"
                 ),
                 "setup_type": smc_result.get(
-                    "setup_type"
+                    "pathway",
+                    smc_result.get("setup_type"),
                 ),
                 "a_plus_score": smc_result.get(
                     "score",
@@ -1466,25 +1913,35 @@ class MarketScanner:
                     "complete"
                 ],
                 "execution_authorized": authorization,
+                "pro_trend_status": strategy_results[
+                    "pro_trend"
+                ].get("status"),
+                "counter_trend_status": strategy_results[
+                    "counter_trend"
+                ].get("status"),
                 "last_error": None,
             })
 
             if a_plus:
+
                 logger.info(
-                    "%s | A+ SETUP | Direction=%s | Score=%s | Authorized=%s",
+                    "%s | A+ SETUP | Direction=%s | "
+                    "Score=%s | Authorized=%s",
                     symbol,
                     smc_result.get("direction"),
-                    smc_result.get(
-                        "score",
-                        smc_result.get("a_plus_score"),
-                    ),
+                    smc_result.get("score"),
                     authorization,
                 )
+
             else:
+
                 logger.info(
-                    "%s | Status=%s | No A+ setup",
+                    "%s | Status=%s | "
+                    "Pro=%s | Counter=%s | No authorized A+ setup",
                     symbol,
                     status,
+                    strategy_results["pro_trend"].get("status"),
+                    strategy_results["counter_trend"].get("status"),
                 )
 
             return result
@@ -1510,20 +1967,19 @@ class MarketScanner:
                 "symbol": symbol,
                 "status": "SCAN_ERROR",
                 "error": str(exc),
-                "traceback": traceback.format_exc()
-                if False else None,
                 "timestamp": self._now(),
                 "a_plus": False,
                 "execution_authorized": False,
             }
 
-    # =========================================================
-    # SCAN ALL
-    # =========================================================
+    # =====================================================
+    # SCAN ALL INSTRUMENTS
+    # =====================================================
 
     async def scan_all(self):
 
         started = time.time()
+
         results = {}
 
         logger.info(
@@ -1531,7 +1987,8 @@ class MarketScanner:
             len(self.INSTRUMENTS),
         )
 
-        # Sequential scanning is retained for the phone host.
+        # Sequential instrument scanning is retained for
+        # resource protection on the phone host.
         for symbol in self.INSTRUMENTS:
 
             if self._stop_event.is_set():
@@ -1558,9 +2015,9 @@ class MarketScanner:
 
         return results
 
-    # =========================================================
+    # =====================================================
     # CONTINUOUS SCANNER
-    # =========================================================
+    # =====================================================
 
     async def run(self):
 
@@ -1568,13 +2025,17 @@ class MarketScanner:
         self._stop_event.clear()
 
         logger.info(
-            "Market Scanner started | Interval=%ss",
+            "Market Scanner V%s started | Interval=%ss",
+            self.VERSION,
             self.scan_interval,
         )
 
         try:
 
-            while self.running and not self._stop_event.is_set():
+            while (
+                self.running
+                and not self._stop_event.is_set()
+            ):
 
                 cycle_started = time.time()
 
@@ -1593,26 +2054,39 @@ class MarketScanner:
                 await asyncio.sleep(wait_time)
 
         except asyncio.CancelledError:
-            logger.info("Market Scanner cancelled")
+
+            logger.info(
+                "Market Scanner cancelled"
+            )
+
             raise
 
         except Exception:
-            logger.exception("Scanner loop failure")
+
+            logger.exception(
+                "Scanner loop failure"
+            )
 
         finally:
+
             self.running = False
-            logger.info("Market Scanner stopped")
+
+            logger.info(
+                "Market Scanner stopped"
+            )
 
     def stop(self):
 
         self.running = False
         self._stop_event.set()
 
-        logger.info("Market Scanner stop requested")
+        logger.info(
+            "Market Scanner stop requested"
+        )
 
-    # =========================================================
+    # =====================================================
     # STATUS
-    # =========================================================
+    # =====================================================
 
     def get_status(self):
 
@@ -1627,6 +2101,14 @@ class MarketScanner:
                 "last_scan_time": self.last_scan_time,
                 "scan_count": self.scan_count,
                 "error_count": self.error_count,
+                "strategy_engines": {
+                    "pro_trend_available": (
+                        self.pro_trend_engine is not None
+                    ),
+                    "counter_trend_available": (
+                        self.counter_trend_engine is not None
+                    ),
+                },
                 "instrument_states": self.instrument_states,
             }
 
@@ -1636,9 +2118,9 @@ class MarketScanner:
             return self.last_scan_results
 
 
-# =============================================================
+# =========================================================
 # SHARED INSTANCE
-# =============================================================
+# =========================================================
 
 market_scanner = MarketScanner()
 scanner = market_scanner
