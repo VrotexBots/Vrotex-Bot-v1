@@ -746,85 +746,48 @@ def create_app(bot: Any) -> FastAPI:
                     "Exness account endpoint returned an unexpected payload"
                 )
 
-            def find_value(data, aliases):
+                        account_state = details.get("account_state", {})
 
-                if isinstance(data, dict):
+            if not isinstance(account_state, dict):
+                account_state = {}
 
-                    for key, value in data.items():
+            def to_number(value):
+                try:
+                    number = float(value)
+                    return number if math.isfinite(number) else None
+                except (TypeError, ValueError):
+                    return None
 
-                        if (
-                            str(key).lower() in aliases
-                            and value is not None
-                        ):
-                            return value
+            balance = to_number(account_state.get("balance"))
+            equity = to_number(account_state.get("equity"))
+            margin = to_number(account_state.get("used_margin"))
 
-                    for value in data.values():
+            profit = (
+                round(equity - balance, 2)
+                if equity is not None and balance is not None
+                else None
+            )
 
-                        found = find_value(
-                            value,
-                            aliases,
-                        )
+            free_margin = (
+                round(equity - margin, 2)
+                if equity is not None and margin is not None
+                else None
+            )
 
-                        if found is not None:
-                            return found
-
-                elif isinstance(data, (list, tuple)):
-
-                    for item in data:
-
-                        found = find_value(
-                            item,
-                            aliases,
-                        )
-
-                        if found is not None:
-                            return found
-
-                return None
-
-            fields = {
-                "balance": {
-                    "balance",
-                    "account_balance",
-                },
-
-                "equity": {
-                    "equity",
-                    "account_equity",
-                },
-
-                "profit": {
-                    "profit",
-                    "floating_profit",
-                    "unrealized_profit",
-                    "pnl",
-                    "pl",
-                },
-
-                "margin": {
-                    "margin",
-                    "used_margin",
-                },
-
-                "free_margin": {
-                    "free_margin",
-                    "available_margin",
-                },
-
-                "margin_level": {
-                    "margin_level",
-                    "marginlevel",
-                },
-
-                "currency": {
-                    "currency",
-                    "account_currency",
-                },
-            }
+            margin_level = (
+                round((equity / margin) * 100, 2)
+                if equity is not None and margin is not None and margin > 0
+                else None
+            )
 
             normalized = {
-                key: find_value(details, aliases)
-                for key, aliases in fields.items()
+                "balance": balance,
+                "equity": equity,
+                "profit": profit,
+                "margin": margin,
+                "free_margin": free_margin,
+                "margin_level": margin_level,
+                "currency": account_state.get("currency"),
             }
 
             return {
