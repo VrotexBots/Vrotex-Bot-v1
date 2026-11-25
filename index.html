@@ -975,11 +975,146 @@ function showPage(target){
 }
 
 
-// Trade page preview. Empty by default; values will come from broker integration later.
-const tradeAccountPreview={balance:0,equity:0,gain:0,margin:0,freeMargin:0,marginLevel:null,currency:''};
-const tradePositionsPreview=[];
-const tradeOrdersPreview=[];
-function renderTradePreview(){
+// Trade page: live account and open-position data from Exness.
+let tradeAccountData = null;
+let tradePositionsData = [];
+let tradeOrdersData = [];
+let tradeRefreshBusy = false;
+
+function tradeFormat(value, currency = '') {
+    if (value === null || value === undefined || value === '') return '—';
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    return number.toFixed(2) + (currency ? ' ' + currency : '');
+}
+
+function renderTradeData() {
+    const account = tradeAccountData || {};
+
+    document.getElementById('trade-balance').textContent =
+        tradeFormat(account.balance, account.currency);
+    document.getElementById('trade-equity').textContent =
+        tradeFormat(account.equity, account.currency);
+    document.getElementById('trade-gain').textContent =
+        tradeFormat(account.profit, account.currency);
+    document.getElementById('trade-margin').textContent =
+        tradeFormat(account.margin, account.currency);
+    document.getElementById('trade-free-margin').textContent =
+        tradeFormat(account.free_margin, account.currency);
+    document.getElementById('trade-margin-level').textContent =
+        account.margin_level == null ? '—' :
+        tradeFormat(account.margin_level) + '%';
+
+    const positions = document.getElementById('trade-positions');
+
+    positions.innerHTML = tradePositionsData.length
+        ? tradePositionsData.map(p => {
+            const side = String(p.direction || p.type || '').toUpperCase();
+            return `<article class="trade-position">
+                <div class="trade-position-head">
+                    <span>${escapeHTML(p.instrument || p.symbol || '—')}
+                    <span>${escapeHTML(side)} ${escapeHTML(p.volume ?? p.initial_volume ?? '—')}</span></span>
+                    <strong>${tradeFormat(p.profit)}</strong>
+                </div>
+                <div class="trade-position-details">
+                    <span>Position ID: <strong>${escapeHTML(p.position_id ?? p.id ?? '—')}</strong></span>
+                    <span>Entry: <strong>${escapeHTML(p.open_price ?? p.price ?? '—')}</strong></span>
+                    <span>Current: <strong>${escapeHTML(p.current_price ?? p.current ?? '—')}</strong></span>
+                    <span>State: <strong>${escapeHTML(p.state ?? '—')}</strong></span>
+                    <span>SL: <strong>${escapeHTML(p.stop_loss ?? p.sl ?? '—')}</strong></span>
+                    <span>TP: <strong>${escapeHTML(p.take_profit ?? p.tp ?? '—')}</strong></span>
+                </div>
+            </article>`;
+        }).join('')
+        : '<div class="trade-empty">No open positions reported by Exness.</div>';
+
+    const orders = document.getElementById('trade-orders');
+    const ordersSection = document.getElementById('trade-orders-section');
+
+    orders.innerHTML = tradeOrdersData.map(o => `
+        <article class="trade-order">
+            <div class="trade-order-head">
+                <span>${escapeHTML(o.instrument || o.symbol || '—')}
+                ${escapeHTML(o.direction || o.type || '')}</span>
+                <strong>${escapeHTML(o.open_price ?? o.price ?? '—')}</strong>
+            </div>
+        </article>
+    `).join('');
+
+    ordersSection.hidden = tradeOrdersData.length === 0;
+}
+
+async function refreshTradeData() {
+    if (tradeRefreshBusy) return;
+    tradeRefreshBusy = true;
+
+    try {
+        const [accountResponse, positionsResponse] = await Promise.all([
+            fetch('/api/account', { cache: 'no-store' }),
+            fetch('/api/positions', { cache: 'no-store' })
+        ]);
+
+        const accountPayload = await accountResponse.json();
+        const positionsPayload = await positionsResponse.json();
+
+        if (!accountResponse.ok) {
+            throw new Error('Account API error: ' + accountResponse.status);
+        }
+
+        if (!positionsResponse.ok) {
+            throw new Error('Positions API error: ' + positionsResponse.status);
+        }
+
+        if (!accountPayload.connected || !positionsPayload.connected) {
+            throw new Error('Exness is not connected.');
+        }
+
+        tradeAccountData = accountPayload.account || {};
+        tradePositionsData = positionsPayload.positions || [];
+        tradeOrdersData = positionsPayload.orders || [];
+
+        renderTradeData();
+
+        const status = document.getElementById('trade-data-status');
+        status.textContent = 'LIVE · EXNESS';
+        status.className = 'trade-data-status connected';
+
+    } catch (error) {
+        console.error('[Trade page]', error);
+
+        const status = document.getElementById('trade-data-status');
+        status.textContent = 'API ERROR';
+        status.className = 'trade-data-status error';
+
+    } finally {
+        tradeRefreshBusy = false;
+    }
+}
+
+const tradeMenu = document.getElementById('trade-menu');
+const tradeMenuToggle = document.getElementById('trade-menu-toggle');
+
+tradeMenuToggle.addEventListener('click', () => {
+    const open = tradeMenu.hidden;
+    tradeMenu.hidden = !open;
+    tradeMenuToggle.setAttribute('aria-expanded', String(open));
+});
+
+tradeMenu.querySelectorAll('button').forEach(button => {
+    button.addEventListener('click', () => {
+        tradeMenu.hidden = true;
+        tradeMenuToggle.setAttribute('aria-expanded', 'false');
+        notify(button.dataset.tradeMenu + ' view is not connected yet.');
+    });
+});
+
+renderTradeData();
+
+setInterval(() => {
+    if (document.getElementById('trade-page').classList.contains('active')) {
+        refreshTradeData();
+    }
+}, 15000);
   const account=tradeAccountPreview;
   const fmt=(value)=>Number(value||0).toFixed(2)+(account.currency?' '+account.currency:'');
   document.getElementById('trade-balance').textContent=fmt(account.balance);
