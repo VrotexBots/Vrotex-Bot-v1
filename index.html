@@ -1117,26 +1117,7 @@ setInterval(() => {
         refreshTradeData();
     }
 }, 15000);
-  const account=tradeAccountPreview;
-  const fmt=(value)=>Number(value||0).toFixed(2)+(account.currency?' '+account.currency:'');
-  document.getElementById('trade-balance').textContent=fmt(account.balance);
-  document.getElementById('trade-equity').textContent=fmt(account.equity);
-  document.getElementById('trade-gain').textContent=fmt(account.gain);
-  document.getElementById('trade-margin').textContent=fmt(account.margin);
-  document.getElementById('trade-free-margin').textContent=fmt(account.freeMargin);
-  document.getElementById('trade-margin-level').textContent=account.marginLevel==null?'—':Number(account.marginLevel).toFixed(2)+'%';
-  const positions=document.getElementById('trade-positions');
-  positions.innerHTML=tradePositionsPreview.map(p=>`<article class="trade-position"><div class="trade-position-head"><span>${escapeHTML(p.symbol)} <span class="${p.side==='BUY'?'trade-buy':'trade-sell'}">${escapeHTML(p.side)} ${escapeHTML(p.volume)}</span></span><strong class="${Number(p.profit)>=0?'trade-buy':'trade-sell'}">${fmt(p.profit)}</strong></div><div class="trade-position-details"><span>Price: <strong>${escapeHTML(p.price)}</strong></span><span>Current: <strong>${escapeHTML(p.current)}</strong></span><span>SL: <strong>${escapeHTML(p.sl||'—')}</strong></span><span>TP: <strong>${escapeHTML(p.tp||'—')}</strong></span></div></article>`).join('');
-  const orders=document.getElementById('trade-orders');
-  const ordersSection=document.getElementById('trade-orders-section');
-  orders.innerHTML=tradeOrdersPreview.map(o=>`<article class="trade-order"><div class="trade-order-head"><span>${escapeHTML(o.symbol)} <span class="${String(o.type).toUpperCase().includes('BUY')?'trade-buy':'trade-sell'}">${escapeHTML(o.type)} ${escapeHTML(o.volume)}</span></span><strong>${escapeHTML(o.price)}</strong></div><div class="trade-position-details"><span>SL: <strong>${escapeHTML(o.sl||'—')}</strong></span><span>TP: <strong>${escapeHTML(o.tp||'—')}</strong></span></div></article>`).join('');
-  ordersSection.hidden=tradeOrdersPreview.length===0;
-}
-const tradeMenu=document.getElementById('trade-menu'), tradeMenuToggle=document.getElementById('trade-menu-toggle');
-tradeMenuToggle.addEventListener('click',()=>{const open=tradeMenu.hidden;tradeMenu.hidden=!open;tradeMenuToggle.setAttribute('aria-expanded',String(open));});
-tradeMenu.querySelectorAll('button').forEach(button=>button.addEventListener('click',()=>{tradeMenu.hidden=true;tradeMenuToggle.setAttribute('aria-expanded','false');notify(button.dataset.tradeMenu+' view is not connected in this dashboard preview.');}));
-renderTradePreview();
-
+  
 // Trading Journal: render only verifiable records found in the live log feed.
 const journalWeekdays=document.getElementById('journal-weekdays');
 const journalDays=document.getElementById('journal-days');
