@@ -746,7 +746,7 @@ def create_app(bot: Any) -> FastAPI:
                     "Exness account endpoint returned an unexpected payload"
                 )
 
-                        account_state = details.get("account_state", {})
+            account_state = details.get("account_state", {})
 
             if not isinstance(account_state, dict):
                 account_state = {}
