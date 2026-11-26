@@ -1383,6 +1383,150 @@ class MarketScanner:
 
         return scores
 
+    @staticmethod
+    def _valid_direction(value):
+        return str(value or "").upper() in ("BULLISH", "BEARISH")
+
+    @staticmethod
+    def _price_in_zone(price, zone):
+        if not isinstance(zone, dict):
+            return False
+
+        price = MarketScanner._number(price)
+        low = MarketScanner._number(
+            zone.get("lower", zone.get("low", zone.get("bottom")))
+        )
+        high = MarketScanner._number(
+            zone.get("upper", zone.get("high", zone.get("top")))
+        )
+
+        return (
+            price is not None
+            and low is not None
+            and high is not None
+            and low <= price <= high
+        )
+
+    @staticmethod
+    def _sweep_is_confirmed(sweep):
+        if not isinstance(sweep, dict):
+            return False
+
+        if sweep.get("confirmed") is True:
+            return True
+
+        level = MarketScanner._number(sweep.get("level"))
+        wick = MarketScanner._number(sweep.get("wick"))
+        close = MarketScanner._number(sweep.get("close"))
+        side = str(sweep.get("direction", "")).upper()
+
+        if None in (level, wick, close):
+            return False
+
+        if side in ("BULLISH", "LONG"):
+            return wick < level and close > level
+
+        if side in ("BEARISH", "SHORT"):
+            return wick > level and close < level
+
+        return False
+
+    @staticmethod
+    def _accepted_entry_model(value):
+        accepted = {
+            "CHOCH_FVG",
+            "SWEEP_ENGULFING",
+            "BREAKER",
+            "MSS_SWEEP_DISPLACEMENT",
+            "FLIP_S2D_D2S",
+        }
+
+        if isinstance(value, dict):
+            model = re.sub(
+                r"[^A-Z0-9]+", "_",
+                str(value.get("model", value.get("name", ""))).upper(),
+            ).strip("_")
+
+            confirmed = (
+                value.get("confirmed") is True
+                or value.get("valid") is True
+            )
+            direction = str(value.get("direction", "")).upper()
+
+            if (
+                model in accepted
+                and confirmed
+                and direction in ("BULLISH", "BEARISH", "LONG", "SHORT")
+            ):
+                return True
+
+            for key, item in value.items():
+                normalized = re.sub(
+                    r"[^A-Z0-9]+", "_", str(key).upper()
+                ).strip("_")
+
+                if normalized in accepted and isinstance(item, dict):
+                    if item.get("confirmed") is True or item.get("valid") is True:
+                        item_direction = str(item.get("direction", "")).upper()
+
+                        if item_direction in (
+                            "BULLISH", "BEARISH", "LONG", "SHORT"
+                        ):
+                            return True
+
+                if isinstance(item, (dict, list, tuple)):
+                    if MarketScanner._accepted_entry_model(item):
+                        return True
+
+            return False
+
+        if isinstance(value, (list, tuple)):
+            return any(
+                MarketScanner._accepted_entry_model(item)
+                for item in value
+            )
+
+        return False
+
+    @staticmethod
+    def _score_criteria(criteria):
+        score = 0
+        observed_count = 0
+        passed_count = 0
+        details = {}
+
+        for name, points, observed, passed in criteria:
+            observed = bool(observed)
+            passed = bool(passed) if observed else False
+
+            if observed:
+                observed_count += 1
+
+                if passed:
+                    score += points
+                    passed_count += 1
+
+            details[name] = {
+                "points": points if passed else 0,
+                "maximum_points": points,
+                "observed": observed,
+                "passed": passed,
+            }
+
+        return {
+            "score": float(score) if observed_count else None,
+            "observed_criteria": observed_count,
+            "passed_criteria": passed_count,
+            "status": (
+                "MISSING" if not observed_count
+                else "VALIDATED" if score == 100
+                else "PARTIAL" if score > 0
+                else "OBSERVED_NO_PASS"
+            ),
+            "criteria": details,
+        }
+
+    
     def _extract_category_scores(
         self,
         market_data,
