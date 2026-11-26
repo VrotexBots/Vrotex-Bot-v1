@@ -1854,7 +1854,49 @@ class MarketScanner:
                 collected["trade_quality_risk"].append(
                     scores["trade_quality_risk"]
                 )
+        # Score Pro-Trend and Counter-Trend independently.
+        # Never blend their scores together.
+        strategy_results = self._dict(strategy_results)
 
+        strategy_pathways = {}
+
+        for strategy_kind in (
+            "pro_trend",
+            "counter_trend",
+        ):
+
+            strategy_output = self._dict(
+                strategy_results.get(strategy_kind)
+            )
+
+            strategy_result = self._dict(
+                strategy_output.get("result")
+            )
+
+            if (
+                strategy_output.get("available") is True
+                and strategy_result
+            ):
+
+                strategy_pathways[strategy_kind] = (
+                    self._strategy_pathway_scores(
+                        strategy_result,
+                        strategy_kind,
+                        fundamentals,
+                        risk_checks,
+                        current_price,
+                        market_data,
+                    )
+                )
+
+            else:
+
+                strategy_pathways[strategy_kind] = {
+                    "scores": {},
+                    "details": {},
+                    "status": "UNAVAILABLE",
+                }
+    
         final = {}
 
         for category, values in collected.items():
