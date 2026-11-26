@@ -2004,6 +2004,22 @@ class MarketScanner:
             current_price,
         )
 
+        validated_categories = set(
+            score_report.get("scores", {}).keys()
+        )
+
+        present = [
+            category
+            for category in self.CATEGORIES
+            if category in validated_categories
+        ]
+
+        missing = [
+            category
+            for category in self.CATEGORIES
+            if category not in present
+        ]        
+
         return {
             "structure": structure,
             "poi": poi,
