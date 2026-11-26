@@ -1767,11 +1767,13 @@ class MarketScanner:
         return {"scores": scores, "details": details}
 
     def _extract_category_scores(
-        self,
-        market_data,
-        fundamentals,
-        risk_checks,
-    ):
+    self,
+    market_data,
+    fundamentals,
+    risk_checks,
+    strategy_results,
+    current_price,
+):
 
         collected = {
             category: []
