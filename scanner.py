@@ -1527,7 +1527,245 @@ class MarketScanner:
             "criteria": details,
         }
 
-    
+
+    def _strategy_pathway_scores(
+        self,
+        strategy_result,
+        strategy_kind,
+        fundamentals,
+        risk_checks,
+        current_price,
+        market_data=None,
+    ):
+        """Translate strategy outputs into the approved seven-category rubric."""
+        strategy_result = self._dict(strategy_result)
+        market_data = self._dict(market_data)
+        fundamentals = self._dict(fundamentals)
+        risk_checks = self._dict(risk_checks)
+        scores = {}
+        details = {}
+
+        if strategy_kind == "pro_trend":
+            h1 = self._dict(strategy_result.get("h1"))
+            m5 = self._dict(strategy_result.get("m5"))
+            m1 = self._dict(strategy_result.get("m1"))
+            h1_structure = self._dict(h1.get("structure"))
+            h1_range = self._dict(h1.get("dealing_range"))
+            m5_external = self._dict(m5.get("external_structure"))
+            m1_choch = self._dict(m1.get("step_2_choch"))
+            h1_inducement = self._dict(h1.get("inducement"))
+            m5_inducement = self._dict(m5.get("inducement"))
+            m1_sweep = self._dict(self._dict(m1.get("step_1_tap_and_sweep")).get("sweep_evidence"))
+            h1_sweep = h1_inducement.get("sweep_evidence")
+            m5_sweep = m5_inducement.get("sweep")
+            selected_h1_poi = self._dict(self._dict(h1.get("poi")).get("selected"))
+            selected_m5_poi = self._dict(self._dict(m5.get("poi")).get("selected"))
+            h1_bias = str(h1.get("bias", "")).upper()
+            h1_anchor_values = (
+                h1_structure.get("strong_low"),
+                h1_structure.get("weak_high"),
+                h1_structure.get("strong_high"),
+                h1_structure.get("weak_low"),
+            )
+            protected_swings = sum(isinstance(x, dict) and self._number(x.get("price")) is not None for x in h1_anchor_values) >= 2
+            range_valid = h1_range.get("valid") is True and self._number(h1_range.get("equilibrium")) is not None
+            body_close_break = (
+                str(self._dict(h1.get("choch")).get("confirmation", "")).upper() == "FULL_BODY_CLOSE"
+                or (m5_external.get("choch_confirmed") is True and str(m5_external.get("confirmation", "")).upper() == "BODY_CLOSE")
+                or m1_choch.get("body_close_confirmed") is True
+            )
+            structure_criteria = [
+                ("h1_directional_bias", 25, "bias" in h1, self._valid_direction(h1_bias)),
+                ("body_close_structure_break", 25, ("choch" in h1 or "external_structure" in m5 or "step_2_choch" in m1), body_close_break),
+                ("protected_external_swings", 25, bool(h1_structure) or bool(h1.get("dealing_range")), protected_swings),
+                ("valid_range_and_equilibrium", 25, bool(h1_range), range_valid),
+            ]
+            poi_location = str(h1.get("location", "")).upper()
+            location_ok = poi_location == ("DISCOUNT" if h1_bias == "BULLISH" else "PREMIUM") if self._valid_direction(h1_bias) else False
+            h1_poi_observed = "selected" in self._dict(h1.get("poi"))
+            selected_poi = selected_h1_poi if selected_h1_poi else selected_m5_poi
+            poi_clean = selected_poi.get("unmitigated") is True and selected_poi.get("invalidated") is not True
+            poi_tap_observed = bool(selected_poi) and current_price is not None
+            poi_tapped = self._price_in_zone(current_price, selected_poi)
+            poi_criteria = [
+                ("valid_h1_or_m5_poi", 25, h1_poi_observed or "selected" in self._dict(m5.get("poi")), bool(selected_poi)),
+                ("clean_unmitigated_poi", 25, bool(selected_poi) and "unmitigated" in selected_poi, poi_clean),
+                ("correct_premium_discount_location", 25, "location" in h1, location_ok),
+                ("live_price_inside_selected_poi", 25, poi_tap_observed, poi_tapped),
+            ]
+            sweep_candidates = [h1_sweep, m5_sweep, m1_sweep]
+            sweep_observed = any(key in h1_inducement for key in ("sweep_evidence", "swept")) or any(key in m5_inducement for key in ("sweep", "swept")) or "sweep_evidence" in self._dict(m1.get("step_1_tap_and_sweep"))
+            confirmed_sweep = any(self._sweep_is_confirmed(x) for x in sweep_candidates)
+            sweep_obj = next((x for x in sweep_candidates if isinstance(x, dict) and x), None)
+            close_back_inside = bool(sweep_obj and (
+                sweep_obj.get("confirmed") is True
+                or str(sweep_obj.get("confirmation", "")).upper() == "WICK_THROUGH_CLOSE_BACK_INSIDE"
+                or self._sweep_is_confirmed(sweep_obj)
+            ))
+            pool_observed = "price" in h1_inducement or "price" in m5_inducement
+            pool_found = self._number(h1_inducement.get("price")) is not None or self._number(m5_inducement.get("price")) is not None
+            reaction_observed = "step_2_choch" in m1 or "choch" in h1
+            reaction_found = m1_choch.get("body_close_confirmed") is True or bool(h1.get("choch"))
+            liquidity_criteria = [
+                ("relevant_liquidity_or_inducement_level", 25, "price" in h1_inducement or "price" in m5_inducement, pool_found),
+                ("completed_liquidity_sweep", 25, sweep_observed, confirmed_sweep),
+                ("wick_through_and_close_back_inside", 25, isinstance(sweep_obj, dict), close_back_inside),
+                ("post_sweep_structure_reaction", 25, reaction_observed, reaction_found),
+            ]
+            m1_ta = self._ta(market_data, "M1")
+            explicit_models = m1_ta.get(
+                "entry_models",
+                m1_ta.get("entry_evidence", m1_ta.get("confirmed_entry_models")),
+            )
+            accepted_model = self._accepted_entry_model(explicit_models)
+            m1_disp = self._dict(m1.get("displacement"))
+            m1_zone = self._dict(m1.get("step_3_entry_zone"))
+            m1_refs = self._dict(m1.get("step_4_execution_references"))
+            entry_criteria = [
+                ("approved_m1_entry_model_identified", 25, explicit_models is not None, accepted_model),
+                ("m1_external_choch_body_close", 25, "body_close_confirmed" in m1_choch, m1_choch.get("body_close_confirmed") is True),
+                ("m1_displacement_and_fvg", 25, bool(m1_disp), m1_disp.get("confirmed") is True and bool(self._list(m1_disp.get("directional_fvgs")))),
+                ("entry_zone_and_structural_stop", 25, bool(m1_zone) or bool(m1_refs), m1_zone.get("unmitigated") is True and self._number(m1_refs.get("stop_loss_reference")) is not None),
+            ]
+            h1_ready = h1.get("handover_to_m5") is True
+            m5_ready = m5.get("handover_to_m1") is True
+            m1_ready = m1.get("m1_entry_setup_ready") is True
+            alignment_criteria = [
+                ("h1_narrative_established", 34, "h1" in strategy_result, self._valid_direction(h1_bias)),
+                ("m5_confirmation_handover", 33, "handover_to_m1" in m5, h1_ready and m5_ready),
+                ("m1_entry_confirmation", 33, "m1" in strategy_result, m1_ready),
+            ]
+        else:
+            layers = self._dict(strategy_result.get("layers"))
+            h1 = self._dict(layers.get("H1_COUNTER_TREND_TO_M5"))
+            m5 = self._dict(layers.get("M5_COUNTER_TREND_TO_M1"))
+            h1_checks = self._dict(h1.get("checks"))
+            m5_checks = self._dict(m5.get("checks"))
+            h1_structure = self._dict(self._dict(h1.get("structure")).get("h1"))
+            m5_structure = self._dict(self._dict(m5.get("structure")).get("m5"))
+            h1_sweep = h1_structure.get("exhaustion_sweep")
+            m5_sweep = m5_structure.get("exhaustion_sweep")
+            selected_poi = self._dict(self._dict(m5.get("poi")).get("selected"))
+            h1_trend = str(h1_structure.get("trend", "")).upper()
+            range_low = self._number(h1_structure.get("range_low"))
+            range_high = self._number(h1_structure.get("range_high"))
+            equilibrium = self._number(h1_structure.get("equilibrium_50"))
+            range_valid = range_low is not None and range_high is not None and range_high > range_low and equilibrium is not None
+            protected = isinstance(h1_structure.get("strong"), dict) and isinstance(h1_structure.get("weak"), dict)
+            body_close = m5_checks.get("m5_body_close_beyond_external_line") is True or m5_checks.get("m5_external_choch_against_h1") is True
+            structure_criteria = [
+                ("h1_directional_bias", 25, "trend" in h1_structure, self._valid_direction(h1_trend)),
+                ("body_close_structure_break", 25, "m5_body_close_beyond_external_line" in m5_checks or "m5_external_choch_against_h1" in m5_checks, body_close),
+                ("protected_external_swings", 25, "strong" in h1_structure or "weak" in h1_structure, protected),
+                ("valid_range_and_equilibrium", 25, "range_low" in h1_structure or "range_high" in h1_structure, range_valid),
+            ]
+            poi_check_observed = "m5_poi_selected_unmitigated_correct_location" in m5_checks
+            poi_criteria = [
+                ("valid_h1_or_m5_poi", 25, "selected" in self._dict(m5.get("poi")), bool(selected_poi)),
+                ("clean_unmitigated_poi", 25, bool(selected_poi) and any(k in selected_poi for k in ("unmitigated", "clean", "mitigated")), (selected_poi.get("unmitigated") is True or selected_poi.get("clean") is True or selected_poi.get("mitigated") is False) and selected_poi.get("invalidated") is not True),
+                ("correct_premium_discount_location", 25, poi_check_observed, m5_checks.get("m5_poi_selected_unmitigated_correct_location") is True),
+                ("live_price_inside_selected_poi", 25, "m5_physical_poi_tap" in m5_checks, m5_checks.get("m5_physical_poi_tap") is True),
+            ]
+            pool_observed = "weak" in h1_structure or "m5_inducement_price" in self._dict(m5.get("poi"))
+            pool_found = isinstance(h1_structure.get("weak"), dict) or self._number(self._dict(m5.get("poi")).get("m5_inducement_price")) is not None
+            sweep_observed = "exhaustion_sweep" in h1_structure or "exhaustion_sweep" in m5_structure
+            sweep_found = self._sweep_is_confirmed(h1_sweep) or self._sweep_is_confirmed(m5_sweep)
+            close_inside = sweep_found
+            reaction_observed = "internal_choch" in h1_structure or "m5_signal_b_internal_choch" in m5_checks
+            reaction_found = isinstance(h1_structure.get("internal_choch"), dict) or m5_checks.get("m5_signal_b_internal_choch") is True
+            liquidity_criteria = [
+                ("relevant_liquidity_or_inducement_level", 25, pool_observed, pool_found),
+                ("completed_liquidity_sweep", 25, sweep_observed, sweep_found),
+                ("wick_through_and_close_back_inside", 25, isinstance(h1_sweep, dict) or isinstance(m5_sweep, dict), close_inside),
+                ("post_sweep_structure_reaction", 25, reaction_observed, reaction_found),
+            ]
+            entry = self._dict(m5.get("entry_evidence"))
+            model_confirmed = self._accepted_entry_model(entry)
+            m1_choch_observed = "m1_external_choch_body_close" in m5_checks
+            displacement_observed = "m1_displacement" in m5_checks
+            entry_criteria = [
+                ("approved_m1_entry_model_identified", 25, bool(entry), model_confirmed),
+                ("m1_external_choch_body_close", 25, m1_choch_observed, m5_checks.get("m1_external_choch_body_close") is True),
+                ("m1_displacement_and_fvg", 25, displacement_observed, m5_checks.get("m1_displacement") is True),
+                ("entry_zone_and_structural_stop", 25, bool(entry), self._number(entry.get("entry_price")) is not None and self._number(entry.get("stop_loss")) is not None),
+            ]
+            alignment_criteria = [
+                ("h1_narrative_established", 34, bool(h1_structure), self._valid_direction(h1_trend)),
+                ("m5_confirmation_handover", 33, bool(m5_checks), m5_checks.get("m5_external_choch_against_h1") is True and m5_checks.get("m5_range_locked") is True),
+                ("m1_entry_confirmation", 33, "m1_entry_trigger_confirmed" in m5_checks or "existing_m1_entry_model_confirmed" in m5_checks, m5_checks.get("m1_entry_trigger_confirmed") is True and m5_checks.get("existing_m1_entry_model_confirmed") is True),
+            ]
+
+        criteria_by_category = {
+            "structure": structure_criteria,
+            "poi": poi_criteria,
+            "liquidity": liquidity_criteria,
+            "entry_models": entry_criteria,
+            "timeframe_alignment": alignment_criteria,
+        }
+
+        for category, criteria in criteria_by_category.items():
+            details[category] = self._score_criteria(criteria)
+            if details[category]["score"] is not None:
+                scores[category] = details[category]["score"]
+
+        fundamental_data = self._dict(fundamentals.get("data"))
+        fundamental_sources = (
+            fundamentals.get("category_scores"),
+            fundamental_data.get("category_scores"),
+        )
+        fundamental_score = None
+        for source in fundamental_sources:
+            normalized = self._normalize_scores(source)
+            if "fundamentals" in normalized:
+                fundamental_score = normalized["fundamentals"]
+                break
+        if fundamental_score is None:
+            candidate = self._number(fundamentals.get("score", fundamental_data.get("score")))
+            if candidate is not None and 0 <= candidate <= 100:
+                fundamental_score = candidate
+        details["fundamentals"] = {
+            "score": fundamental_score,
+            "observed_criteria": 1 if fundamental_score is not None else 0,
+            "passed_criteria": 1 if fundamental_score is not None and fundamental_score > 0 else 0,
+            "status": "SOURCE_SCORE" if fundamental_score is not None else "MISSING",
+            "criteria": {
+                "source_fundamental_score": {
+                    "points": fundamental_score or 0,
+                    "maximum_points": 100,
+                    "observed": fundamental_score is not None,
+                    "passed": fundamental_score is not None and fundamental_score > 0,
+                }
+            },
+        }
+        if fundamental_score is not None:
+            scores["fundamentals"] = fundamental_score
+
+        raw_risk = self._dict(risk_checks.get("checks"))
+        nested_risk = self._dict(raw_risk.get("checks"))
+        if nested_risk:
+            raw_risk = {**raw_risk, **nested_risk}
+        risk_checks_observed = {
+            "spread_valid": raw_risk.get("spread_valid"),
+            "stop_loss_valid": raw_risk.get("stop_loss_valid"),
+            "risk_limits_valid": (
+                raw_risk.get("risk_within_limit") is True
+                and raw_risk.get("daily_limit_valid") is True
+                and raw_risk.get("consecutive_loss_limit_valid") is True
+            ),
+            "reward_risk_valid": raw_risk.get("reward_risk_valid"),
+        }
+        risk_criteria = [
+            ("spread_and_execution_buffer", 25, isinstance(risk_checks_observed["spread_valid"], bool), risk_checks_observed["spread_valid"] is True),
+            ("structural_stop_loss", 25, isinstance(risk_checks_observed["stop_loss_valid"], bool), risk_checks_observed["stop_loss_valid"] is True),
+            ("per_trade_daily_and_consecutive_loss_limits", 25, all(isinstance(raw_risk.get(k), bool) for k in ("risk_within_limit", "daily_limit_valid", "consecutive_loss_limit_valid")), risk_checks_observed["risk_limits_valid"]),
+            ("reward_to_risk_and_target", 25, isinstance(risk_checks_observed["reward_risk_valid"], bool), risk_checks_observed["reward_risk_valid"] is True),
+        ]
+        details["trade_quality_risk"] = self._score_criteria(risk_criteria)
+        if details["trade_quality_risk"]["score"] is not None:
+            scores["trade_quality_risk"] = details["trade_quality_risk"]["score"]
+
+        return {"scores": scores, "details": details}
+
     def _extract_category_scores(
         self,
         market_data,
