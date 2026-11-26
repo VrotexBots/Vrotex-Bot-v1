@@ -2117,10 +2117,13 @@ class MarketScanner:
             "timeframe_alignment": evidence["timeframe_alignment"],
             "trade_quality_risk": evidence["trade_quality_risk"],
             "risk_checks": risk_checks,
-            "category_scores": evidence["category_scores"],
-            "fundamentals": fundamentals,
-            "evidence": evidence,
-        }
+            "category_scores": evidence["category_scores"].get(
+                "scores", {}
+            ),
+            "strategy_pathways": evidence["category_scores"].get(
+                "strategy_pathways", {}
+            ),
+            "fundamentals": fundamentals,  
 
         filtered_kwargs = self._filter_kwargs(
             method,
