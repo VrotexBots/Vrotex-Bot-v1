@@ -1916,6 +1916,7 @@ class MarketScanner:
 
         return {
             "scores": final,
+                        "strategy_pathways": strategy_pathways,
             "category_count": len(final),
             "required_category_count": len(
                 self.CATEGORIES
