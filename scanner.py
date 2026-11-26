@@ -1996,10 +1996,12 @@ class MarketScanner:
             if category not in present
         ]
 
-        score_report = self._extract_category_scores(
+                score_report = self._extract_category_scores(
             market_data,
             fundamentals,
             risk_checks,
+            strategy_results,
+            current_price,
         )
 
         return {
