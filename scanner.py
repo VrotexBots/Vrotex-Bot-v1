@@ -2123,7 +2123,8 @@ class MarketScanner:
             "strategy_pathways": evidence["category_scores"].get(
                 "strategy_pathways", {}
             ),
-            "fundamentals": fundamentals,  
+            "fundamentals": fundamentals,
+        }
 
         filtered_kwargs = self._filter_kwargs(
             method,
