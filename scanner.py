@@ -1995,8 +1995,8 @@ class MarketScanner:
             for category in self.CATEGORIES
             if category not in present
         ]
-
-                score_report = self._extract_category_scores(
+        
+        score_report = self._extract_category_scores(
             market_data,
             fundamentals,
             risk_checks,
