@@ -2296,6 +2296,64 @@ for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
         if result.get("success"):
             market_data["orb_analysis"][orb_session] = result
             break
+
+            # ORB: Detect breakout using the latest safely completed M1 candle.
+market_data["orb_analysis"].setdefault("breakouts", {})
+
+m1_candles = market_data.get("M1", {}).get("candles", [])
+
+# Use the second-newest candle conservatively in case
+# the newest candle is still forming.
+if len(m1_candles) >= 2:
+
+    candle = m1_candles[-2]
+    candle_time = candle.get("time")
+
+    if isinstance(candle_time, str):
+        try:
+            candle_time = datetime.fromisoformat(
+                candle_time.replace("Z", "+00:00")
+            )
+        except ValueError:
+            candle_time = None
+
+    if isinstance(candle_time, datetime) and candle_time.tzinfo is not None:
+
+        orb_m1_candle = {
+            **candle,
+            "timestamp": candle_time,
+        }
+
+        for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
+
+            opening_range = self.orb_strategy_engine.get_opening_range(
+                orb_session,
+                symbol,
+            )
+
+            if not opening_range:
+                continue
+
+            existing_breakout = (
+                self.orb_strategy_engine.get_detected_breakout(
+                    orb_session,
+                    symbol,
+                )
+            )
+
+            if existing_breakout:
+                continue
+
+            breakout_result = self.orb_strategy_engine.detect_breakout(
+                session=orb_session,
+                symbol=symbol,
+                breakout_candle=orb_m1_candle,
+            )
+
+            if breakout_result.get("detected"):
+                market_data["orb_analysis"]["breakouts"][orb_session] = (
+                    breakout_result
+                )
             
             # Run both strategies before preparing SMC evidence.
             strategy_results = await self._run_strategies(
