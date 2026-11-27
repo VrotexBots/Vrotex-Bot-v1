@@ -2239,20 +2239,22 @@ class MarketScanner:
 market_data["orb_analysis"] = {}
 
 orb_now = datetime.now(timezone.utc)
+m5_candles = market_data.get("M5", {}).get("candles", [])
 
 for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
 
-    orb_session_status = (
-        self.orb_strategy_engine.get_session_status(
-            orb_session,
-            now=orb_now,
-        )
+    session_window = self.orb_strategy_engine.get_session_status(
+        orb_session,
+        now=orb_now,
     )
 
-    if not orb_session_status.get("available"):
+    opening_time = session_window.get("opening_time")
+    closing_time = session_window.get("closing_time")
+
+    if not opening_time or not closing_time:
         continue
 
-    if orb_now < orb_session_status["closing_time"]:
+    if orb_now < closing_time:
         continue
 
     if self.orb_strategy_engine.get_opening_range(
@@ -2261,9 +2263,7 @@ for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
     ):
         continue
 
-    for candle in self._list(
-        self._dict(market_data.get("M5")).get("candles")
-    ):
+    for candle in m5_candles:
 
         candle_time = candle.get("time")
 
