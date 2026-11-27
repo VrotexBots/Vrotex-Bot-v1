@@ -677,15 +677,19 @@ class ORBStrategyEngine:
         session,
         symbol,
         direction,
-        risk_snapshot,
+        risk_context,
         *,
-        loss_per_lot_at_stop=None,
+        value_per_price_unit_per_lot=None,
+        spread=None,
+        maximum_spread=None,
+        spread_valid=None,
     ):
-        """Run ORB strategy authorization, then the shared Vrotex risk gate.
+        """Authorize ORB, apply shared risk checks, and size the position.
 
-        This method never places an order. It requires a fresh ORB candidate,
-        the ORB-owned central authorization route, and a live RiskSnapshot
-        supplied by the account/runtime layer.
+        `risk_context` supplies account equity (dict key or object attribute).
+        Broker economics must provide value_per_price_unit_per_lot. Spread
+        must be available or explicitly prevalidated; missing inputs block
+        execution. This method never submits an order.
         """
         authorization = self.authorize_entry_candidate(
             session, symbol, direction
@@ -698,18 +702,64 @@ class ORBStrategyEngine:
                 "risk_reason": "ORB_STRATEGY_AUTHORIZATION_NOT_GRANTED",
             }
 
+        if isinstance(risk_context, dict):
+            account_equity = risk_context.get("equity")
+            if spread is None:
+                spread = risk_context.get("spread")
+            if maximum_spread is None:
+                maximum_spread = risk_context.get("maximum_spread")
+            if spread_valid is None:
+                spread_valid = risk_context.get("spread_valid")
+        else:
+            account_equity = getattr(risk_context, "equity", None)
+            if spread is None:
+                spread = getattr(risk_context, "spread", None)
+            if maximum_spread is None:
+                maximum_spread = getattr(risk_context, "maximum_spread", None)
+            if spread_valid is None:
+                spread_valid = getattr(risk_context, "spread_valid", None)
+
         risk_result = self.risk_gate.evaluate_authorized_candidate(
             authorization,
-            risk_snapshot,
-            loss_per_lot_at_stop=loss_per_lot_at_stop,
+            account_equity=account_equity,
+            value_per_price_unit_per_lot=value_per_price_unit_per_lot,
+            spread=spread,
+            maximum_spread=maximum_spread,
+            spread_valid=spread_valid,
         )
-        return {
+
+        risk_approved = risk_result.get("risk_approved") is True
+        volume = risk_result.get("volume_lots")
+        execution_authorized = bool(
+            risk_approved
+            and risk_result.get("position_size_required") is False
+            and volume is not None
+        )
+
+        result = {
             **authorization,
+            "strategy": "ORB",
             "risk": risk_result,
-            "risk_approved": risk_result.get("risk_approved") is True,
-            "execution_authorized": False,
+            "risk_approved": risk_approved,
+            "execution_authorized": execution_authorized,
             "reason": risk_result.get("reason", authorization.get("reason")),
         }
+
+        if execution_authorized:
+            direction_value = str(
+                authorization.get("direction", "")
+            ).upper()
+            result.update({
+                "instrument": str(authorization.get("symbol", "")).upper(),
+                "side": "buy" if direction_value == "BULLISH" else "sell",
+                "volume": str(volume),
+                "entry_price": str(authorization.get("entry_price")),
+                "stop_loss_price": str(authorization.get("stop_loss")),
+                "take_profit_price": str(authorization.get("take_profit")),
+                "risk_percent": str(risk_result.get("risk_percent")),
+            })
+
+        return result
 
     # --------------------------------------------------------
     # RESET
