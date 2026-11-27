@@ -38,6 +38,8 @@ class ORBStrategyEngine:
         session_engine=None,
         analysis_engine=None,
         entry_engine=None,
+        m1_swing_lookback=2,
+        m1_displacement_multiplier=1.5,
     ):
 
         self.session_engine = (
@@ -58,6 +60,11 @@ class ORBStrategyEngine:
         self.confirmed_breakouts = {}
 
         self.strategy_status = {}
+
+        # ORB-owned M1 confirmation settings. These are configurable
+        # and do not read or inherit Master SMC decisions.
+        self.m1_swing_lookback = max(2, int(m1_swing_lookback))
+        self.m1_displacement_multiplier = max(1.0, float(m1_displacement_multiplier))
 
     # --------------------------------------------------------
     # TIME
@@ -265,7 +272,7 @@ class ORBStrategyEngine:
         self._set_status(
             session,
             symbol,
-            "BREAKOUT_DETECTED_WAITING_FOR_SMC",
+            "BREAKOUT_DETECTED_WAITING_FOR_ORB_M1_CONFIRMATION",
             {
                 "direction": result["direction"],
                 "breakout_level": result["breakout_level"],
@@ -274,182 +281,183 @@ class ORBStrategyEngine:
 
         return {
             "detected": True,
-            "reason": "BREAKOUT_WAITING_FOR_SMC_CONFIRMATION",
+            "reason": "BREAKOUT_WAITING_FOR_ORB_M1_CONFIRMATION",
             "breakout": result.copy(),
         }
 
     # --------------------------------------------------------
-    # SMC BREAKOUT EVIDENCE
+    # ORB-OWNED M1 STRUCTURE / DISPLACEMENT / ZONES
     # --------------------------------------------------------
 
     @staticmethod
-    def _validate_smc_evidence(
-        evidence,
-        direction,
-    ):
-
-        if not isinstance(evidence, dict):
-            return False, "SMC_EVIDENCE_MISSING"
-
-        displacement = (
-            evidence.get("displacement_confirmed") is True
-        )
-
-        structure_event = str(
-            evidence.get("structure_event", "")
-        ).upper()
-
-        structure_direction = str(
-            evidence.get("structure_direction", "")
-        ).upper()
-
-        structure_valid = (
-            structure_event in ("CHOCH", "BOS")
-            and structure_direction == direction
-        )
-
-        if not displacement:
-            return False, "DISPLACEMENT_NOT_CONFIRMED"
-
-        if not structure_valid:
-            return False, "CHOCH_OR_BOS_NOT_CONFIRMED"
-
-        zones = evidence.get("entry_zones")
-
-        if not isinstance(zones, (list, tuple)):
-            return False, "ENTRY_ZONES_MISSING"
-
-        valid_ob = False
-        valid_fvg = False
-
-        for zone in zones:
-
-            if not isinstance(zone, dict):
-                continue
-
-            if zone.get("validated") is not True:
-                continue
-
-            zone_type = str(
-                zone.get("type", "")
-            ).upper()
-
-            zone_direction = str(
-                zone.get("direction", "")
-            ).upper()
-
+    def _normalise_m1_candle(candle):
+        if not isinstance(candle, dict):
+            raise ValueError("M1 candle must be a dictionary.")
+        values = {}
+        for field in ("open", "high", "low", "close"):
             try:
-
-                zone_high = float(zone["high"])
-                zone_low = float(zone["low"])
-
+                values[field] = float(candle[field])
             except (KeyError, TypeError, ValueError):
-                continue
+                raise ValueError(f"Invalid or missing M1 {field}.")
+        if any(v <= 0 for v in values.values()):
+            raise ValueError("M1 candle prices must be positive.")
+        if values["high"] < max(values["open"], values["close"], values["low"]):
+            raise ValueError("Invalid M1 candle high.")
+        if values["low"] > min(values["open"], values["close"], values["high"]):
+            raise ValueError("Invalid M1 candle low.")
+        stamp = candle.get("timestamp", candle.get("time"))
+        if stamp is None:
+            raise ValueError("M1 candle requires timestamp or time.")
+        if isinstance(stamp, str):
+            try:
+                stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("M1 candle time must be ISO datetime.")
+        if isinstance(stamp, (int, float)):
+            stamp = datetime.fromtimestamp(float(stamp), tz=timezone.utc)
+        if not isinstance(stamp, datetime):
+            raise ValueError("Unsupported M1 candle timestamp type.")
+        if stamp.tzinfo is None:
+            raise ValueError("M1 candle timestamp must be timezone-aware.")
+        values["timestamp"] = stamp.astimezone(timezone.utc)
+        return values
 
-            if (
-                zone_direction != direction
-                or zone_low <= 0
-                or zone_high <= zone_low
-            ):
-                continue
+    def _detect_orb_m1_evidence(self, m1_candles, direction):
+        if not isinstance(m1_candles, (list, tuple)):
+            return False, "M1_CANDLES_REQUIRED", None
+        try:
+            candles = [self._normalise_m1_candle(c) for c in m1_candles]
+        except ValueError as exc:
+            return False, str(exc), None
+        candles.sort(key=lambda c: c["timestamp"])
+        lookback = self.m1_swing_lookback
+        if len(candles) < max(5, (lookback * 2) + 1):
+            return False, "INSUFFICIENT_M1_CANDLES", None
 
-            if zone_type == "OB":
-                valid_ob = True
+        # A pivot is confirmed only after candles exist on both sides.
+        pivots_high, pivots_low = [], []
+        for i in range(lookback, len(candles) - lookback):
+            window = candles[i-lookback:i+lookback+1]
+            current = candles[i]
+            if current["high"] == max(x["high"] for x in window):
+                pivots_high.append((i, current["high"]))
+            if current["low"] == min(x["low"] for x in window):
+                pivots_low.append((i, current["low"]))
 
-            elif zone_type == "FVG":
-                valid_fvg = True
+        latest = candles[-1]
+        prior = candles[:-1]
+        if not prior or not pivots_high or not pivots_low:
+            return False, "M1_SWING_POINTS_NOT_CONFIRMED", None
 
-        if not valid_ob:
-            return False, "VALID_ORDER_BLOCK_MISSING"
+        if direction == "BULLISH":
+            eligible = [(i, price) for i, price in pivots_high if i < len(candles)-1]
+            if not eligible:
+                return False, "M1_BULLISH_SWING_HIGH_MISSING", None
+            swing_price = eligible[-1][1]
+            structure_event = "BOS" if latest["close"] > swing_price else None
+            body = latest["close"] - latest["open"]
+        else:
+            eligible = [(i, price) for i, price in pivots_low if i < len(candles)-1]
+            if not eligible:
+                return False, "M1_BEARISH_SWING_LOW_MISSING", None
+            swing_price = eligible[-1][1]
+            structure_event = "BOS" if latest["close"] < swing_price else None
+            body = latest["open"] - latest["close"]
 
-        if not valid_fvg:
-            return False, "VALID_FVG_MISSING"
+        # CHoCH/BOS authorization requires a full candle-body close past swing.
+        if structure_event is None:
+            return False, "M1_CHOCH_BOS_BODY_CLOSE_NOT_CONFIRMED", None
 
-        return True, "SMC_BREAKOUT_CONFIRMED"
+        ranges = [c["high"] - c["low"] for c in prior[-10:] if c["high"] > c["low"]]
+        if not ranges:
+            return False, "M1_DISPLACEMENT_BASELINE_MISSING", None
+        average_range = sum(ranges) / len(ranges)
+        if body <= 0 or body < average_range * self.m1_displacement_multiplier:
+            return False, "M1_DISPLACEMENT_NOT_CONFIRMED", None
+
+        zones = []
+        # Three-candle fair value gap, aligned with the breakout direction.
+        if len(candles) >= 3:
+            left, right = candles[-3], candles[-1]
+            if direction == "BULLISH" and right["low"] > left["high"]:
+                zones.append({"type": "FVG", "direction": direction, "low": left["high"], "high": right["low"], "validated": True})
+            elif direction == "BEARISH" and right["high"] < left["low"]:
+                zones.append({"type": "FVG", "direction": direction, "low": right["high"], "high": left["low"], "validated": True})
+
+        # Order block: last opposite-colour candle preceding the displacement candle.
+        for candidate in reversed(candles[:-1][-5:]):
+            opposite = (direction == "BULLISH" and candidate["close"] < candidate["open"]) or (direction == "BEARISH" and candidate["close"] > candidate["open"])
+            if opposite:
+                zones.append({"type": "OB", "direction": direction, "low": candidate["low"], "high": candidate["high"], "validated": True})
+                break
+
+        valid_zones = [z for z in zones if z["low"] > 0 and z["high"] > z["low"]]
+        if not valid_zones:
+            return False, "VALID_OB_OR_FVG_MISSING", None
+
+        evidence = {
+            "structure_event": structure_event,
+            "structure_direction": direction,
+            "structure_level": swing_price,
+            "displacement_confirmed": True,
+            "displacement_body": body,
+            "displacement_average_range": average_range,
+            "entry_zones": valid_zones,
+            "confirmation_candle": latest,
+            "confirmation_source": "ORB_INDEPENDENT_M1_ANALYSIS",
+        }
+        return True, "ORB_M1_CONFIRMATION_PASSED", evidence
 
     # --------------------------------------------------------
-    # CONFIRM BREAKOUT WITH M1 SMC EVIDENCE
+    # CONFIRM BREAKOUT USING ORB'S OWN M1 CANDLES
     # --------------------------------------------------------
 
     def confirm_breakout(
         self,
         session,
         symbol,
-        smc_evidence,
+        m1_candles,
     ):
-
         session = str(session).upper()
         symbol = str(symbol).upper()
-
         key = self._key(session, symbol)
-
         breakout = self.detected_breakouts.get(key)
-
         if breakout is None:
-            return {
-                "success": False,
-                "reason": "BREAKOUT_NOT_DETECTED",
-            }
-
+            return {"success": False, "reason": "BREAKOUT_NOT_DETECTED"}
         if key in self.confirmed_breakouts:
-            return {
-                "success": False,
-                "reason": "BREAKOUT_ALREADY_CONFIRMED",
-            }
+            return {"success": False, "reason": "BREAKOUT_ALREADY_CONFIRMED"}
 
-        valid, reason = self._validate_smc_evidence(
-            smc_evidence,
-            breakout["direction"],
+        valid, reason, evidence = self._detect_orb_m1_evidence(
+            m1_candles, breakout["direction"]
         )
-
+        if valid:
+            breakout_time = breakout.get("detected_at")
+            confirmation_time = evidence["confirmation_candle"]["timestamp"]
+            if isinstance(breakout_time, datetime) and confirmation_time <= breakout_time:
+                valid, reason, evidence = False, "M1_CONFIRMATION_MUST_FOLLOW_BREAKOUT", None
         if not valid:
-
-            self._set_status(
-                session,
-                symbol,
-                reason,
-            )
-
-            return {
-                "success": False,
-                "reason": reason,
-            }
+            self._set_status(session, symbol, reason)
+            return {"success": False, "reason": reason}
 
         confirmed = {
             **breakout,
-            "smc_confirmed": True,
+            "smc_confirmed": False,
+            "orb_m1_confirmed": True,
             "displacement_confirmed": True,
-            "structure_event": str(
-                smc_evidence["structure_event"]
-            ).upper(),
-            "structure_direction": str(
-                smc_evidence["structure_direction"]
-            ).upper(),
-            "entry_zones": [
-                dict(zone)
-                for zone in smc_evidence["entry_zones"]
-                if isinstance(zone, dict)
-            ],
+            "structure_event": evidence["structure_event"],
+            "structure_direction": evidence["structure_direction"],
+            "structure_level": evidence["structure_level"],
+            "entry_zones": [dict(zone) for zone in evidence["entry_zones"]],
+            "confirmation_candle": evidence["confirmation_candle"],
+            "confirmation_source": evidence["confirmation_source"],
             "confirmed_at": self._utc_now(),
         }
-
         self.confirmed_breakouts[key] = confirmed
-
         self._set_status(
-            session,
-            symbol,
-            "SMC_BREAKOUT_CONFIRMED_WAITING_FOR_RETEST",
-            {
-                "direction": confirmed["direction"],
-                "structure_event": confirmed["structure_event"],
-            },
+            session, symbol, "ORB_M1_CONFIRMED_WAITING_FOR_RETEST",
+            {"direction": confirmed["direction"], "structure_event": confirmed["structure_event"]},
         )
-
-        return {
-            "success": True,
-            "reason": "SMC_BREAKOUT_CONFIRMED",
-            "breakout": confirmed.copy(),
-        }
+        return {"success": True, "reason": "ORB_M1_CONFIRMATION_PASSED", "breakout": confirmed.copy()}
 
     # --------------------------------------------------------
     # RETEST AND ENTRY CANDIDATE
@@ -489,7 +497,7 @@ class ORBStrategyEngine:
 
             return {
                 "success": False,
-                "reason": "WAITING_FOR_CONFIRMED_SMC_BREAKOUT",
+                "reason": "WAITING_FOR_ORB_M1_CONFIRMED_BREAKOUT",
             }
 
         result = self.entry_engine.evaluate_retest(
