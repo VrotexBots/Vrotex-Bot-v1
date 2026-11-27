@@ -2236,38 +2236,38 @@ class MarketScanner:
 
                 return result
             # ORB: Capture completed session-opening M5 candles.
-market_data["orb_analysis"] = {}
+            market_data["orb_analysis"] = {}
 
-orb_now = datetime.now(timezone.utc)
-m5_candles = market_data.get("M5", {}).get("candles", [])
+            orb_now = datetime.now(timezone.utc)
+            m5_candles = market_data.get("M5", {}).get("candles", [])
 
-for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
+            for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
 
-    session_window = self.orb_strategy_engine.get_session_status(
-        orb_session,
-        now=orb_now,
+            session_window = self.orb_strategy_engine.get_session_status(
+            orb_session,
+            now=orb_now,
     )
 
-    opening_time = session_window.get("opening_time")
-    closing_time = session_window.get("closing_time")
+            opening_time = session_window.get("opening_time")
+            closing_time = session_window.get("closing_time")
 
-    if not opening_time or not closing_time:
-        continue
+            if not opening_time or not closing_time:
+            continue
 
-    if orb_now < closing_time:
-        continue
+            if orb_now < closing_time:
+            continue
 
-    if self.orb_strategy_engine.get_opening_range(
-        orb_session,
-        symbol,
+            if self.orb_strategy_engine.get_opening_range(
+            orb_session,
+            symbol,
     ):
-        continue
+            continue
 
-    for candle in m5_candles:
+            for candle in m5_candles:
 
-        candle_time = candle.get("time")
+            candle_time = candle.get("time")
 
-        if isinstance(candle_time, str):
+            if isinstance(candle_time, str):
             try:
                 candle_time = datetime.fromisoformat(
                     candle_time.replace("Z", "+00:00")
@@ -2275,10 +2275,10 @@ for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
             except ValueError:
                 continue
 
-        if not isinstance(candle_time, datetime):
-            continue
+            if not isinstance(candle_time, datetime):
+                continue
 
-        if candle_time.tzinfo is None:
+             if candle_time.tzinfo is None:
             continue
 
         orb_candle = {
@@ -2298,9 +2298,9 @@ for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
             break
 
             # ORB: Detect breakout using the latest safely completed M1 candle.
-market_data["orb_analysis"].setdefault("breakouts", {})
+            market_data["orb_analysis"].setdefault("breakouts", {})
 
-m1_candles = market_data.get("M1", {}).get("candles", [])
+            m1_candles = market_data.get("M1", {}).get("candles", [])
 
 # Use the second-newest candle conservatively in case
 # the newest candle is still forming.
