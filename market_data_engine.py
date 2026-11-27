@@ -1,7 +1,7 @@
 import asyncio
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from config import settings
@@ -894,6 +894,225 @@ class MarketDataEngine:
         )
 
     # --------------------------------------------------
+    # ORB CANDLE TIMESTAMP AND COMPLETION SUPPORT
+    # --------------------------------------------------
+
+    @staticmethod
+    def parse_candle_timestamp(value):
+        """
+        Convert broker candle timestamps to timezone-aware UTC datetimes.
+
+        Exness candle timestamps are expected to identify the candle
+        opening time. Naive ISO timestamps are interpreted as UTC because
+        the market-data API requests and stores times in UTC.
+        """
+
+        if isinstance(value, datetime):
+            result = value
+
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            # Accept Unix seconds or milliseconds.
+            if abs(numeric) >= 100_000_000_000:
+                numeric /= 1000.0
+            result = datetime.fromtimestamp(numeric, tz=timezone.utc)
+
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                raise ValueError("Empty candle timestamp")
+
+            try:
+                numeric = float(raw)
+            except ValueError:
+                result = datetime.fromisoformat(
+                    raw.replace("Z", "+00:00")
+                )
+            else:
+                if abs(numeric) >= 100_000_000_000:
+                    numeric /= 1000.0
+                result = datetime.fromtimestamp(
+                    numeric,
+                    tz=timezone.utc,
+                )
+
+        else:
+            raise ValueError("Unsupported candle timestamp format")
+
+        if result.tzinfo is None:
+            # The Exness market-data request is UTC-based.
+            result = result.replace(tzinfo=timezone.utc)
+
+        return result.astimezone(timezone.utc)
+
+    @staticmethod
+    def timeframe_duration(timeframe):
+        durations = {
+            "M1": timedelta(minutes=1),
+            "M5": timedelta(minutes=5),
+            "H1": timedelta(hours=1),
+        }
+
+        timeframe = str(timeframe).upper().strip()
+
+        if timeframe not in durations:
+            raise ValueError(
+                f"Unsupported completion timeframe: {timeframe}"
+            )
+
+        return durations[timeframe]
+
+    def get_completed_candles(
+        self,
+        symbol,
+        timeframe,
+        price_type="bid",
+        count=1000,
+        now=None,
+    ):
+        """
+        Return cached candles that have fully closed.
+
+        The original candle records and cache are not modified.
+        Each returned ORB-compatible candle contains a timezone-aware
+        ISO-8601 'timestamp' field while retaining the original 'time'.
+        """
+
+        symbol = str(symbol).upper().strip()
+        timeframe = str(timeframe).upper().strip()
+
+        duration = self.timeframe_duration(timeframe)
+
+        current_time = now or self.utc_now()
+        current_time = self.parse_candle_timestamp(current_time)
+
+        candles = self.get_cached_candles(
+            symbol,
+            timeframe,
+            price_type,
+        )
+
+        completed = []
+
+        for candle in candles:
+            if not isinstance(candle, dict):
+                continue
+
+            raw_time = candle.get(
+                "time",
+                candle.get("timestamp"),
+            )
+
+            if raw_time is None:
+                continue
+
+            try:
+                candle_start = self.parse_candle_timestamp(raw_time)
+            except (TypeError, ValueError, OverflowError, OSError):
+                logger.warning(
+                    "Skipping candle with invalid timestamp | %s | %s | %s",
+                    symbol,
+                    timeframe,
+                    raw_time,
+                )
+                continue
+
+            candle_end = candle_start + duration
+
+            # Do not expose the currently forming candle to ORB.
+            if candle_end > current_time:
+                continue
+
+            orb_candle = dict(candle)
+            orb_candle["timestamp"] = candle_start.isoformat()
+            orb_candle["time"] = candle_start.isoformat()
+            orb_candle["completed"] = True
+            completed.append(orb_candle)
+
+        completed.sort(
+            key=lambda item: item["timestamp"]
+        )
+
+        if count is not None:
+            completed = completed[-max(1, int(count)):]
+
+        return completed
+
+    async def get_orb_market_data(
+        self,
+        symbol,
+        m5_count=100,
+        m1_count=200,
+        price_type="bid",
+        now=None,
+    ):
+        """
+        Supply completed M5 and M1 candles to the independent ORB modules.
+
+        M5 is used for opening-range capture.
+        M1 is used for breakout and subsequent ORB confirmation.
+        """
+
+        symbol = str(symbol).upper().strip()
+
+        if symbol not in self.PILOT_INSTRUMENTS:
+            raise ValueError(
+                f"Instrument is not approved for V1 ORB: {symbol}"
+            )
+
+        m5_request_count = min(
+            self.MAX_CANDLES_PER_REQUEST,
+            max(2, int(m5_count) + 1),
+        )
+        m1_request_count = min(
+            self.MAX_CANDLES_PER_REQUEST,
+            max(2, int(m1_count) + 1),
+        )
+
+        await self.request_candles(
+            symbol=symbol,
+            timeframe="M5",
+            count=m5_request_count,
+            price_type=price_type,
+        )
+
+        await self.request_candles(
+            symbol=symbol,
+            timeframe="M1",
+            count=m1_request_count,
+            price_type=price_type,
+        )
+
+        m5_candles = self.get_completed_candles(
+            symbol=symbol,
+            timeframe="M5",
+            price_type=price_type,
+            count=m5_count,
+            now=now,
+        )
+
+        m1_candles = self.get_completed_candles(
+            symbol=symbol,
+            timeframe="M1",
+            price_type=price_type,
+            count=m1_count,
+            now=now,
+        )
+
+        return {
+            "symbol": symbol,
+            "as_of": self.parse_candle_timestamp(
+                now or self.utc_now()
+            ).isoformat(),
+            "m5_candles": m5_candles,
+            "m1_candles": m1_candles,
+            "m5_count": len(m5_candles),
+            "m1_count": len(m1_candles),
+            "all_candles_completed": True,
+            "source": "EXNESS_MARKET_DATA",
+        }
+
+    # --------------------------------------------------
     # PILOT VERIFICATION
     # --------------------------------------------------
 
@@ -1126,6 +1345,12 @@ class MarketDataEngine:
             },
             "live_tick_count": len(live_ticks),
             "live_tick_status": self.get_live_tick_status(),
+            "orb_market_data": {
+                "enabled": True,
+                "timeframes": ["M5", "M1"],
+                "completed_candles_only": True,
+                "timestamp_timezone": "UTC",
+            },
         }
 
 
