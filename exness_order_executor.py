@@ -133,100 +133,89 @@ class ExnessOrderExecutor:
         if not isinstance(setup, dict):
             return False, "Invalid setup"
 
-        if setup.get("execution_authorized") is not True:
-            return False, "Master SMC authorization missing"
+        strategy = str(setup.get("strategy", "SMC")).strip().upper()
+        if strategy not in ("SMC", "ORB"):
+            return False, f"Unsupported strategy: {strategy}"
+
+        if strategy == "ORB":
+            # ORB uses its own Central Authorization + shared Risk route.
+            # It must never be forced through Master SMC scoring.
+            if setup.get("strategy_authorized") is not True:
+                return False, "ORB central strategy authorization missing"
+            if setup.get("risk_approved") is not True:
+                return False, "ORB shared Risk Manager approval missing"
+            if setup.get("execution_authorized") is not True:
+                return False, "ORB final execution authorization missing"
+
+            risk_result = setup.get("risk")
+            if not isinstance(risk_result, dict):
+                return False, "ORB shared risk result missing"
+            if risk_result.get("risk_approved") is not True:
+                return False, "ORB shared risk result not approved"
+            if risk_result.get("position_size_required") is True:
+                return False, "ORB broker-based position size still required"
+            risk_volume = self._decimal(risk_result.get("volume_lots"))
+            supplied_volume = self._decimal(setup.get("volume"))
+            if risk_volume is None or supplied_volume is None:
+                return False, "ORB verified position volume missing"
+            if risk_volume != supplied_volume:
+                return False, "ORB volume does not match shared Risk Manager sizing"
+
+        else:
+            # Preserve the existing Master SMC authorization and A+ threshold.
+            if setup.get("execution_authorized") is not True:
+                return False, "Master SMC authorization missing"
+
+            score = self._decimal(
+                setup.get("score", setup.get("final_score"))
+            )
+            if score is None or score < self.MIN_SCORE:
+                return False, "Score below 85"
 
         if setup.get("approved") is False:
             return False, "Setup rejected upstream"
 
-        score = self._decimal(
-            setup.get(
-                "score",
-                setup.get("final_score"),
-            )
-        )
-
-        if score is None or score < self.MIN_SCORE:
-            return False, "Score below 85"
-
         instrument = self._normalise_symbol(
-            setup.get(
-                "instrument",
-                setup.get("symbol"),
-            )
+            setup.get("instrument", setup.get("symbol"))
         )
-
         if instrument not in self.ALLOWED_INSTRUMENTS:
             return False, f"Instrument not approved: {instrument}"
 
         side = self._normalise_side(
-            setup.get(
-                "side",
-                setup.get("direction"),
-            )
+            setup.get("side", setup.get("direction"))
         )
-
         if side is None:
             return False, "Invalid trade direction"
 
         volume = self._decimal(setup.get("volume"))
-
-        entry = self._decimal(
-            setup.get(
-                "entry_price",
-                setup.get("entry"),
-            )
-        )
-
-        sl = self._decimal(
-            setup.get(
-                "stop_loss_price",
-                setup.get("sl"),
-            )
-        )
-
-        tp = self._decimal(
-            setup.get(
-                "take_profit_price",
-                setup.get("tp"),
-            )
-        )
-
-        risk_percent = self._decimal(
-            setup.get("risk_percent")
-        )
+        entry = self._decimal(setup.get("entry_price", setup.get("entry")))
+        sl = self._decimal(setup.get("stop_loss_price", setup.get("sl")))
+        tp = self._decimal(setup.get("take_profit_price", setup.get("tp")))
+        risk_percent = self._decimal(setup.get("risk_percent"))
 
         if volume is None or volume <= 0:
             return False, "Invalid volume"
-
         if entry is None or entry <= 0:
             return False, "Invalid entry price"
-
         if sl is None or sl <= 0:
             return False, "Invalid stop loss"
-
         if tp is None or tp <= 0:
             return False, "Invalid take profit"
-
         if risk_percent is None or risk_percent <= 0:
             return False, "Risk percentage missing"
-
         if risk_percent > Decimal("1"):
             return False, "Risk exceeds 1% per trade"
 
         if side == "buy":
-
             if not sl < entry < tp:
                 return False, "Invalid BUY SL/TP placement"
-
         else:
-
             if not tp < entry < sl:
                 return False, "Invalid SELL SL/TP placement"
 
         normalized = dict(setup)
-
         normalized.update({
+            "strategy": strategy,
             "instrument": instrument,
             "symbol": instrument,
             "side": side,
@@ -236,8 +225,14 @@ class ExnessOrderExecutor:
             "stop_loss_price": str(sl),
             "take_profit_price": str(tp),
             "risk_percent": str(risk_percent),
-            "score": float(score),
         })
+
+        if strategy == "SMC":
+            normalized["score"] = float(score)
+        else:
+            # ORB does not inherit or fabricate an SMC score.
+            normalized.pop("score", None)
+            normalized.pop("final_score", None)
 
         return True, normalized
 
@@ -248,89 +243,71 @@ class ExnessOrderExecutor:
     async def _check_risk(self, setup):
 
         try:
-
             from risk_manager import risk_manager
 
+            strategy = str(setup.get("strategy", "SMC")).upper()
+
             global_result = risk_manager.can_trade()
-
             if isinstance(global_result, tuple):
-
                 if global_result[0] is not True:
-
                     reason = (
                         global_result[1]
                         if len(global_result) > 1
                         else "Global risk rejected"
                     )
-
                     return False, str(reason)
-
             elif global_result is not True:
-
                 return False, "Global risk limits rejected trade"
 
-            validator = getattr(
-                risk_manager,
-                "validate_trade",
-                None,
-            )
+            if strategy == "ORB":
+                # ORB's detailed checks and broker-based sizing are performed
+                # by ORBSharedRiskGate before the final execution handoff.
+                if setup.get("risk_approved") is not True:
+                    return False, "ORB shared risk approval missing"
+                risk_result = setup.get("risk")
+                if not isinstance(risk_result, dict):
+                    return False, "ORB shared risk result missing"
+                if risk_result.get("risk_approved") is not True:
+                    return False, "ORB shared risk result rejected"
+                if risk_result.get("position_size_required") is True:
+                    return False, "ORB position size is not finalized"
+                sized_volume = self._decimal(risk_result.get("volume_lots"))
+                setup_volume = self._decimal(setup.get("volume"))
+                if sized_volume is None or setup_volume != sized_volume:
+                    return False, "ORB volume does not match approved risk sizing"
+                return True, "ORB shared risk approval rechecked"
 
+            validator = getattr(risk_manager, "validate_trade", None)
             if not callable(validator):
-
                 return False, "Risk Manager validator unavailable"
 
             result = validator(setup)
-
             if asyncio.iscoroutine(result):
                 result = await result
 
             if isinstance(result, tuple):
-
                 allowed = result[0] is True
-
-                reason = (
-                    result[1]
-                    if len(result) > 1
-                    else "Trade risk rejected"
-                )
-
+                reason = result[1] if len(result) > 1 else "Trade risk rejected"
                 if not allowed:
                     return False, str(reason)
-
             elif isinstance(result, dict):
-
                 allowed = any(
                     result.get(key) is True
-                    for key in (
-                        "allowed",
-                        "approved",
-                        "valid",
-                        "success",
-                        "passed",
-                    )
+                    for key in ("allowed", "approved", "valid", "success", "passed")
                 )
-
                 if not allowed:
                     return False, {
                         "reason": "Trade risk rejected",
                         "risk_report": result,
                     }
-
             elif result is not True:
-
                 return False, "Trade-specific risk rejected"
 
             return True, "Risk approved"
 
         except Exception as exc:
-
-            logger.exception(
-                "Risk Manager validation failed"
-            )
-
-            return False, (
-                f"Risk Manager error: {type(exc).__name__}"
-            )
+            logger.exception("Risk Manager validation failed")
+            return False, f"Risk Manager error: {type(exc).__name__}"
 
     # ==========================================================
     # DEMO ACCOUNT IDENTIFICATION
@@ -422,6 +399,7 @@ class ExnessOrderExecutor:
         if supplied_id:
 
             identity = (
+                f"{setup.get('strategy', 'SMC')}|"
                 f"{supplied_id}|"
                 f"{setup['instrument']}|"
                 f"{setup['side']}"
@@ -436,7 +414,8 @@ class ExnessOrderExecutor:
                 setup["entry_price"],
                 setup["stop_loss_price"],
                 setup["take_profit_price"],
-                str(setup["score"]),
+                str(setup.get("strategy", "SMC")),
+                str(setup.get("score", "N/A")),
             ))
 
         digest = hashlib.sha256(
@@ -517,6 +496,44 @@ class ExnessOrderExecutor:
                 setup.get("instrument"),
                 verification.get("position_id"),
             )
+
+            # Register the filled trade in shared account-risk statistics
+            # only after Exness confirms the position is open.
+            if result.get("risk_manager_registered") is not True:
+                try:
+                    from risk_manager import risk_manager
+
+                    register_trade = getattr(
+                        risk_manager,
+                        "register_trade",
+                        None,
+                    )
+                    if not callable(register_trade):
+                        raise RuntimeError(
+                            "Risk Manager register_trade method unavailable"
+                        )
+
+                    risk_registered = register_trade(
+                        symbol=setup.get("instrument"),
+                        risk_percent=setup.get("risk_percent"),
+                    )
+                    result["risk_manager_registered"] = (
+                        risk_registered is True
+                    )
+                    if risk_registered is not True:
+                        result["risk_manager_registration_error"] = (
+                            "Risk Manager did not register confirmed position"
+                        )
+                        logger.error(
+                            "Confirmed position was not registered in Risk Manager | %s",
+                            setup.get("instrument"),
+                        )
+                except Exception as risk_exc:
+                    result["risk_manager_registered"] = False
+                    result["risk_manager_registration_error"] = str(risk_exc)
+                    logger.exception(
+                        "Risk Manager trade registration failed"
+                    )
 
             return True
 
@@ -1024,11 +1041,12 @@ class ExnessOrderExecutor:
 
             logger.warning(
                 "OPENING EXNESS DEMO POSITION | "
-                "%s %s | Volume=%s | Score=%s",
+                "Strategy=%s | %s %s | Volume=%s | Score=%s",
+                normalized.get("strategy", "SMC"),
                 normalized["side"].upper(),
                 normalized["instrument"],
                 normalized["volume"],
-                normalized["score"],
+                normalized.get("score", "N/A"),
             )
 
             try:
@@ -1044,6 +1062,7 @@ class ExnessOrderExecutor:
                     "success": False,
                     "status": "SUBMITTED",
                     "request_id": request_id,
+                    "strategy": normalized.get("strategy", "SMC"),
                     "instrument": normalized["instrument"],
                     "side": normalized["side"],
                     "volume": normalized["volume"],
