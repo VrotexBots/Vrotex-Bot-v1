@@ -71,7 +71,8 @@ class MarketScanner:
         self.market_data_engine = market_data_engine
         self.pro_trend_engine = pro_trend_engine
         self.counter_trend_engine = counter_trend_engine
-
+        self.orb_strategy_engine = ORBStrategyEngine()
+        
         self.fundamental_analysis_engine = (
             fundamental_analysis_engine
         )
