@@ -2235,7 +2235,7 @@ class MarketScanner:
                 })
 
                 return result
-# ORB: Capture completed session-opening M5 candles.
+            # ORB: Capture completed session-opening M5 candles.
 market_data["orb_analysis"] = {}
 
 orb_now = datetime.now(timezone.utc)
