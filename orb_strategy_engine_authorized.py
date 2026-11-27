@@ -33,6 +33,10 @@ from central_authorization_engine import (
     CentralAuthorizationEngine,
     central_authorization_engine as default_central_authorization_engine,
 )
+from orb_risk_integration import (
+    ORBSharedRiskGate,
+    orb_shared_risk_gate as default_orb_shared_risk_gate,
+)
 
 
 class ORBStrategyEngine:
@@ -45,6 +49,7 @@ class ORBStrategyEngine:
         m1_swing_lookback=2,
         m1_displacement_multiplier=1.5,
         authorization_engine=None,
+        risk_gate=None,
     ):
 
         self.session_engine = (
@@ -65,6 +70,12 @@ class ORBStrategyEngine:
             authorization_engine
             if authorization_engine is not None
             else default_central_authorization_engine
+        )
+
+        self.risk_gate = (
+            risk_gate
+            if risk_gate is not None
+            else default_orb_shared_risk_gate
         )
 
         self.detected_breakouts = {}
@@ -656,6 +667,49 @@ class ORBStrategyEngine:
             )
 
         return result
+
+    # --------------------------------------------------------
+    # SHARED RISK - ORB ROUTE
+    # --------------------------------------------------------
+
+    def authorize_and_check_risk(
+        self,
+        session,
+        symbol,
+        direction,
+        risk_snapshot,
+        *,
+        loss_per_lot_at_stop=None,
+    ):
+        """Run ORB strategy authorization, then the shared Vrotex risk gate.
+
+        This method never places an order. It requires a fresh ORB candidate,
+        the ORB-owned central authorization route, and a live RiskSnapshot
+        supplied by the account/runtime layer.
+        """
+        authorization = self.authorize_entry_candidate(
+            session, symbol, direction
+        )
+        if authorization.get("strategy_authorized") is not True:
+            return {
+                **authorization,
+                "risk_approved": False,
+                "execution_authorized": False,
+                "risk_reason": "ORB_STRATEGY_AUTHORIZATION_NOT_GRANTED",
+            }
+
+        risk_result = self.risk_gate.evaluate_authorized_candidate(
+            authorization,
+            risk_snapshot,
+            loss_per_lot_at_stop=loss_per_lot_at_stop,
+        )
+        return {
+            **authorization,
+            "risk": risk_result,
+            "risk_approved": risk_result.get("risk_approved") is True,
+            "execution_authorized": False,
+            "reason": risk_result.get("reason", authorization.get("reason")),
+        }
 
     # --------------------------------------------------------
     # RESET
