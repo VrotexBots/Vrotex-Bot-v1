@@ -2236,125 +2236,197 @@ class MarketScanner:
 
                 return result
             # ORB: Capture completed session-opening M5 candles.
-            market_data["orb_analysis"] = {}
+            # ORB remains independent of the Master SMC pathway.
+            market_data["orb_analysis"] = {
+                "opening_ranges": {},
+                "breakouts": {},
+                "status": "SCANNING",
+            }
 
             orb_now = datetime.now(timezone.utc)
-            m5_candles = market_data.get("M5", {}).get("candles", [])
+            m5_candles = self._list(
+                self._dict(market_data.get("M5")).get("candles")
+            )
 
             for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
 
-            session_window = self.orb_strategy_engine.get_session_status(
-            orb_session,
-            now=orb_now,
-    )
+                try:
+                    session_window = self.orb_strategy_engine.get_session_status(
+                        orb_session,
+                        now=orb_now,
+                    )
 
-            opening_time = session_window.get("opening_time")
-            closing_time = session_window.get("closing_time")
+                    if not isinstance(session_window, dict):
+                        continue
 
-            if not opening_time or not closing_time:
-            continue
+                    opening_time = session_window.get("opening_time")
+                    closing_time = session_window.get("closing_time")
 
-            if orb_now < closing_time:
-            continue
+                    if not isinstance(opening_time, datetime):
+                        continue
 
-            if self.orb_strategy_engine.get_opening_range(
-            orb_session,
-            symbol,
-    ):
-            continue
+                    if not isinstance(closing_time, datetime):
+                        continue
 
-            for candle in m5_candles:
+                    if opening_time.tzinfo is None or closing_time.tzinfo is None:
+                        continue
 
-            candle_time = candle.get("time")
+                    if orb_now < closing_time:
+                        continue
 
-            if isinstance(candle_time, str):
-            try:
-                candle_time = datetime.fromisoformat(
-                    candle_time.replace("Z", "+00:00")
+                    existing_range = self.orb_strategy_engine.get_opening_range(
+                        orb_session,
+                        symbol,
+                    )
+
+                    if existing_range:
+                        market_data["orb_analysis"]["opening_ranges"][
+                            orb_session
+                        ] = existing_range
+                        continue
+
+                    for candle in m5_candles:
+
+                        if not isinstance(candle, dict):
+                            continue
+
+                        candle_time = candle.get("time")
+
+                        if isinstance(candle_time, str):
+                            try:
+                                candle_time = datetime.fromisoformat(
+                                    candle_time.replace("Z", "+00:00")
+                                )
+                            except ValueError:
+                                continue
+
+                        if not isinstance(candle_time, datetime):
+                            continue
+
+                        if candle_time.tzinfo is None:
+                            continue
+
+                        orb_candle = {
+                            **candle,
+                            "timestamp": candle_time,
+                        }
+
+                        capture_result = (
+                            self.orb_strategy_engine.capture_opening_range(
+                                session=orb_session,
+                                symbol=symbol,
+                                m5_candle=orb_candle,
+                                now=orb_now,
+                            )
+                        )
+
+                        if isinstance(capture_result, dict) and (
+                            capture_result.get("success") is True
+                        ):
+                            market_data["orb_analysis"]["opening_ranges"][
+                                orb_session
+                            ] = capture_result
+                            break
+
+                except Exception as orb_exc:
+                    logger.exception(
+                        "%s | ORB opening-range check failed | Session=%s | %s",
+                        symbol,
+                        orb_session,
+                        orb_exc,
+                    )
+                    market_data["orb_analysis"]["opening_ranges"][
+                        orb_session
+                    ] = {
+                        "success": False,
+                        "status": "ERROR",
+                        "error": str(orb_exc),
+                    }
+
+            # ORB: Check the latest safely completed M1 candle.
+            # The newest candle may still be forming, so use M1[-2].
+            m1_candles = self._list(
+                self._dict(market_data.get("M1")).get("candles")
+            )
+
+            if len(m1_candles) >= 2:
+
+                candle = m1_candles[-2]
+                candle_time = (
+                    candle.get("time")
+                    if isinstance(candle, dict)
+                    else None
                 )
-            except ValueError:
-                continue
 
-            if not isinstance(candle_time, datetime):
-                continue
+                if isinstance(candle_time, str):
+                    try:
+                        candle_time = datetime.fromisoformat(
+                            candle_time.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        candle_time = None
 
-             if candle_time.tzinfo is None:
-            continue
+                if (
+                    isinstance(candle_time, datetime)
+                    and candle_time.tzinfo is not None
+                ):
 
-        orb_candle = {
-            **candle,
-            "timestamp": candle_time,
-        }
+                    orb_m1_candle = {
+                        **candle,
+                        "timestamp": candle_time,
+                    }
 
-        result = self.orb_strategy_engine.capture_opening_range(
-            session=orb_session,
-            symbol=symbol,
-            m5_candle=orb_candle,
-            now=orb_now,
-        )
+                    for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
 
-        if result.get("success"):
-            market_data["orb_analysis"][orb_session] = result
-            break
+                        try:
+                            opening_range = (
+                                self.orb_strategy_engine.get_opening_range(
+                                    orb_session,
+                                    symbol,
+                                )
+                            )
 
-            # ORB: Detect breakout using the latest safely completed M1 candle.
-            market_data["orb_analysis"].setdefault("breakouts", {})
+                            if not opening_range:
+                                continue
 
-            m1_candles = market_data.get("M1", {}).get("candles", [])
+                            breakout_result = (
+                                self.orb_strategy_engine.detect_breakout(
+                                    session=orb_session,
+                                    symbol=symbol,
+                                    breakout_candle=orb_m1_candle,
+                                )
+                            )
 
-# Use the second-newest candle conservatively in case
-# the newest candle is still forming.
-if len(m1_candles) >= 2:
+                            if isinstance(breakout_result, dict):
+                                market_data["orb_analysis"]["breakouts"][
+                                    orb_session
+                                ] = breakout_result
 
-    candle = m1_candles[-2]
-    candle_time = candle.get("time")
+                                if breakout_result.get("detected") is True:
+                                    logger.info(
+                                        "%s | ORB breakout detected | Session=%s | Direction=%s",
+                                        symbol,
+                                        orb_session,
+                                        breakout_result.get("direction"),
+                                    )
 
-    if isinstance(candle_time, str):
-        try:
-            candle_time = datetime.fromisoformat(
-                candle_time.replace("Z", "+00:00")
-            )
-        except ValueError:
-            candle_time = None
+                        except Exception as orb_exc:
+                            logger.exception(
+                                "%s | ORB breakout check failed | Session=%s | %s",
+                                symbol,
+                                orb_session,
+                                orb_exc,
+                            )
+                            market_data["orb_analysis"]["breakouts"][
+                                orb_session
+                            ] = {
+                                "detected": False,
+                                "status": "ERROR",
+                                "error": str(orb_exc),
+                            }
 
-    if isinstance(candle_time, datetime) and candle_time.tzinfo is not None:
+            market_data["orb_analysis"]["status"] = "CHECKED"
 
-        orb_m1_candle = {
-            **candle,
-            "timestamp": candle_time,
-        }
-
-        for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
-
-            opening_range = self.orb_strategy_engine.get_opening_range(
-                orb_session,
-                symbol,
-            )
-
-            if not opening_range:
-                continue
-
-            existing_breakout = (
-                self.orb_strategy_engine.get_detected_breakout(
-                    orb_session,
-                    symbol,
-                )
-            )
-
-            if existing_breakout:
-                continue
-
-            breakout_result = self.orb_strategy_engine.detect_breakout(
-                session=orb_session,
-                symbol=symbol,
-                breakout_candle=orb_m1_candle,
-            )
-
-            if breakout_result.get("detected"):
-                market_data["orb_analysis"]["breakouts"][orb_session] = (
-                    breakout_result
-                )
-            
             # Run both strategies before preparing SMC evidence.
             strategy_results = await self._run_strategies(
                 market_data,
