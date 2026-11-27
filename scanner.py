@@ -2235,7 +2235,68 @@ class MarketScanner:
                 })
 
                 return result
+# ORB: Capture completed session-opening M5 candles.
+market_data["orb_analysis"] = {}
 
+orb_now = datetime.now(timezone.utc)
+
+for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
+
+    orb_session_status = (
+        self.orb_strategy_engine.get_session_status(
+            orb_session,
+            now=orb_now,
+        )
+    )
+
+    if not orb_session_status.get("available"):
+        continue
+
+    if orb_now < orb_session_status["closing_time"]:
+        continue
+
+    if self.orb_strategy_engine.get_opening_range(
+        orb_session,
+        symbol,
+    ):
+        continue
+
+    for candle in self._list(
+        self._dict(market_data.get("M5")).get("candles")
+    ):
+
+        candle_time = candle.get("time")
+
+        if isinstance(candle_time, str):
+            try:
+                candle_time = datetime.fromisoformat(
+                    candle_time.replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+
+        if not isinstance(candle_time, datetime):
+            continue
+
+        if candle_time.tzinfo is None:
+            continue
+
+        orb_candle = {
+            **candle,
+            "timestamp": candle_time,
+        }
+
+        result = self.orb_strategy_engine.capture_opening_range(
+            session=orb_session,
+            symbol=symbol,
+            m5_candle=orb_candle,
+            now=orb_now,
+        )
+
+        if result.get("success"):
+            market_data["orb_analysis"][orb_session] = result
+            break
+            
             # Run both strategies before preparing SMC evidence.
             strategy_results = await self._run_strategies(
                 market_data,
