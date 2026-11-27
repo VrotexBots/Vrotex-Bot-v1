@@ -30,7 +30,7 @@ logger = get_logger("risk_manager")
 
 class RiskManager:
 
-    VERSION = "2.1"
+    VERSION = "2.2"
 
     REQUIRED_RISK_CHECKS = (
         "spread_valid",
@@ -677,6 +677,76 @@ class RiskManager:
             "stop_loss": self._number(stop_loss),
             "take_profit": self._number(take_profit),
         }
+
+    # =====================================================
+    # ORB SHARED RISK INTERFACE
+    # =====================================================
+
+    def check_orb_trade(self, authorization, *, spread=None,
+                        maximum_spread=None, spread_valid=None):
+        """Validate an independently authorized ORB candidate.
+
+        ORB does not use Master SMC A+ scoring. It must first carry its own
+        Central Authorization approval; after that, this method applies the
+        same account-wide risk limits and per-trade checks used by Vrotex.
+        This method does not register or execute a trade.
+        """
+        if not isinstance(authorization, dict):
+            return {
+                "status": "RISK_REJECTED",
+                "available": True,
+                "strategy": "ORB",
+                "approved": False,
+                "reason": "Invalid ORB authorization payload",
+            }
+
+        if (str(authorization.get("strategy", "")).strip().upper() != "ORB"
+                or authorization.get("strategy_authorized") is not True):
+            return {
+                "status": "RISK_REJECTED",
+                "available": True,
+                "strategy": "ORB",
+                "symbol": authorization.get("symbol"),
+                "approved": False,
+                "reason": "ORB central strategy authorization is required",
+            }
+
+        direction = self._direction(authorization.get("direction"))
+        entry = authorization.get("entry_price")
+        stop = authorization.get("stop_loss")
+        target = authorization.get("take_profit")
+        risk_percent = authorization.get(
+            "risk_percent", self.max_risk_percent
+        )
+
+        result = self.validate_trade(
+            symbol=authorization.get("symbol"),
+            direction=direction,
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=target,
+            risk_percent=risk_percent,
+            spread=(authorization.get("spread")
+                    if spread is None else spread),
+            maximum_spread=maximum_spread,
+            spread_valid=(authorization.get("spread_valid")
+                          if spread_valid is None else spread_valid),
+        )
+
+        approved = result.get("approved") is True
+        response = {
+            "status": "RISK_APPROVED" if approved else "RISK_REJECTED",
+            "available": True,
+            "strategy": "ORB",
+            **result,
+            "execution_authorized": False,
+            "trade_registration_required": True,
+        }
+        logger.info(
+            "ORB shared risk validation | %s | Approved=%s | Checks=%s",
+            authorization.get("symbol"), approved, result.get("checks"),
+        )
+        return response
 
     # =====================================================
     # SCANNER / SMC INTERFACE
