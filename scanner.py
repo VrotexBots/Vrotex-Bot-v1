@@ -30,7 +30,12 @@ import time
 import math
 import re
 
-from orb_strategy_engine import ORBStrategyEngine
+# Prefer the independently authorized ORB engine.
+# Keep the original engine as a compatibility fallback.
+try:
+    from orb_strategy_engine_authorized import ORBStrategyEngine
+except ImportError:
+    from orb_strategy_engine import ORBStrategyEngine
 
 from datetime import datetime, timezone
 
@@ -2240,6 +2245,7 @@ class MarketScanner:
             market_data["orb_analysis"] = {
                 "opening_ranges": {},
                 "breakouts": {},
+                "confirmations": {},
                 "status": "SCANNING",
             }
 
@@ -2389,13 +2395,41 @@ class MarketScanner:
                             if not opening_range:
                                 continue
 
-                            breakout_result = (
-                                self.orb_strategy_engine.detect_breakout(
-                                    session=orb_session,
-                                    symbol=symbol,
-                                    breakout_candle=orb_m1_candle,
-                                )
+                            # Reuse a previously detected breakout when available.
+                            # This is important because M1 confirmation may need
+                            # a later completed candle after the initial break.
+                            breakout_result = None
+                            get_detected = getattr(
+                                self.orb_strategy_engine,
+                                "get_detected_breakout",
+                                None,
                             )
+
+                            if callable(get_detected):
+                                stored_breakout = get_detected(
+                                    orb_session,
+                                    symbol,
+                                )
+
+                                if isinstance(stored_breakout, dict) and stored_breakout:
+                                    breakout_result = (
+                                        stored_breakout
+                                        if stored_breakout.get("detected") is True
+                                        else {
+                                            "detected": True,
+                                            "breakout": stored_breakout,
+                                            "reason": "STORED_ORB_BREAKOUT_AWAITING_CONFIRMATION",
+                                        }
+                                    )
+
+                            if breakout_result is None:
+                                breakout_result = (
+                                    self.orb_strategy_engine.detect_breakout(
+                                        session=orb_session,
+                                        symbol=symbol,
+                                        breakout_candle=orb_m1_candle,
+                                    )
+                                )
 
                             if isinstance(breakout_result, dict):
                                 market_data["orb_analysis"]["breakouts"][
@@ -2403,13 +2437,73 @@ class MarketScanner:
                                 ] = breakout_result
 
                                 if breakout_result.get("detected") is True:
+                                    breakout_details = self._dict(
+                                        breakout_result.get("breakout")
+                                    )
+                                    breakout_direction = (
+                                        breakout_result.get("direction")
+                                        or breakout_details.get("direction")
+                                    )
+
                                     logger.info(
                                         "%s | ORB breakout detected | Session=%s | Direction=%s",
                                         symbol,
                                         orb_session,
-                                        breakout_result.get("direction")
-                                        or (breakout_result.get("breakout") or {}).get("direction")
-                               )
+                                        breakout_direction,
+                                    )
+
+                                    # Only completed M1 candles are supplied.
+                                    # The latest candle is excluded because it may
+                                    # still be forming. The ORB engine independently
+                                    # checks that confirmation occurs after breakout.
+                                    confirmation_method = getattr(
+                                        self.orb_strategy_engine,
+                                        "confirm_breakout",
+                                        None,
+                                    )
+
+                                    if callable(confirmation_method):
+                                        confirmation_result = (
+                                            confirmation_method(
+                                                session=orb_session,
+                                                symbol=symbol,
+                                                m1_candles=m1_candles[:-1],
+                                            )
+                                        )
+
+                                        if not isinstance(confirmation_result, dict):
+                                            confirmation_result = {
+                                                "confirmed": False,
+                                                "status": "INVALID_CONFIRMATION_RESPONSE",
+                                                "raw_result": str(confirmation_result),
+                                            }
+                                    else:
+                                        confirmation_result = {
+                                            "confirmed": False,
+                                            "status": "CONFIRMATION_METHOD_UNAVAILABLE",
+                                        }
+
+                                    market_data["orb_analysis"]["confirmations"][
+                                        orb_session
+                                    ] = confirmation_result
+
+                                    if confirmation_result.get("confirmed") is True:
+                                        logger.info(
+                                            "%s | ORB independent M1 confirmation PASSED | Session=%s | Direction=%s",
+                                            symbol,
+                                            orb_session,
+                                            breakout_direction,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "%s | ORB independent M1 confirmation pending | Session=%s | Reason=%s",
+                                            symbol,
+                                            orb_session,
+                                            confirmation_result.get(
+                                                "reason",
+                                                confirmation_result.get("status", "NOT_CONFIRMED"),
+                                            ),
+                                        )
 
                         except Exception as orb_exc:
                             logger.exception(
