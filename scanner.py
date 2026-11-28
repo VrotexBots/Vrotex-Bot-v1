@@ -2407,8 +2407,9 @@ class MarketScanner:
                                         "%s | ORB breakout detected | Session=%s | Direction=%s",
                                         symbol,
                                         orb_session,
-                                        breakout_result.get("direction"),
-                                    )
+                                        breakout_result.get("direction")
+                                        or (breakout_result.get("breakout") or {}).get("direction")
+                               )
 
                         except Exception as orb_exc:
                             logger.exception(
