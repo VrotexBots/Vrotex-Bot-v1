@@ -601,6 +601,105 @@ class ExnessConnection:
             path
         )
 
+    async def get_instrument_conditions(self, instrument):
+        """
+        Retrieve the account-specific Exness trading conditions.
+
+        Values are returned by Exness and are never defaulted or guessed.
+        The caller must use these values for volume and price validation.
+        """
+        self._require_connected()
+
+        instrument = str(instrument or "").strip().upper()
+        if not instrument or not re.fullmatch(r"[A-Z0-9._-]{1,11}", instrument):
+            raise ValueError("A valid Exness instrument symbol is required.")
+
+        path = (
+            f"/v1/configuration/accounts/{self.account_id}"
+            f"/instruments/{instrument}/conditions"
+        )
+        result = await self.signed_request(
+            self.access_point,
+            "GET",
+            path,
+        )
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"Exness returned invalid instrument conditions for {instrument}."
+            )
+
+        # Some API responses may wrap the payload. Accept only a clearly
+        # identified conditions object; do not silently use an unrelated object.
+        conditions = result.get("conditions", result)
+        if not isinstance(conditions, dict):
+            raise RuntimeError(
+                f"Exness conditions payload is malformed for {instrument}."
+            )
+
+        returned_symbol = str(
+            conditions.get("instrument", instrument)
+        ).strip().upper()
+        if returned_symbol != instrument:
+            raise RuntimeError(
+                f"Exness conditions symbol mismatch: requested {instrument}, "
+                f"received {returned_symbol}."
+            )
+
+        required = (
+            "contract_size",
+            "volume_min",
+            "volume_max",
+            "volume_step",
+            "point_digits",
+            "quote_currency",
+            "trade_mode",
+        )
+        missing = [
+            key for key in required
+            if conditions.get(key) is None
+            or conditions.get(key) == ""
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Exness conditions for {instrument} are incomplete: "
+                + ", ".join(missing)
+            )
+
+        try:
+            contract_size = Decimal(str(conditions["contract_size"]))
+            volume_min = Decimal(str(conditions["volume_min"]))
+            volume_max = Decimal(str(conditions["volume_max"]))
+            volume_step = Decimal(str(conditions["volume_step"]))
+            point_digits = int(conditions["point_digits"])
+        except (InvalidOperation, TypeError, ValueError):
+            raise RuntimeError(
+                f"Exness returned invalid numeric conditions for {instrument}."
+            )
+
+        if (
+            not contract_size.is_finite()
+            or contract_size <= 0
+            or not volume_min.is_finite()
+            or not volume_max.is_finite()
+            or not volume_step.is_finite()
+            or volume_min <= 0
+            or volume_max < volume_min
+            or volume_step <= 0
+            or point_digits < 0
+        ):
+            raise RuntimeError(
+                f"Exness returned unsafe trading conditions for {instrument}."
+            )
+
+        if str(conditions["trade_mode"]).lower() != "enabled":
+            raise RuntimeError(
+                f"Trading is not enabled for {instrument}: "
+                f"{conditions['trade_mode']}"
+            )
+
+        return conditions
+
     def _require_connected(self):
 
         if not self.connected or not self.access_point:
