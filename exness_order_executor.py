@@ -20,7 +20,7 @@ logger = get_logger("broker.exness_order_executor")
 
 class ExnessOrderExecutor:
 
-    VERSION = "2.3"
+    VERSION = "2.4"
 
     ALLOWED_INSTRUMENTS = {
         "EURUSD",
@@ -243,9 +243,68 @@ class ExnessOrderExecutor:
     async def _check_risk(self, setup):
 
         try:
-            from risk_manager import risk_manager
-
             strategy = str(setup.get("strategy", "SMC")).upper()
+
+            if strategy == "ORB":
+                # Rebuild the shared snapshot immediately before submission.
+                # ORB does not pass through legacy SMC/A+ risk checks.
+                from trade_management import trade_manager
+                from risk_management import RiskManager
+
+                snapshot_data = await self.connection.get_trading_snapshot()
+                equity_value = self._extract_value(
+                    snapshot_data,
+                    ("equity", "account_equity", "current_equity"),
+                )
+                if equity_value is None:
+                    equity_value = self._extract_value(
+                        self.connection.account_info or {},
+                        ("equity", "account_equity", "current_equity"),
+                    )
+                equity = self._decimal(equity_value)
+                if equity is None or equity <= 0:
+                    return False, "ORB execution blocked: live broker equity unavailable"
+
+                pending_symbols = set()
+                for pending in self.pending_orders.values():
+                    if isinstance(pending, dict):
+                        symbol = pending.get("symbol", pending.get("instrument"))
+                        if symbol:
+                            pending_symbols.add(str(symbol).strip().upper())
+
+                snapshot = trade_manager.build_risk_snapshot(
+                    float(equity),
+                    pending_instruments=tuple(sorted(pending_symbols)),
+                )
+
+                approved, reason = RiskManager().can_open_orb_trade(
+                    snapshot,
+                    strategy_authorized=setup.get("strategy_authorized") is True,
+                    instrument=setup.get("symbol", setup.get("instrument")),
+                )
+                if not approved:
+                    return False, f"ORB shared risk recheck rejected: {reason}"
+
+                risk_result = setup.get("risk")
+                if not isinstance(risk_result, dict):
+                    return False, "ORB shared risk result missing"
+                if risk_result.get("risk_approved") is not True:
+                    return False, "ORB shared risk result rejected"
+                if risk_result.get("position_size_required") is True:
+                    return False, "ORB position size is not finalized"
+
+                sized_volume = self._decimal(risk_result.get("volume_lots"))
+                setup_volume = self._decimal(setup.get("volume"))
+                if sized_volume is None or setup_volume != sized_volume:
+                    return False, "ORB volume does not match approved shared-risk sizing"
+
+                approved_risk = self._decimal(risk_result.get("risk_percent"))
+                if approved_risk is None or approved_risk > Decimal("1"):
+                    return False, "ORB approved risk percentage is invalid or exceeds 1%"
+
+                return True, "ORB persistent shared risk snapshot rechecked"
+
+            from risk_manager import risk_manager
 
             global_result = risk_manager.can_trade()
             if isinstance(global_result, tuple):
@@ -258,24 +317,6 @@ class ExnessOrderExecutor:
                     return False, str(reason)
             elif global_result is not True:
                 return False, "Global risk limits rejected trade"
-
-            if strategy == "ORB":
-                # ORB's detailed checks and broker-based sizing are performed
-                # by ORBSharedRiskGate before the final execution handoff.
-                if setup.get("risk_approved") is not True:
-                    return False, "ORB shared risk approval missing"
-                risk_result = setup.get("risk")
-                if not isinstance(risk_result, dict):
-                    return False, "ORB shared risk result missing"
-                if risk_result.get("risk_approved") is not True:
-                    return False, "ORB shared risk result rejected"
-                if risk_result.get("position_size_required") is True:
-                    return False, "ORB position size is not finalized"
-                sized_volume = self._decimal(risk_result.get("volume_lots"))
-                setup_volume = self._decimal(setup.get("volume"))
-                if sized_volume is None or setup_volume != sized_volume:
-                    return False, "ORB volume does not match approved risk sizing"
-                return True, "ORB shared risk approval rechecked"
 
             validator = getattr(risk_manager, "validate_trade", None)
             if not callable(validator):
