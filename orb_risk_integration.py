@@ -11,7 +11,7 @@ from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from risk_management import RiskManager, RiskSnapshot
+from risk_manager import RiskManager, RiskSnapshot
 from orb_position_sizer import (
     ORBPositionSizingError, calculate_orb_position_size,
 )
