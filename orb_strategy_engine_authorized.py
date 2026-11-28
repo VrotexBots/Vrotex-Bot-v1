@@ -449,14 +449,57 @@ class ORBStrategyEngine:
         if key in self.confirmed_breakouts:
             return {"success": False, "reason": "BREAKOUT_ALREADY_CONFIRMED"}
 
+        # The M1 structure break and displacement belong to the breakout
+        # candle itself. Do not wait for a second CHoCH/BOS after the range
+        # breakout; doing so can delay the entry and miss the intended retest.
+        #
+        # The scanner may retry confirmation on later scans. Always cut the
+        # supplied history off at the original breakout candle so a later
+        # M1 candle cannot become a substitute confirmation event.
+        breakout_candle = breakout.get("breakout_candle")
+        if not isinstance(breakout_candle, dict):
+            reason = "ORB_BREAKOUT_M1_CANDLE_NOT_STORED"
+            self._set_status(session, symbol, reason)
+            return {"success": False, "reason": reason}
+
+        try:
+            breakout_timestamp = self._normalise_m1_candle(
+                breakout_candle
+            )["timestamp"]
+            eligible_candles = []
+            breakout_candle_found = False
+
+            for candle in m1_candles:
+                normalised = self._normalise_m1_candle(candle)
+                candle_timestamp = normalised["timestamp"]
+
+                if candle_timestamp == breakout_timestamp:
+                    breakout_candle_found = True
+
+                if candle_timestamp <= breakout_timestamp:
+                    eligible_candles.append(candle)
+
+        except (TypeError, ValueError) as exc:
+            reason = f"INVALID_ORB_BREAKOUT_M1_CANDLE_DATA: {exc}"
+            self._set_status(session, symbol, reason)
+            return {"success": False, "reason": reason}
+
+        if not breakout_candle_found:
+            reason = "ORB_BREAKOUT_CANDLE_NOT_FOUND_IN_M1_HISTORY"
+            self._set_status(session, symbol, reason)
+            return {"success": False, "reason": reason}
+
         valid, reason, evidence = self._detect_orb_m1_evidence(
-            m1_candles, breakout["direction"]
+            eligible_candles,
+            breakout["direction"],
         )
-        if valid:
-            breakout_time = breakout.get("detected_at")
-            confirmation_time = evidence["confirmation_candle"]["timestamp"]
-            if isinstance(breakout_time, datetime) and confirmation_time <= breakout_time:
-                valid, reason, evidence = False, "M1_CONFIRMATION_MUST_FOLLOW_BREAKOUT", None
+        if valid and evidence["confirmation_candle"]["timestamp"] != breakout_timestamp:
+            valid, reason, evidence = (
+                False,
+                "ORB_CONFIRMATION_MUST_USE_BREAKOUT_CANDLE",
+                None,
+            )
+
         if not valid:
             self._set_status(session, symbol, reason)
             return {"success": False, "reason": reason}
