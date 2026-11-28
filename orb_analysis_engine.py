@@ -298,7 +298,7 @@ class ORBAnalysisEngine:
             "breakout_candle": data,
             "opening_high": opening_range["high"],
             "opening_low": opening_range["low"],
-            "detected_at": datetime.now(timezone.utc),
+            "detected_at": data["timestamp"],
         }
 
         opening_range["breakout_detected"] = True
