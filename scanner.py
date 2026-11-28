@@ -19,7 +19,8 @@ Responsibilities:
 - Prepare evidence for the Master SMC Engine.
 - Preserve Master SMC authorization.
 
-This scanner does not independently authorize or execute trades.
+SMC trades remain under Master SMC authorization. ORB candidates use the
+independent central ORB authorization route and shared Exness executor.
 """
 
 import asyncio
@@ -30,12 +31,9 @@ import time
 import math
 import re
 
-# Prefer the independently authorized ORB engine.
-# Keep the original engine as a compatibility fallback.
-try:
-    from orb_strategy_engine_authorized import ORBStrategyEngine
-except ImportError:
-    from orb_strategy_engine import ORBStrategyEngine
+# ORB must use the approved independent range-break/retest engine.
+# Do not silently fall back to legacy CHoCH/BOS/OB/FVG-gated ORB logic.
+from orb_strategy_engine_authorized import ORBStrategyEngine
 
 from datetime import datetime, timezone
 
@@ -77,6 +75,16 @@ class MarketScanner:
         self.pro_trend_engine = pro_trend_engine
         self.counter_trend_engine = counter_trend_engine
         self.orb_strategy_engine = ORBStrategyEngine()
+        self.orb_execution_engine = self._load_engine(
+            "exness_order_executor",
+            ("exness_order_executor",),
+        )
+        self._orb_execution_states = {}
+        self._orb_authorizations = {}
+        self._orb_logged_events = set()
+        # One successful/submitted ORB trade is allowed per session opening,
+        # shared across all enabled instruments (not one per symbol).
+        self._orb_session_trade_locks = {}
         
         self.fundamental_analysis_engine = (
             fundamental_analysis_engine
@@ -429,6 +437,297 @@ class MarketScanner:
                 )
 
         return None
+
+    async def _get_live_quote(self, symbol):
+        """Return a fresh bid/ask quote; never fabricate spread data."""
+        engine = self.market_data_engine
+        if engine is None:
+            return None
+        for name in ("get_live_tick", "get_latest_tick", "get_tick"):
+            method = getattr(engine, name, None)
+            if not callable(method):
+                continue
+            try:
+                quote = await self._invoke(method, symbol)
+                if not isinstance(quote, dict):
+                    continue
+                bid = self._number(quote.get("bid"))
+                ask = self._number(quote.get("ask"))
+                if bid is None or ask is None or bid <= 0 or ask < bid:
+                    continue
+                return {**quote, "bid": bid, "ask": ask, "spread": ask - bid}
+            except Exception:
+                logger.debug("Live quote method failed: %s", name, exc_info=True)
+        return None
+
+    @staticmethod
+    def _orb_derive_levels(m1_candles, breakout, retest_candle, entry_price, spread):
+        """Derive stop beyond the post-breakout pullback and target at nearest
+        confirmed opposing M1 swing liquidity. Missing levels fail closed."""
+        from datetime import datetime
+
+        def stamp(candle):
+            value = candle.get("time", candle.get("timestamp"))
+            if isinstance(value, str):
+                try:
+                    value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+            return value if isinstance(value, datetime) and value.tzinfo else None
+
+        direction = str(breakout.get("direction", "")).upper()
+        breakout_time = breakout.get("detected_at")
+        if isinstance(breakout_time, str):
+            try:
+                breakout_time = datetime.fromisoformat(breakout_time.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(breakout_time, datetime) or breakout_time.tzinfo is None:
+            return None
+
+        rows = []
+        for raw in m1_candles:
+            if not isinstance(raw, dict):
+                continue
+            ts = stamp(raw)
+            if ts is None:
+                continue
+            try:
+                row = {k: float(raw[k]) for k in ("open", "high", "low", "close")}
+            except (KeyError, TypeError, ValueError):
+                continue
+            if row["low"] <= 0 or row["high"] < max(row["open"], row["close"], row["low"]) or row["low"] > min(row["open"], row["close"], row["high"]):
+                continue
+            rows.append({**row, "timestamp": ts})
+        rows.sort(key=lambda item: item["timestamp"])
+        if len(rows) < 7:
+            return None
+        retest_time = stamp(retest_candle)
+        if retest_time is None:
+            return None
+        post = [r for r in rows if breakout_time < r["timestamp"] <= retest_time]
+        if not post:
+            return None
+        spread = float(spread)
+        if not math.isfinite(spread) or spread <= 0:
+            return None
+        entry = float(entry_price)
+
+        # Confirmed swing liquidity uses only completed candles available
+        # at or before the retest; the still-forming M1 candle is excluded.
+        eligible_rows = [r for r in rows if r["timestamp"] <= retest_time]
+        pivots = []
+        for i in range(2, len(eligible_rows) - 2):
+            window = eligible_rows[i-2:i+3]
+            current = eligible_rows[i]
+            if direction == "BULLISH" and current["high"] == max(x["high"] for x in window):
+                if current["timestamp"] < retest_time and current["high"] > entry:
+                    pivots.append(current["high"])
+            elif direction == "BEARISH" and current["low"] == min(x["low"] for x in window):
+                if current["timestamp"] < retest_time and current["low"] < entry:
+                    pivots.append(current["low"])
+        if not pivots:
+            return None
+
+        if direction == "BULLISH":
+            stop = min(r["low"] for r in post) - spread
+            target = min(pivots)
+            if not (stop < entry < target):
+                return None
+        elif direction == "BEARISH":
+            stop = max(r["high"] for r in post) + spread
+            target = max(pivots)
+            if not (target < entry < stop):
+                return None
+        else:
+            return None
+        return {"stop_loss": stop, "take_profit": target}
+
+    def _log_orb_once(self, key, event, message, *args):
+        log_key = (key, event)
+        if log_key in self._orb_logged_events:
+            return
+        self._orb_logged_events.add(log_key)
+        logger.info(message, *args)
+
+    @staticmethod
+    def _orb_retest_tolerance_price(symbol):
+        """Convert the approved two-pip retest tolerance to quote-price units.
+
+        EURUSD/GBPUSD use the conventional 0.0001 FX pip. BTCUSD uses a
+        one-dollar price pip. The entry engine consumes absolute price units,
+        never a raw spread value.
+        """
+        from orb_config import ORB_RETEST_TOLERANCE_PIPS
+
+        normalized = str(symbol).strip().upper()
+        pip_size = {
+            "EURUSD": 0.0001,
+            "GBPUSD": 0.0001,
+            "BTCUSD": 1.0,
+        }.get(normalized)
+        if pip_size is None:
+            raise ValueError(f"No approved ORB pip convention for {normalized}")
+        return float(ORB_RETEST_TOLERANCE_PIPS) * pip_size
+
+    async def _process_orb_candidate(self, session, symbol, candidate, quote):
+        """Central ORB authorization -> shared executor. No Master SMC gate."""
+        key = (str(session).upper(), str(symbol).upper())
+        if not isinstance(candidate, dict) or not isinstance(quote, dict):
+            return {"status": "WAITING_FOR_VALID_ORB_CANDIDATE_OR_QUOTE"}
+        opening_range = self.orb_strategy_engine.get_opening_range(session, symbol)
+        opening_time = opening_range.get("start_time") if isinstance(opening_range, dict) else None
+        if isinstance(opening_time, datetime):
+            opening_id = opening_time.isoformat()
+        else:
+            opening_id = str(opening_time or "UNKNOWN")
+        session_lock = self._orb_session_trade_locks.get(str(session).upper())
+        if isinstance(session_lock, dict) and session_lock.get("opening_id") == opening_id:
+            if str(session_lock.get("symbol", "")).upper() != str(symbol).upper():
+                return {
+                    "status": "SESSION_TRADE_ALREADY_TAKEN",
+                    "symbol": session_lock.get("symbol"),
+                    "request_id": session_lock.get("request_id"),
+                }
+        elif session_lock is not None:
+            # New session opening: the previous session lock has expired.
+            self._orb_session_trade_locks.pop(str(session).upper(), None)
+        execution_state = self._orb_execution_states.get(key)
+        if isinstance(execution_state, dict):
+            state = str(execution_state.get("status", "")).upper()
+            request_id = execution_state.get("request_id")
+            if state == "CONFIRMED":
+                return {"status": "CONFIRMED", "request_id": request_id}
+            if state == "FAILED":
+                return {"status": "FAILED", "request_id": request_id}
+            if state == "PENDING":
+                completed = getattr(executor := self.orb_execution_engine, "completed_orders", {})
+                confirmed = completed.get(request_id) if isinstance(completed, dict) else None
+                if isinstance(confirmed, dict) and str(confirmed.get("status", "")).upper() == "CONFIRMED":
+                    self._orb_execution_states[key] = {"status": "CONFIRMED", "request_id": request_id}
+                    verification = self._dict(confirmed.get("verification"))
+                    logger.info(
+                        "%s | ORB POSITION CONFIRMED | Session=%s | Position ID=%s",
+                        symbol, session, verification.get("position_id"),
+                    )
+                    return confirmed
+                pending = getattr(executor, "pending_orders", {})
+                if isinstance(pending, dict) and request_id in pending:
+                    reconcile = getattr(executor, "reconcile_pending", None)
+                    if callable(reconcile):
+                        try:
+                            reconciled = await self._invoke(reconcile)
+                            for item in reconciled if isinstance(reconciled, list) else []:
+                                if not isinstance(item, dict) or item.get("request_id") != request_id:
+                                    continue
+                                reconciled_status = str(item.get("status", "")).upper()
+                                if reconciled_status == "CONFIRMED":
+                                    self._orb_execution_states[key] = {"status": "CONFIRMED", "request_id": request_id}
+                                    verification = self._dict(item.get("verification"))
+                                    logger.info(
+                                        "%s | ORB POSITION CONFIRMED | Session=%s | Position ID=%s",
+                                        symbol, session, verification.get("position_id"),
+                                    )
+                                    return item
+                                if reconciled_status == "FAILED":
+                                    self._orb_execution_states[key] = {"status": "FAILED", "request_id": request_id}
+                                    return item
+                        except Exception:
+                            logger.exception("ORB pending position reconciliation failed | %s | %s", symbol, session)
+                return {"status": "PENDING", "request_id": request_id}
+
+        authorization = self._orb_authorizations.get(key)
+        if not isinstance(authorization, dict):
+            authorization = self.orb_strategy_engine.authorize_entry_candidate(
+                session, symbol, candidate.get("direction")
+            )
+            if authorization.get("strategy_authorized") is not True:
+                logger.warning(
+                    "%s | ORB CENTRAL AUTHORIZATION REJECTED | Session=%s | Reason=%s",
+                    symbol, session, authorization.get("reason"),
+                )
+                return authorization
+            self._orb_authorizations[key] = authorization
+
+        direction = str(candidate.get("direction", "")).upper()
+        side = "buy" if direction == "BULLISH" else "sell"
+        live_entry = quote["ask"] if side == "buy" else quote["bid"]
+        stop = self._number(candidate.get("stop_loss"))
+        target = self._number(candidate.get("take_profit"))
+        if stop is None or target is None:
+            return {"status": "ORB_LEVELS_MISSING"}
+        if side == "buy" and not (stop < live_entry < target):
+            return {"status": "ORB_LIVE_ENTRY_MOVED_OUTSIDE_TRADE_LEVELS"}
+        if side == "sell" and not (target < live_entry < stop):
+            return {"status": "ORB_LIVE_ENTRY_MOVED_OUTSIDE_TRADE_LEVELS"}
+
+        executor = self.orb_execution_engine
+        execute = getattr(executor, "execute", None) if executor is not None else None
+        if not callable(execute):
+            logger.error("ORB execution blocked | ExnessOrderExecutor unavailable")
+            return {"status": "ORB_EXECUTOR_UNAVAILABLE"}
+
+        setup = {
+            **candidate,
+            "strategy": "ORB",
+            "strategy_authorized": True,
+            "execution_authorized": False,
+            "approved": True,
+            "instrument": symbol,
+            "symbol": symbol,
+            "side": side,
+            "direction": side,
+            "entry_price": live_entry,
+            "stop_loss_price": stop,
+            "take_profit_price": target,
+            "spread": quote["spread"],
+            "spread_valid": True,
+            "maximum_spread": None,
+        }
+        self._log_orb_once(
+            key, "RETEST_CONFIRMED",
+            "%s | ORB RETEST CONFIRMED | Session=%s | Direction=%s | Entry=%s | SL=%s | TP=%s",
+            symbol, session, direction, live_entry, stop, target,
+        )
+        result = await self._invoke(execute, setup)
+        if not isinstance(result, dict):
+            return {"status": "ORB_EXECUTOR_INVALID_RESPONSE"}
+
+        status = str(result.get("status", "UNKNOWN")).upper()
+        if result.get("request_id") or status in ("SUBMITTED", "PENDING", "CONFIRMED"):
+            logger.info(
+                "%s | ORB ORDER SUBMITTED | Session=%s | Status=%s | Request=%s",
+                symbol, session, status, result.get("request_id"),
+            )
+        if status == "CONFIRMED":
+            self._orb_execution_states[key] = {"status": "CONFIRMED", "request_id": result.get("request_id")}
+            self._orb_session_trade_locks[str(session).upper()] = {
+                "opening_id": opening_id, "symbol": str(symbol).upper(),
+                "request_id": result.get("request_id"), "status": "CONFIRMED",
+            }
+            verification = self._dict(result.get("verification"))
+            logger.info(
+                "%s | ORB POSITION CONFIRMED | Session=%s | Position ID=%s",
+                symbol, session, verification.get("position_id"),
+            )
+        elif status == "FAILED":
+            self._orb_execution_states[key] = {"status": "FAILED", "request_id": result.get("request_id")}
+            logger.error("%s | ORB EXECUTION FAILED | Session=%s | %s", symbol, session, result.get("reason"))
+        elif status in ("SUBMITTED", "PENDING") or result.get("request_id"):
+            self._orb_execution_states[key] = {"status": "PENDING", "request_id": result.get("request_id")}
+            self._orb_session_trade_locks[str(session).upper()] = {
+                "opening_id": opening_id, "symbol": str(symbol).upper(),
+                "request_id": result.get("request_id"), "status": "PENDING",
+            }
+            logger.warning(
+                "%s | ORB POSITION AWAITING EXNESS CONFIRMATION | Session=%s",
+                symbol, session,
+            )
+        else:
+            # A pre-submission rejection (e.g. stale quote or risk rejection)
+            # may be retried on the next fresh scan without creating a duplicate.
+            logger.warning("%s | ORB EXECUTION NOT SUBMITTED | Session=%s | Reason=%s", symbol, session, result.get("reason", status))
+        return result
 
     async def _collect_market_data(self, symbol):
 
@@ -2240,303 +2539,206 @@ class MarketScanner:
                 })
 
                 return result
-            # ORB: Capture completed session-opening M5 candles.
-            # ORB remains independent of the Master SMC pathway.
+            # ORB is an independent pathway: fixed M5 opening range, M1
+            # body-close breakout, M1 range-boundary retest, central ORB
+            # authorization and the shared Exness demo executor.
             market_data["orb_analysis"] = {
                 "opening_ranges": {},
                 "breakouts": {},
                 "confirmations": {},
+                "retests": {},
+                "execution": {},
                 "status": "SCANNING",
             }
-
             orb_now = datetime.now(timezone.utc)
-            m5_candles = self._list(
-                self._dict(market_data.get("M5")).get("candles")
-            )
+            m5_candles = self._list(self._dict(market_data.get("M5")).get("candles"))
+            m1_candles = self._list(self._dict(market_data.get("M1")).get("candles"))
+            orb_quote = await self._get_live_quote(symbol)
 
+            # First capture only the exact completed M5 candle at each
+            # configured session opening. Existing ranges are never changed.
             for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
-
                 try:
-                    session_window = self.orb_strategy_engine.get_session_status(
-                        orb_session,
-                        now=orb_now,
-                    )
-
+                    session_window = self.orb_strategy_engine.get_session_status(orb_session, now=orb_now)
                     if not isinstance(session_window, dict):
                         continue
-
                     opening_time = session_window.get("opening_time")
                     closing_time = session_window.get("closing_time")
-
-                    if not isinstance(opening_time, datetime):
+                    if not isinstance(opening_time, datetime) or not isinstance(closing_time, datetime):
                         continue
-
-                    if not isinstance(closing_time, datetime):
+                    if opening_time.tzinfo is None or closing_time.tzinfo is None or orb_now < closing_time:
                         continue
-
-                    if opening_time.tzinfo is None or closing_time.tzinfo is None:
-                        continue
-
-                    if orb_now < closing_time:
-                        continue
-
-                    existing_range = self.orb_strategy_engine.get_opening_range(
-                        orb_session,
-                        symbol,
-                    )
-
+                    existing_range = self.orb_strategy_engine.get_opening_range(orb_session, symbol)
                     if existing_range:
-                        market_data["orb_analysis"]["opening_ranges"][
-                            orb_session
-                        ] = existing_range
-                        continue
-
-                    # Select only the M5 candle whose timestamp exactly
-                    # matches this session's opening time. No later M5 candle
-                    # is considered part of the opening range.
-                    opening_candle = None
-
-                    for candle in m5_candles:
-
-                        if not isinstance(candle, dict):
-                            continue
-
-                        candle_time = candle.get("time")
-
-                        if isinstance(candle_time, str):
+                        old_start = existing_range.get("start_time")
+                        if isinstance(old_start, str):
                             try:
-                                candle_time = datetime.fromisoformat(
-                                    candle_time.replace("Z", "+00:00")
-                                )
+                                old_start = datetime.fromisoformat(old_start.replace("Z", "+00:00"))
+                            except ValueError:
+                                old_start = None
+                        if old_start != opening_time:
+                            # Session state is scoped to the actual local-date
+                            # opening timestamp; clear yesterday's state only
+                            # when today's new M5 opening candle is complete.
+                            self.orb_strategy_engine.reset_session(orb_session, symbol)
+                            self._orb_execution_states.pop((orb_session, symbol), None)
+                            self._orb_authorizations.pop((orb_session, symbol), None)
+                            self._orb_logged_events = {
+                                item for item in self._orb_logged_events
+                                if not (isinstance(item, tuple) and item and item[0] == (orb_session, symbol))
+                            }
+                            existing_range = None
+                    if existing_range:
+                        market_data["orb_analysis"]["opening_ranges"][orb_session] = existing_range
+                        self._log_orb_once(
+                            (orb_session, symbol), "SESSION_ACTIVE",
+                            "%s | ORB SESSION ACTIVE | Session=%s | Timezone=%s",
+                            symbol, orb_session, session_window.get("timezone"),
+                        )
+                        continue
+                    opening_candle = None
+                    for raw in m5_candles:
+                        if not isinstance(raw, dict):
+                            continue
+                        stamp = raw.get("time", raw.get("timestamp"))
+                        if isinstance(stamp, str):
+                            try:
+                                stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
                             except ValueError:
                                 continue
-
-                        if not isinstance(candle_time, datetime):
-                            continue
-
-                        if candle_time.tzinfo is None:
-                            continue
-
-                        if candle_time == opening_time:
-                            opening_candle = {
-                                **candle,
-                                "timestamp": candle_time,
-                            }
+                        if isinstance(stamp, datetime) and stamp.tzinfo is not None and stamp == opening_time:
+                            opening_candle = {**raw, "timestamp": stamp}
                             break
-
                     if opening_candle is None:
                         continue
-
-                    capture_result = (
-                        self.orb_strategy_engine.capture_opening_range(
-                            session=orb_session,
-                            symbol=symbol,
-                            m5_candle=opening_candle,
-                            now=orb_now,
-                        )
+                    captured = self.orb_strategy_engine.capture_opening_range(
+                        session=orb_session, symbol=symbol, m5_candle=opening_candle, now=orb_now
                     )
-
-                    if isinstance(capture_result, dict) and (
-                        capture_result.get("success") is True
-                    ):
-                        market_data["orb_analysis"]["opening_ranges"][
-                            orb_session
-                        ] = capture_result
-
+                    if captured.get("success") is True:
+                        market_data["orb_analysis"]["opening_ranges"][orb_session] = captured
+                        self._log_orb_once(
+                            (orb_session, symbol), "SESSION_ACTIVE",
+                            "%s | ORB SESSION ACTIVE | Session=%s | Timezone=%s",
+                            symbol, orb_session, session_window.get("timezone"),
+                        )
+                        logger.info(
+                            "%s | ORB RANGE ESTABLISHED | Session=%s | High=%s | Low=%s",
+                            symbol, orb_session, captured["opening_range"]["high"], captured["opening_range"]["low"],
+                        )
                 except Exception as orb_exc:
-                    logger.exception(
-                        "%s | ORB opening-range check failed | Session=%s | %s",
-                        symbol,
-                        orb_session,
-                        orb_exc,
-                    )
-                    market_data["orb_analysis"]["opening_ranges"][
-                        orb_session
-                    ] = {
-                        "success": False,
-                        "status": "ERROR",
-                        "error": str(orb_exc),
-                    }
+                    logger.exception("%s | ORB opening-range check failed | Session=%s | %s", symbol, orb_session, orb_exc)
 
-            # ORB: Use the latest safely completed M1 candle for breakout.
-            # M5 establishes the opening range; M1 confirms a breakout only
-            # when its candle CLOSES beyond the range boundary. A wick alone
-            # is a sweep, not a breakout. No separate CHoCH/BOS confirmation.
-            m1_candles = self._list(
-                self._dict(market_data.get("M1")).get("candles")
-            )
-
+            # The latest safely completed M1 candle is [-2]; the forming
+            # candle [-1] is never used for breakout or retest confirmation.
             if len(m1_candles) >= 2:
-
-                candle = m1_candles[-2]
-                candle_time = (
-                    candle.get("time")
-                    if isinstance(candle, dict)
-                    else None
-                )
-
-                if isinstance(candle_time, str):
+                raw_m1 = m1_candles[-2]
+                stamp = raw_m1.get("time", raw_m1.get("timestamp")) if isinstance(raw_m1, dict) else None
+                if isinstance(stamp, str):
                     try:
-                        candle_time = datetime.fromisoformat(
-                            candle_time.replace("Z", "+00:00")
-                        )
+                        stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
                     except ValueError:
-                        candle_time = None
-
-                if (
-                    isinstance(candle_time, datetime)
-                    and candle_time.tzinfo is not None
-                    and isinstance(candle, dict)
-                ):
-
-                    orb_m1_candle = {
-                        **candle,
-                        "timestamp": candle_time,
-                    }
-
+                        stamp = None
+                if isinstance(stamp, datetime) and stamp.tzinfo is not None and isinstance(raw_m1, dict):
+                    completed_m1 = {**raw_m1, "timestamp": stamp}
                     for orb_session in ("ASIAN", "LONDON", "NEW_YORK"):
-
                         try:
-                            opening_range = (
-                                self.orb_strategy_engine.get_opening_range(
-                                    orb_session,
-                                    symbol,
-                                )
-                            )
-
+                            opening_range = self.orb_strategy_engine.get_opening_range(orb_session, symbol)
                             if not isinstance(opening_range, dict):
                                 continue
-
-                            range_high = opening_range.get(
-                                "opening_high",
-                                opening_range.get("high"),
-                            )
-                            range_low = opening_range.get(
-                                "opening_low",
-                                opening_range.get("low"),
-                            )
-
-                            try:
-                                range_high = float(range_high)
-                                range_low = float(range_low)
-                                candle_close = float(orb_m1_candle.get("close"))
-                            except (TypeError, ValueError):
-                                market_data["orb_analysis"]["breakouts"][
-                                    orb_session
-                                ] = {
-                                    "detected": False,
-                                    "status": "INVALID_ORB_BREAKOUT_DATA",
-                                }
+                            range_high = self._number(opening_range.get("high", opening_range.get("opening_high")))
+                            range_low = self._number(opening_range.get("low", opening_range.get("opening_low")))
+                            if range_high is None or range_low is None or range_high <= range_low:
                                 continue
 
-                            # Full candle close beyond the boundary is required.
-                            # A wick through the boundary is deliberately ignored.
-                            bullish_body_close = candle_close > range_high
-                            bearish_body_close = candle_close < range_low
+                            stored_breakout = self.orb_strategy_engine.get_detected_breakout(orb_session, symbol)
+                            if not stored_breakout:
+                                close = self._number(completed_m1.get("close"))
+                                if close is None:
+                                    continue
+                                bullish = close > range_high
+                                bearish = close < range_low
+                                if bullish or bearish:
+                                    breakout_result = self.orb_strategy_engine.detect_breakout(
+                                        session=orb_session, symbol=symbol, breakout_candle=completed_m1
+                                    )
+                                    market_data["orb_analysis"]["breakouts"][orb_session] = breakout_result
+                                    if breakout_result.get("detected") is True:
+                                        direction = (
+                                            self._dict(breakout_result.get("breakout")).get("direction")
+                                            or ("BULLISH" if bullish else "BEARISH")
+                                        )
+                                        logger.info(
+                                            "%s | ORB BREAKOUT DETECTED | Session=%s | Direction=%s | Close=%s",
+                                            symbol, orb_session, direction, close,
+                                        )
+                                        self._log_orb_once(
+                                            (orb_session, symbol), "WAITING_RETEST",
+                                            "%s | ORB WAITING FOR RETEST | Session=%s | Boundary=%s",
+                                            symbol, orb_session, range_high if direction == "BULLISH" else range_low,
+                                        )
+                                        market_data["orb_analysis"]["confirmations"][orb_session] = {
+                                            "confirmed": True,
+                                            "method": "M1_BODY_CLOSE_BEYOND_M5_OPENING_RANGE",
+                                            "direction": direction,
+                                            "timestamp": stamp.isoformat(),
+                                        }
+                                else:
+                                    market_data["orb_analysis"]["breakouts"][orb_session] = {
+                                        "detected": False, "status": "WAITING_FOR_M1_BODY_CLOSE",
+                                        "reason": "WICK_ONLY_IS_A_SWEEP_NOT_A_BREAKOUT",
+                                    }
+                                    self._log_orb_once(
+                                        (orb_session, symbol), "WAITING_BREAKOUT",
+                                        "%s | ORB WAITING FOR BREAKOUT | Session=%s | ORH=%s | ORL=%s",
+                                        symbol, orb_session, range_high, range_low,
+                                    )
+                                    continue
 
-                            if not (bullish_body_close or bearish_body_close):
-                                market_data["orb_analysis"]["breakouts"][
-                                    orb_session
-                                ] = {
-                                    "detected": False,
-                                    "status": "WAITING_FOR_M1_BODY_CLOSE",
-                                    "reason": "WICK_ONLY_IS_A_SWEEP_NOT_A_BREAKOUT",
-                                    "opening_high": range_high,
-                                    "opening_low": range_low,
-                                    "m1_close": candle_close,
-                                }
+                            breakout = self.orb_strategy_engine.get_breakout(orb_session, symbol)
+                            if not isinstance(breakout, dict):
                                 continue
+                            direction = str(breakout.get("direction", "")).upper()
+                            candidate = self.orb_strategy_engine.get_entry_candidate(orb_session, symbol, direction)
 
-                            # Each session/symbol gets one breakout only.
-                            # If the engine already recorded it, do not emit
-                            # another "breakout detected" log on later scans.
-                            get_detected = getattr(
-                                self.orb_strategy_engine,
-                                "get_detected_breakout",
-                                None,
-                            )
-                            stored_breakout = (
-                                get_detected(orb_session, symbol)
-                                if callable(get_detected)
-                                else None
-                            )
-
-                            if isinstance(stored_breakout, dict) and stored_breakout:
-                                market_data["orb_analysis"]["breakouts"][
-                                    orb_session
-                                ] = {
-                                    "detected": False,
-                                    "status": "BREAKOUT_ALREADY_RECORDED",
-                                    "breakout": stored_breakout,
-                                }
-                                continue
-
-                            # First valid M1 body-close beyond this session's
-                            # fixed M5 range records the single breakout.
-                            breakout_result = (
-                                self.orb_strategy_engine.detect_breakout(
+                            # Evaluate a fresh retest only until a candidate is created.
+                            if not isinstance(candidate, dict):
+                                if not isinstance(orb_quote, dict):
+                                    market_data["orb_analysis"]["retests"][orb_session] = {
+                                        "status": "WAITING_FOR_FRESH_BID_ASK",
+                                    }
+                                    continue
+                                entry_price = orb_quote["ask"] if direction == "BULLISH" else orb_quote["bid"]
+                                levels = self._orb_derive_levels(
+                                    m1_candles, breakout, completed_m1, entry_price, orb_quote["spread"]
+                                )
+                                if levels is None:
+                                    market_data["orb_analysis"]["retests"][orb_session] = {
+                                        "status": "WAITING_FOR_PULLBACK_STRUCTURE_AND_OPPOSING_LIQUIDITY",
+                                    }
+                                    continue
+                                retest_result = self.orb_strategy_engine.evaluate_entry(
                                     session=orb_session,
                                     symbol=symbol,
-                                    breakout_candle=orb_m1_candle,
+                                    m1_candle=completed_m1,
+                                    entry_model="CONFIRMATION",
+                                    tolerance=self._orb_retest_tolerance_price(symbol),
+                                    stop_loss=levels["stop_loss"],
+                                    liquidity_target=levels["take_profit"],
                                 )
-                            )
+                                market_data["orb_analysis"]["retests"][orb_session] = retest_result
+                                if retest_result.get("success") is True:
+                                    candidate = retest_result["candidate"]
 
-                            if isinstance(breakout_result, dict):
-                                market_data["orb_analysis"]["breakouts"][
-                                    orb_session
-                                ] = breakout_result
-
-                                if breakout_result.get("detected") is True:
-                                    breakout_details = self._dict(
-                                        breakout_result.get("breakout")
-                                    )
-                                    breakout_direction = (
-                                        breakout_result.get("direction")
-                                        or breakout_details.get("direction")
-                                        or (
-                                            "BULLISH"
-                                            if bullish_body_close
-                                            else "BEARISH"
-                                        )
-                                    )
-
-                                    logger.info(
-                                        "%s | ORB M1 body-close breakout detected | Session=%s | Direction=%s",
-                                        symbol,
-                                        orb_session,
-                                        breakout_direction,
-                                    )
-
-                                    # The M1 body-close is the breakout confirmation.
-                                    # No second structural confirmation is used.
-                                    market_data["orb_analysis"]["confirmations"][
-                                        orb_session
-                                    ] = {
-                                        "confirmed": True,
-                                        "status": "M1_BODY_CLOSE_CONFIRMED",
-                                        "confirmation_method": "M1_CLOSE_BEYOND_M5_OPENING_RANGE",
-                                        "direction": breakout_direction,
-                                        "m1_close": candle_close,
-                                        "opening_high": range_high,
-                                        "opening_low": range_low,
-                                        "timestamp": candle_time.isoformat(),
-                                    }
-
+                            if isinstance(candidate, dict):
+                                execution_result = await self._process_orb_candidate(
+                                    orb_session, symbol, candidate, orb_quote
+                                )
+                                market_data["orb_analysis"]["execution"][orb_session] = execution_result
                         except Exception as orb_exc:
-                            logger.exception(
-                                "%s | ORB breakout check failed | Session=%s | %s",
-                                symbol,
-                                orb_session,
-                                orb_exc,
-                            )
-                            market_data["orb_analysis"]["breakouts"][
-                                orb_session
-                            ] = {
-                                "detected": False,
-                                "status": "ERROR",
-                                "error": str(orb_exc),
+                            logger.exception("%s | ORB lifecycle failed | Session=%s | %s", symbol, orb_session, orb_exc)
+                            market_data["orb_analysis"]["execution"][orb_session] = {
+                                "status": "ERROR", "error": str(orb_exc),
                             }
-
             market_data["orb_analysis"]["status"] = "CHECKED"
 
             # Run both strategies before preparing SMC evidence.
