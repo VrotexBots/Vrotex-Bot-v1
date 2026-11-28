@@ -7,13 +7,13 @@ Main coordinator for the independent ORB strategy.
 
 Workflow:
 1. Detect the configured trading session.
-2. Capture the first completed M5 opening candle.
-3. Detect a full-close M5/M1 breakout from the range.
-4. Require M1 displacement and CHoCH/BOS evidence.
-5. Require validated Order Block and FVG zones.
-6. Wait for an OB/FVG retest.
-7. Generate either a limit or confirmation entry candidate.
-8. Pass candidates to central authorization and risk systems.
+2. Capture that session's first completed M5 opening candle.
+3. Detect a completed M1 candle close beyond the opening-range high or low.
+4. Wait for price to retest the broken opening-range boundary.
+5. Generate a limit or rejection/confirmation entry candidate.
+6. Pass candidates to central authorization and shared risk systems.
+
+No separate M1 CHoCH/BOS, displacement, OB/FVG or SMC confirmation is required.
 
 This module does NOT execute orders or bypass
 the central Vrotex authorization and risk controls.
@@ -46,8 +46,6 @@ class ORBStrategyEngine:
         session_engine=None,
         analysis_engine=None,
         entry_engine=None,
-        m1_swing_lookback=2,
-        m1_displacement_multiplier=1.5,
         authorization_engine=None,
         risk_gate=None,
     ):
@@ -83,10 +81,6 @@ class ORBStrategyEngine:
 
         self.strategy_status = {}
 
-        # ORB-owned M1 confirmation settings. These are configurable
-        # and do not read or inherit Master SMC decisions.
-        self.m1_swing_lookback = max(2, int(m1_swing_lookback))
-        self.m1_displacement_multiplier = max(1.0, float(m1_displacement_multiplier))
 
     # --------------------------------------------------------
     # TIME
@@ -291,238 +285,50 @@ class ORBStrategyEngine:
 
         self.detected_breakouts[key] = result.copy()
 
+        # The range-close breakout is the complete breakout confirmation.
+        # Store it directly as the active breakout; there is no second
+        # M1 structure-confirmation gate.
+        boundary = float(result["breakout_level"])
+        eligible_breakout = {
+            **result,
+            "breakout_confirmed": True,
+            "confirmation_method": "M1_CLOSE_BEYOND_SESSION_M5_OPENING_RANGE",
+            "orb_m1_confirmation_required": False,
+            "entry_zones": [{
+                "type": "ORB_RANGE_BOUNDARY",
+                "direction": result["direction"],
+                "low": boundary,
+                "high": boundary,
+                "entry_price": boundary,
+                "validated": True,
+            }],
+        }
+        self.confirmed_breakouts[key] = eligible_breakout
+
         self._set_status(
             session,
             symbol,
-            "BREAKOUT_DETECTED_WAITING_FOR_ORB_M1_CONFIRMATION",
+            "BREAKOUT_CONFIRMED_WAITING_FOR_RANGE_RETEST",
             {
                 "direction": result["direction"],
-                "breakout_level": result["breakout_level"],
+                "breakout_level": boundary,
+                "confirmation_method": eligible_breakout["confirmation_method"],
             },
         )
 
         return {
             "detected": True,
-            "reason": "BREAKOUT_WAITING_FOR_ORB_M1_CONFIRMATION",
-            "breakout": result.copy(),
+            "reason": "BREAKOUT_CONFIRMED_WAITING_FOR_RANGE_RETEST",
+            "breakout": eligible_breakout.copy(),
         }
 
     # --------------------------------------------------------
-    # ORB-OWNED M1 STRUCTURE / DISPLACEMENT / ZONES
+    # SIMPLE ORB BREAKOUT ACCEPTANCE
     # --------------------------------------------------------
 
-    @staticmethod
-    def _normalise_m1_candle(candle):
-        if not isinstance(candle, dict):
-            raise ValueError("M1 candle must be a dictionary.")
-        values = {}
-        for field in ("open", "high", "low", "close"):
-            try:
-                values[field] = float(candle[field])
-            except (KeyError, TypeError, ValueError):
-                raise ValueError(f"Invalid or missing M1 {field}.")
-        if any(v <= 0 for v in values.values()):
-            raise ValueError("M1 candle prices must be positive.")
-        if values["high"] < max(values["open"], values["close"], values["low"]):
-            raise ValueError("Invalid M1 candle high.")
-        if values["low"] > min(values["open"], values["close"], values["high"]):
-            raise ValueError("Invalid M1 candle low.")
-        stamp = candle.get("timestamp", candle.get("time"))
-        if stamp is None:
-            raise ValueError("M1 candle requires timestamp or time.")
-        if isinstance(stamp, str):
-            try:
-                stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            except ValueError:
-                raise ValueError("M1 candle time must be ISO datetime.")
-        if isinstance(stamp, (int, float)):
-            stamp = datetime.fromtimestamp(float(stamp), tz=timezone.utc)
-        if not isinstance(stamp, datetime):
-            raise ValueError("Unsupported M1 candle timestamp type.")
-        if stamp.tzinfo is None:
-            raise ValueError("M1 candle timestamp must be timezone-aware.")
-        values["timestamp"] = stamp.astimezone(timezone.utc)
-        return values
-
-    def _detect_orb_m1_evidence(self, m1_candles, direction):
-        if not isinstance(m1_candles, (list, tuple)):
-            return False, "M1_CANDLES_REQUIRED", None
-        try:
-            candles = [self._normalise_m1_candle(c) for c in m1_candles]
-        except ValueError as exc:
-            return False, str(exc), None
-        candles.sort(key=lambda c: c["timestamp"])
-        lookback = self.m1_swing_lookback
-        if len(candles) < max(5, (lookback * 2) + 1):
-            return False, "INSUFFICIENT_M1_CANDLES", None
-
-        # A pivot is confirmed only after candles exist on both sides.
-        pivots_high, pivots_low = [], []
-        for i in range(lookback, len(candles) - lookback):
-            window = candles[i-lookback:i+lookback+1]
-            current = candles[i]
-            if current["high"] == max(x["high"] for x in window):
-                pivots_high.append((i, current["high"]))
-            if current["low"] == min(x["low"] for x in window):
-                pivots_low.append((i, current["low"]))
-
-        latest = candles[-1]
-        prior = candles[:-1]
-        if not prior or not pivots_high or not pivots_low:
-            return False, "M1_SWING_POINTS_NOT_CONFIRMED", None
-
-        if direction == "BULLISH":
-            eligible = [(i, price) for i, price in pivots_high if i < len(candles)-1]
-            if not eligible:
-                return False, "M1_BULLISH_SWING_HIGH_MISSING", None
-            swing_price = eligible[-1][1]
-            structure_event = "BOS" if latest["close"] > swing_price else None
-            body = latest["close"] - latest["open"]
-        else:
-            eligible = [(i, price) for i, price in pivots_low if i < len(candles)-1]
-            if not eligible:
-                return False, "M1_BEARISH_SWING_LOW_MISSING", None
-            swing_price = eligible[-1][1]
-            structure_event = "BOS" if latest["close"] < swing_price else None
-            body = latest["open"] - latest["close"]
-
-        # CHoCH/BOS authorization requires a full candle-body close past swing.
-        if structure_event is None:
-            return False, "M1_CHOCH_BOS_BODY_CLOSE_NOT_CONFIRMED", None
-
-        ranges = [c["high"] - c["low"] for c in prior[-10:] if c["high"] > c["low"]]
-        if not ranges:
-            return False, "M1_DISPLACEMENT_BASELINE_MISSING", None
-        average_range = sum(ranges) / len(ranges)
-        if body <= 0 or body < average_range * self.m1_displacement_multiplier:
-            return False, "M1_DISPLACEMENT_NOT_CONFIRMED", None
-
-        zones = []
-        # Three-candle fair value gap, aligned with the breakout direction.
-        if len(candles) >= 3:
-            left, right = candles[-3], candles[-1]
-            if direction == "BULLISH" and right["low"] > left["high"]:
-                zones.append({"type": "FVG", "direction": direction, "low": left["high"], "high": right["low"], "validated": True})
-            elif direction == "BEARISH" and right["high"] < left["low"]:
-                zones.append({"type": "FVG", "direction": direction, "low": right["high"], "high": left["low"], "validated": True})
-
-        # Order block: last opposite-colour candle preceding the displacement candle.
-        for candidate in reversed(candles[:-1][-5:]):
-            opposite = (direction == "BULLISH" and candidate["close"] < candidate["open"]) or (direction == "BEARISH" and candidate["close"] > candidate["open"])
-            if opposite:
-                zones.append({"type": "OB", "direction": direction, "low": candidate["low"], "high": candidate["high"], "validated": True})
-                break
-
-        valid_zones = [z for z in zones if z["low"] > 0 and z["high"] > z["low"]]
-        if not valid_zones:
-            return False, "VALID_OB_OR_FVG_MISSING", None
-
-        evidence = {
-            "structure_event": structure_event,
-            "structure_direction": direction,
-            "structure_level": swing_price,
-            "displacement_confirmed": True,
-            "displacement_body": body,
-            "displacement_average_range": average_range,
-            "entry_zones": valid_zones,
-            "confirmation_candle": latest,
-            "confirmation_source": "ORB_INDEPENDENT_M1_ANALYSIS",
-        }
-        return True, "ORB_M1_CONFIRMATION_PASSED", evidence
-
-    # --------------------------------------------------------
-    # CONFIRM BREAKOUT USING ORB'S OWN M1 CANDLES
-    # --------------------------------------------------------
-
-    def confirm_breakout(
-        self,
-        session,
-        symbol,
-        m1_candles,
-    ):
-        session = str(session).upper()
-        symbol = str(symbol).upper()
-        key = self._key(session, symbol)
-        breakout = self.detected_breakouts.get(key)
-        if breakout is None:
-            return {"success": False, "reason": "BREAKOUT_NOT_DETECTED"}
-        if key in self.confirmed_breakouts:
-            return {"success": False, "reason": "BREAKOUT_ALREADY_CONFIRMED"}
-
-        # The M1 structure break and displacement belong to the breakout
-        # candle itself. Do not wait for a second CHoCH/BOS after the range
-        # breakout; doing so can delay the entry and miss the intended retest.
-        #
-        # The scanner may retry confirmation on later scans. Always cut the
-        # supplied history off at the original breakout candle so a later
-        # M1 candle cannot become a substitute confirmation event.
-        breakout_candle = breakout.get("breakout_candle")
-        if not isinstance(breakout_candle, dict):
-            reason = "ORB_BREAKOUT_M1_CANDLE_NOT_STORED"
-            self._set_status(session, symbol, reason)
-            return {"success": False, "reason": reason}
-
-        try:
-            breakout_timestamp = self._normalise_m1_candle(
-                breakout_candle
-            )["timestamp"]
-            eligible_candles = []
-            breakout_candle_found = False
-
-            for candle in m1_candles:
-                normalised = self._normalise_m1_candle(candle)
-                candle_timestamp = normalised["timestamp"]
-
-                if candle_timestamp == breakout_timestamp:
-                    breakout_candle_found = True
-
-                if candle_timestamp <= breakout_timestamp:
-                    eligible_candles.append(candle)
-
-        except (TypeError, ValueError) as exc:
-            reason = f"INVALID_ORB_BREAKOUT_M1_CANDLE_DATA: {exc}"
-            self._set_status(session, symbol, reason)
-            return {"success": False, "reason": reason}
-
-        if not breakout_candle_found:
-            reason = "ORB_BREAKOUT_CANDLE_NOT_FOUND_IN_M1_HISTORY"
-            self._set_status(session, symbol, reason)
-            return {"success": False, "reason": reason}
-
-        valid, reason, evidence = self._detect_orb_m1_evidence(
-            eligible_candles,
-            breakout["direction"],
-        )
-        if valid and evidence["confirmation_candle"]["timestamp"] != breakout_timestamp:
-            valid, reason, evidence = (
-                False,
-                "ORB_CONFIRMATION_MUST_USE_BREAKOUT_CANDLE",
-                None,
-            )
-
-        if not valid:
-            self._set_status(session, symbol, reason)
-            return {"success": False, "reason": reason}
-
-        confirmed = {
-            **breakout,
-            "smc_confirmed": False,
-            "orb_m1_confirmed": True,
-            "displacement_confirmed": True,
-            "structure_event": evidence["structure_event"],
-            "structure_direction": evidence["structure_direction"],
-            "structure_level": evidence["structure_level"],
-            "entry_zones": [dict(zone) for zone in evidence["entry_zones"]],
-            "confirmation_candle": evidence["confirmation_candle"],
-            "confirmation_source": evidence["confirmation_source"],
-            "confirmed_at": self._utc_now(),
-        }
-        self.confirmed_breakouts[key] = confirmed
-        self._set_status(
-            session, symbol, "ORB_M1_CONFIRMED_WAITING_FOR_RETEST",
-            {"direction": confirmed["direction"], "structure_event": confirmed["structure_event"]},
-        )
-        return {"success": True, "reason": "ORB_M1_CONFIRMATION_PASSED", "breakout": confirmed.copy()}
+    # A completed M1 candle closing beyond the first completed M5
+    # session-opening candle confirms the range breakout. No separate
+    # M1 CHoCH/BOS, displacement, OB, FVG or SMC confirmation is used.
 
     # --------------------------------------------------------
     # RETEST AND ENTRY CANDIDATE
@@ -562,7 +368,7 @@ class ORBStrategyEngine:
 
             return {
                 "success": False,
-                "reason": "WAITING_FOR_ORB_M1_CONFIRMED_BREAKOUT",
+                "reason": "WAITING_FOR_SESSION_OPENING_RANGE_BREAKOUT",
             }
 
         result = self.entry_engine.evaluate_retest(
@@ -720,19 +526,15 @@ class ORBStrategyEngine:
         session,
         symbol,
         direction,
-        risk_context,
+        risk_snapshot,
         *,
-        value_per_price_unit_per_lot=None,
-        spread=None,
-        maximum_spread=None,
-        spread_valid=None,
+        loss_per_lot_at_stop=None,
     ):
-        """Authorize ORB, apply shared risk checks, and size the position.
+        """Run ORB strategy authorization, then the shared Vrotex risk gate.
 
-        `risk_context` supplies account equity (dict key or object attribute).
-        Broker economics must provide value_per_price_unit_per_lot. Spread
-        must be available or explicitly prevalidated; missing inputs block
-        execution. This method never submits an order.
+        This method never places an order. It requires a fresh ORB candidate,
+        the ORB-owned central authorization route, and a live RiskSnapshot
+        supplied by the account/runtime layer.
         """
         authorization = self.authorize_entry_candidate(
             session, symbol, direction
@@ -745,64 +547,18 @@ class ORBStrategyEngine:
                 "risk_reason": "ORB_STRATEGY_AUTHORIZATION_NOT_GRANTED",
             }
 
-        if isinstance(risk_context, dict):
-            account_equity = risk_context.get("equity")
-            if spread is None:
-                spread = risk_context.get("spread")
-            if maximum_spread is None:
-                maximum_spread = risk_context.get("maximum_spread")
-            if spread_valid is None:
-                spread_valid = risk_context.get("spread_valid")
-        else:
-            account_equity = getattr(risk_context, "equity", None)
-            if spread is None:
-                spread = getattr(risk_context, "spread", None)
-            if maximum_spread is None:
-                maximum_spread = getattr(risk_context, "maximum_spread", None)
-            if spread_valid is None:
-                spread_valid = getattr(risk_context, "spread_valid", None)
-
         risk_result = self.risk_gate.evaluate_authorized_candidate(
             authorization,
-            account_equity=account_equity,
-            value_per_price_unit_per_lot=value_per_price_unit_per_lot,
-            spread=spread,
-            maximum_spread=maximum_spread,
-            spread_valid=spread_valid,
+            risk_snapshot,
+            loss_per_lot_at_stop=loss_per_lot_at_stop,
         )
-
-        risk_approved = risk_result.get("risk_approved") is True
-        volume = risk_result.get("volume_lots")
-        execution_authorized = bool(
-            risk_approved
-            and risk_result.get("position_size_required") is False
-            and volume is not None
-        )
-
-        result = {
+        return {
             **authorization,
-            "strategy": "ORB",
             "risk": risk_result,
-            "risk_approved": risk_approved,
-            "execution_authorized": execution_authorized,
+            "risk_approved": risk_result.get("risk_approved") is True,
+            "execution_authorized": False,
             "reason": risk_result.get("reason", authorization.get("reason")),
         }
-
-        if execution_authorized:
-            direction_value = str(
-                authorization.get("direction", "")
-            ).upper()
-            result.update({
-                "instrument": str(authorization.get("symbol", "")).upper(),
-                "side": "buy" if direction_value == "BULLISH" else "sell",
-                "volume": str(volume),
-                "entry_price": str(authorization.get("entry_price")),
-                "stop_loss_price": str(authorization.get("stop_loss")),
-                "take_profit_price": str(authorization.get("take_profit")),
-                "risk_percent": str(risk_result.get("risk_percent")),
-            })
-
-        return result
 
     # --------------------------------------------------------
     # RESET
