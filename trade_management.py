@@ -428,8 +428,25 @@ class TradeManager:
                   AND closed_at >= ? AND closed_at < ?
             """, (day_start, day_end)).fetchone()
 
+            recent_outcomes = db.execute("""
+                SELECT outcome
+                FROM vrotex_managed_trades
+                WHERE status = 'CLOSED'
+                  AND closed_at >= ? AND closed_at < ?
+                  AND outcome IS NOT NULL
+                ORDER BY closed_at DESC, rowid DESC
+            """, (day_start, day_end)).fetchall()
+
         trades_taken = len(rows)
         daily_losses = int(loss_rows["loss_count"] or 0)
+        consecutive_losses = 0
+        for outcome_row in recent_outcomes:
+            outcome = str(outcome_row["outcome"] or "").strip().upper()
+            if outcome == "LOSS":
+                consecutive_losses += 1
+            else:
+                # A win or breakeven ends the current losing streak.
+                break
         start_equity = float(baseline["start_of_day_equity"])
         daily_loss_percent = max(
             0.0, ((start_equity - float(equity)) / start_equity) * 100.0
@@ -455,6 +472,7 @@ class TradeManager:
             trading_day=day,
             active_instruments=active_symbols,
             pending_instruments=pending_symbols,
+            consecutive_losses_today=consecutive_losses,
         )
 
     # ==========================================================
