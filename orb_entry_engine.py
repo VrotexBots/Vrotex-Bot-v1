@@ -4,8 +4,8 @@ VROTEX BOT V1 - ORB ENTRY ENGINE
 File: orb_entry_engine.py
 
 Handles:
-1. M1 retests of validated Order Blocks and Fair Value Gaps.
-2. Option A: Limit-entry candidates.
+1. M1 retests of the broken session opening-range boundary.
+2. Option A: Limit-entry candidates at the range boundary.
 3. Option B: Rejection-candle confirmation candidates.
 4. Retest timeout protection.
 5. Stop-loss and opposing-liquidity target validation.
@@ -43,6 +43,7 @@ class ORBEntryEngine:
     VALID_ZONES = (
         "OB",
         "FVG",
+        "ORB_RANGE_BOUNDARY",
     )
 
     def __init__(self):
@@ -175,7 +176,13 @@ class ORBEntryEngine:
 
             return False
 
-        if zone_low <= 0 or zone_high <= zone_low:
+        if zone_low <= 0:
+            return False
+
+        if zone_type == "ORB_RANGE_BOUNDARY":
+            if zone_high != zone_low:
+                return False
+        elif zone_high <= zone_low:
             return False
 
         if zone.get("validated") is not True:
@@ -436,7 +443,7 @@ class ORBEntryEngine:
 
             return {
                 "success": False,
-                "reason": "NO_VALIDATED_OB_OR_FVG",
+                "reason": "NO_VALIDATED_ORB_RANGE_BOUNDARY",
             }
 
         symbol = breakout.get("symbol")
@@ -514,7 +521,7 @@ class ORBEntryEngine:
 
             return {
                 "success": False,
-                "reason": "WAITING_FOR_OB_OR_FVG_RETEST",
+                "reason": "WAITING_FOR_BROKEN_RANGE_BOUNDARY_RETEST",
             }
 
         for zone in touched_zones:
