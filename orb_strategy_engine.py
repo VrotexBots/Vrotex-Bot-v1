@@ -20,6 +20,7 @@ the central Vrotex authorization and risk controls.
 """
 
 from datetime import datetime, timezone
+import logging
 
 from orb_config import (
     ORB_ENABLED,
@@ -60,6 +61,9 @@ class ORBStrategyEngine:
         self.confirmed_breakouts = {}
 
         self.strategy_status = {}
+        self._logged_active_sessions = set()
+
+        self.logger = logging.getLogger(__name__)
 
         # ORB-owned M1 confirmation settings. These are configurable
         # and do not read or inherit Master SMC decisions.
@@ -107,6 +111,8 @@ class ORBStrategyEngine:
     ):
 
         key = self._key(session, symbol)
+        previous = self.strategy_status.get(key)
+        previous_status = previous.get("status") if previous else None
 
         self.strategy_status[key] = {
             "strategy": "ORB",
@@ -116,6 +122,25 @@ class ORBStrategyEngine:
             "details": details or {},
             "updated_at": self._utc_now(),
         }
+
+        # Log only on state transitions to avoid flooding the runtime logs
+        # when the scanner checks the same condition repeatedly.
+        if previous_status != status:
+            event_names = {
+                "OPENING_RANGE_CAPTURED": "ORB RANGE ESTABLISHED",
+                "WAITING_FOR_BREAKOUT": "ORB WAITING FOR BREAKOUT",
+                "BREAKOUT_DETECTED_WAITING_FOR_ORB_M1_CONFIRMATION": "ORB BREAKOUT DETECTED",
+                "ORB_M1_CONFIRMED_WAITING_FOR_RETEST": "ORB WAITING FOR RETEST",
+                "ENTRY_CANDIDATE_REQUIRES_CENTRAL_AUTHORIZATION": "ORB RETEST CONFIRMED",
+            }
+            event = event_names.get(status, f"ORB STATUS: {status}")
+            self.logger.info(
+                "%s | session=%s | symbol=%s | details=%s",
+                event,
+                key[0],
+                key[1],
+                details or {},
+            )
 
     def get_status(self, session, symbol):
 
@@ -151,6 +176,20 @@ class ORBStrategyEngine:
                 "available": False,
                 "reason": "SESSION_UNAVAILABLE",
             }
+
+        active_key = (
+            str(window["session"]).upper(),
+            str(window["opening_time"]),
+        )
+        if active_key not in self._logged_active_sessions:
+            self._logged_active_sessions.add(active_key)
+            self.logger.info(
+                "ORB SESSION ACTIVE | session=%s | timezone=%s | opening_time=%s | closing_time=%s",
+                window["session"],
+                window["timezone"],
+                window["opening_time"],
+                window["closing_time"],
+            )
 
         return {
             "available": True,
