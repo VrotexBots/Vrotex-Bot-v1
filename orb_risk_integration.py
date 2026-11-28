@@ -7,11 +7,14 @@ instrument economics/volume constraints. Missing inputs fail closed.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from dataclasses import asdict
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 from risk_management import RiskManager, RiskSnapshot
+from orb_position_sizer import (
+    ORBPositionSizingError, calculate_orb_position_size,
+)
 
 
 class ORBRiskIntegrationError(ValueError):
@@ -19,7 +22,7 @@ class ORBRiskIntegrationError(ValueError):
 
 
 class ORBSharedRiskGate:
-    VERSION = "3.0"
+    VERSION = "3.1"
     APPROVED_SYMBOLS = frozenset({"EURUSD", "GBPUSD", "BTCUSD"})
 
     def __init__(self, risk_manager: Optional[RiskManager] = None):
@@ -42,29 +45,23 @@ class ORBSharedRiskGate:
             raise ORBRiskIntegrationError("A complete risk_management.RiskSnapshot is required.")
         return asdict(snapshot)
 
-    @staticmethod
-    def _floor_to_step(volume: Decimal, step: Decimal) -> Decimal:
-        units = (volume / step).to_integral_value(rounding=ROUND_DOWN)
-        return units * step
-
     def evaluate_authorized_candidate(
         self,
         authorization: dict,
         *,
         snapshot: RiskSnapshot,
-        loss_per_lot_at_stop: Any,
-        broker_volume_min: Any,
-        broker_volume_max: Any,
-        broker_volume_step: Any,
+        instrument_conditions: dict,
+        account_currency: str,
+        quote_to_account_rate: Any = None,
         spread: Any = None,
         maximum_spread: Any = None,
         spread_valid: Optional[bool] = None,
     ) -> dict:
         """Apply shared daily/account limits and size only from verified inputs.
 
-        `loss_per_lot_at_stop` is the account-currency loss for 1.0 lot at the
-        candidate stop, including contract/tick economics and currency conversion.
-        It must be obtained from broker data; this module never guesses it.
+        Position size is calculated by orb_position_sizer from exact Exness
+        instrument conditions and a verified quote-to-account conversion rate.
+        The module does not accept caller-supplied loss-per-lot or volume limits.
         """
         if not isinstance(authorization, dict):
             raise ORBRiskIntegrationError("authorization must be a dictionary.")
@@ -96,46 +93,30 @@ class ORBSharedRiskGate:
 
         try:
             snapshot_data = self._snapshot_dict(snapshot)
-            allowed, reason = self.risk_manager.can_open_orb_trade(
-                snapshot,
-                strategy_authorized=True,
-                instrument=symbol,
-            )
+            allowed, reason = self._check_orb_shared_limits(snapshot, symbol)
         except Exception as exc:
             return self._reject(symbol, f"RISK_SNAPSHOT_INVALID: {exc}")
         if not allowed:
             return self._reject(symbol, reason, risk_snapshot=snapshot_data)
 
-        loss_per_lot = self._decimal(loss_per_lot_at_stop, "loss_per_lot_at_stop")
-        volume_min = self._decimal(broker_volume_min, "broker_volume_min")
-        volume_max = self._decimal(broker_volume_max, "broker_volume_max")
-        volume_step = self._decimal(broker_volume_step, "broker_volume_step")
-        if volume_max < volume_min:
-            raise ORBRiskIntegrationError("Broker maximum volume is below minimum volume.")
-
-        stop_distance = abs(entry - stop)
-        if stop_distance <= 0:
-            return self._reject(symbol, "STOP_DISTANCE_INVALID")
-
-        sized = self.risk_manager.calculate_position_size(
-            equity=float(snapshot.equity),
-            stop_loss_distance=float(stop_distance),
-            loss_per_lot_at_stop=float(loss_per_lot),
-        )
-        raw_volume = Decimal(str(sized.volume_lots))
-        volume = self._floor_to_step(min(raw_volume, volume_max), volume_step)
-        if volume < volume_min:
-            return self._reject(
-                symbol,
-                "RISK_SIZED_VOLUME_BELOW_BROKER_MINIMUM",
-                raw_volume=str(raw_volume),
-                broker_volume_min=str(volume_min),
+        try:
+            sized = calculate_orb_position_size(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry,
+                stop_loss=stop,
+                equity=snapshot.equity,
+                account_currency=account_currency,
+                instrument_conditions=instrument_conditions,
+                quote_to_account_rate=quote_to_account_rate,
+                risk_percent=self.risk_manager.risk_percent,
             )
-        if volume <= 0 or volume > volume_max:
-            return self._reject(symbol, "BROKER_VOLUME_CONSTRAINT_FAILED")
+        except ORBPositionSizingError as exc:
+            return self._reject(symbol, f"POSITION_SIZING_REJECTED: {exc}")
 
-        actual_risk_amount = volume * loss_per_lot
-        risk_percent = (actual_risk_amount / Decimal(str(snapshot.equity))) * Decimal("100")
+        volume = sized.volume_lots
+        actual_risk_amount = sized.volume_lots * sized.loss_per_lot_at_stop
+        risk_percent = (actual_risk_amount / sized.equity) * Decimal("100")
         if risk_percent > Decimal(str(self.risk_manager.risk_percent)):
             return self._reject(symbol, "ROUNDED_VOLUME_EXCEEDS_APPROVED_RISK")
 
@@ -151,16 +132,39 @@ class ORBSharedRiskGate:
             "volume_lots": float(volume),
             "risk_percent": float(risk_percent),
             "risk_amount": float(actual_risk_amount),
-            "loss_per_lot_at_stop": float(loss_per_lot),
-            "stop_distance": float(stop_distance),
-            "broker_volume": {
-                "minimum": str(volume_min),
-                "maximum": str(volume_max),
-                "step": str(volume_step),
+            "loss_per_lot_at_stop": float(sized.loss_per_lot_at_stop),
+            "stop_distance": float(sized.stop_distance),
+            "position_sizing": {
+                "account_currency": sized.account_currency,
+                "quote_currency": sized.quote_currency,
+                "quote_to_account_rate": str(sized.quote_to_account_rate),
+                "contract_size": str(sized.contract_size),
+                "raw_volume_lots": str(sized.raw_volume_lots),
+                "volume_min": str(sized.volume_min),
+                "volume_max": str(sized.volume_max),
+                "volume_step": str(sized.volume_step),
             },
             "risk_snapshot": snapshot_data,
             "reason": "ORB_SHARED_RISK_AND_BROKER_VOLUME_CHECKS_PASSED",
         }
+
+    def _check_orb_shared_limits(self, snapshot: RiskSnapshot, symbol: str) -> tuple[bool, str]:
+        """Apply shared daily limits without imposing SMC's A+ requirement on ORB."""
+        self.risk_manager._validate_snapshot(snapshot)
+        if snapshot.daily_loss_percent >= self.risk_manager.max_daily_loss_percent:
+            return False, "BLOCKED: maximum daily loss limit reached."
+        if snapshot.daily_losses_today >= self.risk_manager.max_daily_losses:
+            return False, "BLOCKED: second daily loss reached; learning-only until next trading day."
+        if snapshot.trades_taken_today >= self.risk_manager.max_trades_per_day:
+            return False, "BLOCKED: maximum daily trade count reached."
+        if (self.risk_manager.max_open_trades is not None
+                and snapshot.open_trade_count >= self.risk_manager.max_open_trades):
+            return False, "BLOCKED: configured simultaneous open-trade limit reached."
+        reserved = {item.strip().upper() for item in
+                    (*snapshot.active_instruments, *snapshot.pending_instruments)}
+        if symbol in reserved:
+            return False, f"BLOCKED: {symbol} already has an open position or pending entry order."
+        return True, "APPROVED: ORB shared risk limits passed."
 
     @staticmethod
     def _reject(symbol: str, reason: str, **details: Any) -> dict:
