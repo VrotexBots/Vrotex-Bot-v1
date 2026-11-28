@@ -305,15 +305,69 @@ class ExnessOrderExecutor:
                 if len(quote_currency) != 3:
                     return False, "ORB execution blocked: Exness quote currency missing"
 
-                # Only identity conversion is currently verifiable from the
-                # broker data returned by this connection. Never accept a
-                # caller-supplied conversion rate/source as proof.
-                if quote_currency != account_currency:
-                    return False, (
-                        f"ORB execution blocked: verified live {quote_currency}->{account_currency} "
-                        "conversion is not available from the Exness connection"
+                # Resolve non-identity conversions from fresh bid/ask quotes
+                # supplied by the existing live tick engine. Do not accept
+                # conversion rates supplied by a strategy/setup payload.
+                from currency_conversion_engine import (
+                    currency_conversion_engine,
+                    CurrencyConversionError,
+                )
+
+                async def conversion_quote_provider(pair_symbol):
+                    # Prefer an explicit broker conversion-quote method if the
+                    # connection exposes one; otherwise use the existing live
+                    # Exness tick engine's cache for auxiliary FX pairs.
+                    broker_method = getattr(self.connection, "get_conversion_quote", None)
+                    if callable(broker_method):
+                        quote = broker_method(pair_symbol)
+                        if asyncio.iscoroutine(quote):
+                            quote = await quote
+                        if isinstance(quote, dict):
+                            return quote
+
+                    try:
+                        from market_data_engine import market_data_engine
+                        tick_engine = getattr(market_data_engine, "tick_engine", None)
+                        getter = getattr(tick_engine, "get_tick", None)
+                        if callable(getter):
+                            quote = getter(pair_symbol)
+                            if asyncio.iscoroutine(quote):
+                                quote = await quote
+                            if isinstance(quote, dict):
+                                normalized_quote = dict(quote)
+                                normalized_quote.setdefault("symbol", pair_symbol)
+                                return normalized_quote
+                    except Exception as feed_exc:
+                        logger.warning(
+                            "CURRENCY_CONVERSION_FEED_UNAVAILABLE | %s | %s",
+                            pair_symbol, feed_exc,
+                        )
+                    return None
+
+                try:
+                    conversion = await currency_conversion_engine.get_conversion(
+                        quote_currency,
+                        account_currency,
+                        quote_provider=conversion_quote_provider,
                     )
-                conversion_rate = Decimal("1")
+                except CurrencyConversionError as conversion_exc:
+                    logger.error(
+                        "ORB_CURRENCY_CONVERSION_BLOCKED | %s->%s | %s",
+                        quote_currency, account_currency, conversion_exc,
+                    )
+                    return False, (
+                        f"ORB execution blocked: {quote_currency}->{account_currency} "
+                        f"conversion unavailable: {conversion_exc}"
+                    )
+                conversion_rate = conversion.rate
+                logger.info(
+                    "ORB_CURRENCY_CONVERSION_VERIFIED | account=%s | quote=%s | rate=%s | pair=%s | age=%.3fs",
+                    account_currency,
+                    quote_currency,
+                    conversion_rate,
+                    conversion.source_symbol,
+                    conversion.age_seconds,
+                )
 
                 direction = "BULLISH" if setup.get("side") == "buy" else "BEARISH"
                 authorization = {
@@ -337,6 +391,7 @@ class ExnessOrderExecutor:
                 if risk_result.get("success") is not True:
                     return False, str(risk_result.get("reason", "ORB shared risk gate rejected"))
 
+                risk_result["currency_conversion"] = conversion.as_dict()
                 setup["risk"] = risk_result
                 setup["risk_approved"] = True
                 setup["execution_authorized"] = True
