@@ -2291,6 +2291,11 @@ class MarketScanner:
                         ] = existing_range
                         continue
 
+                    # Select only the M5 candle whose timestamp exactly
+                    # matches this session's opening time. No later M5 candle
+                    # is considered part of the opening range.
+                    opening_candle = None
+
                     for candle in m5_candles:
 
                         if not isinstance(candle, dict):
@@ -2312,27 +2317,31 @@ class MarketScanner:
                         if candle_time.tzinfo is None:
                             continue
 
-                        orb_candle = {
-                            **candle,
-                            "timestamp": candle_time,
-                        }
-
-                        capture_result = (
-                            self.orb_strategy_engine.capture_opening_range(
-                                session=orb_session,
-                                symbol=symbol,
-                                m5_candle=orb_candle,
-                                now=orb_now,
-                            )
-                        )
-
-                        if isinstance(capture_result, dict) and (
-                            capture_result.get("success") is True
-                        ):
-                            market_data["orb_analysis"]["opening_ranges"][
-                                orb_session
-                            ] = capture_result
+                        if candle_time == opening_time:
+                            opening_candle = {
+                                **candle,
+                                "timestamp": candle_time,
+                            }
                             break
+
+                    if opening_candle is None:
+                        continue
+
+                    capture_result = (
+                        self.orb_strategy_engine.capture_opening_range(
+                            session=orb_session,
+                            symbol=symbol,
+                            m5_candle=opening_candle,
+                            now=orb_now,
+                        )
+                    )
+
+                    if isinstance(capture_result, dict) and (
+                        capture_result.get("success") is True
+                    ):
+                        market_data["orb_analysis"]["opening_ranges"][
+                            orb_session
+                        ] = capture_result
 
                 except Exception as orb_exc:
                     logger.exception(
@@ -2438,39 +2447,39 @@ class MarketScanner:
                                 }
                                 continue
 
-                            # Reuse an already-recorded valid breakout when available.
-                            breakout_result = None
+                            # Each session/symbol gets one breakout only.
+                            # If the engine already recorded it, do not emit
+                            # another "breakout detected" log on later scans.
                             get_detected = getattr(
                                 self.orb_strategy_engine,
                                 "get_detected_breakout",
                                 None,
                             )
+                            stored_breakout = (
+                                get_detected(orb_session, symbol)
+                                if callable(get_detected)
+                                else None
+                            )
 
-                            if callable(get_detected):
-                                stored_breakout = get_detected(
-                                    orb_session,
-                                    symbol,
+                            if isinstance(stored_breakout, dict) and stored_breakout:
+                                market_data["orb_analysis"]["breakouts"][
+                                    orb_session
+                                ] = {
+                                    "detected": False,
+                                    "status": "BREAKOUT_ALREADY_RECORDED",
+                                    "breakout": stored_breakout,
+                                }
+                                continue
+
+                            # First valid M1 body-close beyond this session's
+                            # fixed M5 range records the single breakout.
+                            breakout_result = (
+                                self.orb_strategy_engine.detect_breakout(
+                                    session=orb_session,
+                                    symbol=symbol,
+                                    breakout_candle=orb_m1_candle,
                                 )
-
-                                if isinstance(stored_breakout, dict) and stored_breakout:
-                                    breakout_result = (
-                                        stored_breakout
-                                        if stored_breakout.get("detected") is True
-                                        else {
-                                            "detected": True,
-                                            "breakout": stored_breakout,
-                                            "reason": "STORED_ORB_BREAKOUT",
-                                        }
-                                    )
-
-                            if breakout_result is None:
-                                breakout_result = (
-                                    self.orb_strategy_engine.detect_breakout(
-                                        session=orb_session,
-                                        symbol=symbol,
-                                        breakout_candle=orb_m1_candle,
-                                    )
-                                )
+                            )
 
                             if isinstance(breakout_result, dict):
                                 market_data["orb_analysis"]["breakouts"][
@@ -2499,7 +2508,7 @@ class MarketScanner:
                                     )
 
                                     # The M1 body-close is the breakout confirmation.
-                                    # Do not call confirm_breakout / CHoCH / BOS here.
+                                    # No second structural confirmation is used.
                                     market_data["orb_analysis"]["confirmations"][
                                         orb_session
                                     ] = {
