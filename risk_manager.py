@@ -63,13 +63,11 @@ class RiskManager:
             2.0,
         )
 
-        self.max_open_trades = self._optional_setting(
-            "MAX_OPEN_TRADES"
-        )
-
-        self.max_total_open_risk_percent = self._optional_setting(
-            "MAX_TOTAL_OPEN_RISK_PERCENT"
-        )
+        # Vrotex V1 permits simultaneous positions on different instruments.
+        # The per-instrument guard below prevents duplicates; a global open-
+        # trade or aggregate-risk cap must not silently override that rule.
+        self.max_open_trades = None
+        self.max_total_open_risk_percent = None
 
         self.max_spread = self._first_setting(
             (
@@ -94,6 +92,7 @@ class RiskManager:
 
         self.active_trades = 0
         self.open_trade_risks = {}
+        self.pending_instruments = set()
 
         self.locked = False
         self.lock_reason = None
@@ -200,7 +199,7 @@ class RiskManager:
     # GLOBAL TRADING LIMITS
     # =====================================================
 
-    def can_trade(self):
+    def can_trade(self, symbol=None):
 
         with self._lock:
 
@@ -228,18 +227,14 @@ class RiskManager:
             if self.max_risk_percent > 1.0:
                 return False, "Risk exceeds 1% safety cap"
 
-            if (
-                self.max_open_trades is not None
-                and self.active_trades >= self.max_open_trades
-            ):
-                return False, "Maximum open trades reached"
-
-            if (
-                self.max_total_open_risk_percent is not None
-                and self.get_total_open_risk()
-                >= self.max_total_open_risk_percent
-            ):
-                return False, "Maximum total open risk reached"
+            if symbol is not None:
+                key = str(symbol).strip().upper()
+                if not key:
+                    return False, "Invalid instrument symbol"
+                if key in self.open_trade_risks:
+                    return False, "An active trade already exists for this instrument"
+                if key in self.pending_instruments:
+                    return False, "A pending trade already exists for this instrument"
 
             return True, "Risk checks passed"
 
@@ -602,7 +597,7 @@ class RiskManager:
         spread_valid=None,
     ):
 
-        allowed, reason = self.can_trade()
+        allowed, reason = self.can_trade(symbol=symbol)
 
         stop_valid, stop_reason = self.validate_stop_loss(
             direction,
@@ -864,73 +859,95 @@ class RiskManager:
         risk_percent=None,
     ):
 
-        allowed, reason = self.can_trade()
-
-        if not allowed:
-            logger.warning(
-                "Trade registration blocked: %s",
-                reason,
-            )
+        key = str(symbol).strip().upper() if symbol is not None else None
+        if symbol is not None and not key:
             return False
 
-        if risk_percent is not None:
+        with self._lock:
+            # A pending reservation for this same instrument is promoted
+            # atomically when its order becomes an active position.
+            had_pending_reservation = key is not None and key in self.pending_instruments
+            if had_pending_reservation:
+                self.pending_instruments.discard(key)
 
-            valid, risk_reason = self.validate_trade_risk(
-                risk_percent
-            )
-
-            if not valid:
-                logger.warning(
-                    "Trade registration blocked: %s",
-                    risk_reason,
-                )
+            allowed, reason = self.can_trade(symbol=key)
+            if not allowed:
+                if had_pending_reservation:
+                    self.pending_instruments.add(key)
+                logger.warning("Trade registration blocked: %s", reason)
                 return False
 
-        with self._lock:
+            if risk_percent is not None:
+                valid, risk_reason = self.validate_trade_risk(risk_percent)
+                if not valid:
+                    if had_pending_reservation:
+                        self.pending_instruments.add(key)
+                    logger.warning("Trade registration blocked: %s", risk_reason)
+                    return False
 
             if self.daily_trades >= self.max_daily_trades:
+                if had_pending_reservation:
+                    self.pending_instruments.add(key)
+                logger.warning("Trade registration blocked: daily trade limit reached")
                 return False
 
             self.daily_trades += 1
             self.active_trades += 1
-
-            if symbol is not None and risk_percent is not None:
-                self.open_trade_risks[str(symbol)] = (
-                    self._number(risk_percent)
+            if key is not None:
+                self.open_trade_risks[key] = (
+                    self._number(risk_percent) if risk_percent is not None else None
                 )
+                self.pending_instruments.discard(key)
 
         logger.info(
-            "Trade registered | Symbol=%s | "
-            "Daily trades=%s | Active trades=%s",
-            symbol,
-            self.daily_trades,
-            self.active_trades,
+            "Trade registered | Symbol=%s | Daily trades=%s | Active trades=%s",
+            key, self.daily_trades, self.active_trades,
         )
-
         return True
 
-    # =====================================================
-    # POSITION CLOSURE
-    # =====================================================
+    def reserve_pending_trade(self, symbol):
+        """Reserve an instrument while an order is pending; one per symbol."""
+        key = str(symbol or "").strip().upper()
+        if not key:
+            return False, "Invalid instrument symbol"
+        with self._lock:
+            allowed, reason = self.can_trade(symbol=key)
+            if not allowed:
+                return False, reason
+            self.pending_instruments.add(key)
+            return True, "Pending instrument reserved"
+
+    def release_pending_trade(self, symbol):
+        """Release a pending reservation after rejection or cancellation."""
+        key = str(symbol or "").strip().upper()
+        if not key:
+            return False
+        with self._lock:
+            existed = key in self.pending_instruments
+            self.pending_instruments.discard(key)
+            return existed
 
     def register_trade_closed(self, symbol=None):
-
         with self._lock:
+            if symbol is None:
+                if self.active_trades > 0:
+                    self.active_trades -= 1
+                return True
 
+            key = str(symbol).strip().upper()
+            if key not in self.open_trade_risks:
+                logger.warning("Ignored close for unregistered instrument: %s", key)
+                return False
+
+            self.open_trade_risks.pop(key, None)
             if self.active_trades > 0:
                 self.active_trades -= 1
 
-            if symbol is not None:
-                self.open_trade_risks.pop(
-                    str(symbol),
-                    None,
-                )
-
         logger.info(
             "Trade closed | Symbol=%s | Active trades=%s",
-            symbol,
-            self.active_trades,
+            key, self.active_trades,
         )
+        return True
 
     def get_total_open_risk(self):
 
@@ -1120,6 +1137,7 @@ class RiskManager:
                 "open_trade_risks": dict(
                     self.open_trade_risks
                 ),
+                "pending_instruments": sorted(self.pending_instruments),
                 "total_open_risk_percent": (
                     self.get_total_open_risk()
                 ),
