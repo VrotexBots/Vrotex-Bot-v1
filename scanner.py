@@ -2349,8 +2349,10 @@ class MarketScanner:
                         "error": str(orb_exc),
                     }
 
-            # ORB: Check the latest safely completed M1 candle.
-            # The newest candle may still be forming, so use M1[-2].
+            # ORB: Use the latest safely completed M1 candle for breakout.
+            # M5 establishes the opening range; M1 confirms a breakout only
+            # when its candle CLOSES beyond the range boundary. A wick alone
+            # is a sweep, not a breakout. No separate CHoCH/BOS confirmation.
             m1_candles = self._list(
                 self._dict(market_data.get("M1")).get("candles")
             )
@@ -2375,6 +2377,7 @@ class MarketScanner:
                 if (
                     isinstance(candle_time, datetime)
                     and candle_time.tzinfo is not None
+                    and isinstance(candle, dict)
                 ):
 
                     orb_m1_candle = {
@@ -2392,12 +2395,50 @@ class MarketScanner:
                                 )
                             )
 
-                            if not opening_range:
+                            if not isinstance(opening_range, dict):
                                 continue
 
-                            # Reuse a previously detected breakout when available.
-                            # This is important because M1 confirmation may need
-                            # a later completed candle after the initial break.
+                            range_high = opening_range.get(
+                                "opening_high",
+                                opening_range.get("high"),
+                            )
+                            range_low = opening_range.get(
+                                "opening_low",
+                                opening_range.get("low"),
+                            )
+
+                            try:
+                                range_high = float(range_high)
+                                range_low = float(range_low)
+                                candle_close = float(orb_m1_candle.get("close"))
+                            except (TypeError, ValueError):
+                                market_data["orb_analysis"]["breakouts"][
+                                    orb_session
+                                ] = {
+                                    "detected": False,
+                                    "status": "INVALID_ORB_BREAKOUT_DATA",
+                                }
+                                continue
+
+                            # Full candle close beyond the boundary is required.
+                            # A wick through the boundary is deliberately ignored.
+                            bullish_body_close = candle_close > range_high
+                            bearish_body_close = candle_close < range_low
+
+                            if not (bullish_body_close or bearish_body_close):
+                                market_data["orb_analysis"]["breakouts"][
+                                    orb_session
+                                ] = {
+                                    "detected": False,
+                                    "status": "WAITING_FOR_M1_BODY_CLOSE",
+                                    "reason": "WICK_ONLY_IS_A_SWEEP_NOT_A_BREAKOUT",
+                                    "opening_high": range_high,
+                                    "opening_low": range_low,
+                                    "m1_close": candle_close,
+                                }
+                                continue
+
+                            # Reuse an already-recorded valid breakout when available.
                             breakout_result = None
                             get_detected = getattr(
                                 self.orb_strategy_engine,
@@ -2418,7 +2459,7 @@ class MarketScanner:
                                         else {
                                             "detected": True,
                                             "breakout": stored_breakout,
-                                            "reason": "STORED_ORB_BREAKOUT_AWAITING_CONFIRMATION",
+                                            "reason": "STORED_ORB_BREAKOUT",
                                         }
                                     )
 
@@ -2443,67 +2484,34 @@ class MarketScanner:
                                     breakout_direction = (
                                         breakout_result.get("direction")
                                         or breakout_details.get("direction")
+                                        or (
+                                            "BULLISH"
+                                            if bullish_body_close
+                                            else "BEARISH"
+                                        )
                                     )
 
                                     logger.info(
-                                        "%s | ORB breakout detected | Session=%s | Direction=%s",
+                                        "%s | ORB M1 body-close breakout detected | Session=%s | Direction=%s",
                                         symbol,
                                         orb_session,
                                         breakout_direction,
                                     )
 
-                                    # Only completed M1 candles are supplied.
-                                    # The latest candle is excluded because it may
-                                    # still be forming. The ORB engine independently
-                                    # checks that confirmation occurs after breakout.
-                                    confirmation_method = getattr(
-                                        self.orb_strategy_engine,
-                                        "confirm_breakout",
-                                        None,
-                                    )
-
-                                    if callable(confirmation_method):
-                                        confirmation_result = (
-                                            confirmation_method(
-                                                session=orb_session,
-                                                symbol=symbol,
-                                                m1_candles=m1_candles[:-1],
-                                            )
-                                        )
-
-                                        if not isinstance(confirmation_result, dict):
-                                            confirmation_result = {
-                                                "confirmed": False,
-                                                "status": "INVALID_CONFIRMATION_RESPONSE",
-                                                "raw_result": str(confirmation_result),
-                                            }
-                                    else:
-                                        confirmation_result = {
-                                            "confirmed": False,
-                                            "status": "CONFIRMATION_METHOD_UNAVAILABLE",
-                                        }
-
+                                    # The M1 body-close is the breakout confirmation.
+                                    # Do not call confirm_breakout / CHoCH / BOS here.
                                     market_data["orb_analysis"]["confirmations"][
                                         orb_session
-                                    ] = confirmation_result
-
-                                    if confirmation_result.get("confirmed") is True:
-                                        logger.info(
-                                            "%s | ORB independent M1 confirmation PASSED | Session=%s | Direction=%s",
-                                            symbol,
-                                            orb_session,
-                                            breakout_direction,
-                                        )
-                                    else:
-                                        logger.info(
-                                            "%s | ORB independent M1 confirmation pending | Session=%s | Reason=%s",
-                                            symbol,
-                                            orb_session,
-                                            confirmation_result.get(
-                                                "reason",
-                                                confirmation_result.get("status", "NOT_CONFIRMED"),
-                                            ),
-                                        )
+                                    ] = {
+                                        "confirmed": True,
+                                        "status": "M1_BODY_CLOSE_CONFIRMED",
+                                        "confirmation_method": "M1_CLOSE_BEYOND_M5_OPENING_RANGE",
+                                        "direction": breakout_direction,
+                                        "m1_close": candle_close,
+                                        "opening_high": range_high,
+                                        "opening_low": range_low,
+                                        "timestamp": candle_time.isoformat(),
+                                    }
 
                         except Exception as orb_exc:
                             logger.exception(
