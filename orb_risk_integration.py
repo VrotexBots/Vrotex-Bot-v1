@@ -153,8 +153,8 @@ class ORBSharedRiskGate:
         self.risk_manager._validate_snapshot(snapshot)
         if snapshot.daily_loss_percent >= self.risk_manager.max_daily_loss_percent:
             return False, "BLOCKED: maximum daily loss limit reached."
-        if snapshot.daily_losses_today >= self.risk_manager.max_daily_losses:
-            return False, "BLOCKED: second daily loss reached; learning-only until next trading day."
+        if snapshot.consecutive_losses_today >= self.risk_manager.max_daily_losses:
+            return False, "BLOCKED: two consecutive losses reached; learning-only until next trading day."
         if snapshot.trades_taken_today >= self.risk_manager.max_trades_per_day:
             return False, "BLOCKED: maximum daily trade count reached."
         if (self.risk_manager.max_open_trades is not None
