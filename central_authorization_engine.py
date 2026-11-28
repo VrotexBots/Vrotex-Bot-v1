@@ -28,7 +28,7 @@ class CentralAuthorizationEngine:
     ORB_SESSIONS = ("ASIAN", "LONDON", "NEW_YORK")
     ORB_DIRECTIONS = ("BULLISH", "BEARISH")
     ORB_ENTRY_MODELS = ("LIMIT", "CONFIRMATION")
-    ORB_ZONE_TYPES = ("OB", "FVG")
+    ORB_ZONE_TYPES = ("ORB_RANGE_BOUNDARY",)
 
     def __init__(self, allowed_orb_symbols: Optional[Iterable[str]] = None):
         symbols = allowed_orb_symbols or self.ORB_SYMBOLS
@@ -89,11 +89,12 @@ class CentralAuthorizationEngine:
         breakout: dict,
         opening_range: Optional[dict] = None,
     ) -> dict:
-        """Authorize an ORB candidate using ORB evidence only.
+        """Authorize an ORB retest using only the approved ORB rule set.
 
-        Required inputs are the ORB entry candidate and the confirmed ORB
-        breakout returned by ORBStrategyEngine.get_breakout(session, symbol).
-        No SMC result, SMC score, or SMC evidence is accepted or consulted.
+        A completed M1 close beyond the fixed first-session M5 range candle
+        confirms the breakout. A later M1 retest of that same boundary plus
+        the selected entry model produces the candidate. No SMC, BOS/CHoCH,
+        displacement, OB/FVG, or A+ score is required here.
         """
         candidate = self._dict(candidate)
         breakout = self._dict(breakout)
@@ -124,46 +125,46 @@ class CentralAuthorizationEngine:
             return reject("INVALID_ORB_DIRECTION")
         if entry_model not in self.ORB_ENTRY_MODELS:
             return reject("UNAPPROVED_ORB_ENTRY_MODEL")
-        if order_type not in ("LIMIT", "MARKET"):
-            return reject("UNAPPROVED_ORB_ORDER_TYPE")
-        if zone_type not in self.ORB_ZONE_TYPES:
-            return reject("ENTRY_ZONE_MUST_BE_OB_OR_FVG")
+        if zone_type != "ORB_RANGE_BOUNDARY":
+            return reject("ENTRY_ZONE_MUST_BE_ORB_RANGE_BOUNDARY")
         if candidate.get("success") is not True:
             return reject("ENTRY_CANDIDATE_NOT_SUCCESSFUL")
 
-        # Require the ORB engine's own confirmed breakout and M1 evidence.
-        if breakout.get("orb_m1_confirmed") is not True:
-            return reject("ORB_OWN_M1_CONFIRMATION_MISSING")
-        if breakout.get("displacement_confirmed") is not True:
-            return reject("ORB_DISPLACEMENT_NOT_CONFIRMED")
-        if str(breakout.get("confirmation_source", "")).upper() != "ORB_INDEPENDENT_M1_ANALYSIS":
-            return reject("ORB_CONFIRMATION_SOURCE_INVALID")
-        if str(breakout.get("direction", "")).upper() != direction:
+        expected_orders = (
+            {"BUY", "BUY_LIMIT"} if direction == "BULLISH"
+            else {"SELL", "SELL_LIMIT"}
+        )
+        if order_type not in expected_orders:
+            return reject("ORDER_SIDE_DOES_NOT_MATCH_BREAKOUT_DIRECTION")
+        if entry_model == "CONFIRMATION" and order_type not in {"BUY", "SELL"}:
+            return reject("CONFIRMATION_ENTRY_MUST_BE_MARKET_SIDE")
+        if entry_model == "LIMIT" and order_type not in {"BUY_LIMIT", "SELL_LIMIT"}:
+            return reject("LIMIT_ENTRY_MUST_USE_LIMIT_ORDER_SIDE")
+
+        if breakout.get("detected") is not True or breakout.get("breakout_confirmed") is not True:
+            return reject("ORB_RANGE_BREAKOUT_NOT_CONFIRMED")
+        if str(breakout.get("direction", "")).strip().upper() != direction:
             return reject("BREAKOUT_DIRECTION_MISMATCH")
-        if str(breakout.get("session", session)).upper() != session:
+        if str(breakout.get("session", session)).strip().upper() != session:
             return reject("BREAKOUT_SESSION_MISMATCH")
-        if str(breakout.get("symbol", symbol)).upper() != symbol:
+        if str(breakout.get("symbol", symbol)).strip().upper() != symbol:
             return reject("BREAKOUT_SYMBOL_MISMATCH")
-        if str(breakout.get("structure_direction", "")).upper() != direction:
-            return reject("ORB_M1_STRUCTURE_DIRECTION_MISMATCH")
-        if str(breakout.get("structure_event", "")).upper() not in ("BOS", "CHOCH"):
-            return reject("ORB_M1_STRUCTURE_BREAK_MISSING")
 
         zones = breakout.get("entry_zones")
         if not isinstance(zones, (list, tuple)):
-            return reject("VALIDATED_ORB_OB_OR_FVG_MISSING")
+            return reject("ORB_RANGE_BOUNDARY_ZONE_MISSING")
         matching_zones = [
             zone for zone in zones
             if isinstance(zone, dict)
-            and str(zone.get("type", "")).upper() == zone_type
-            and str(zone.get("direction", "")).upper() == direction
+            and str(zone.get("type", "")).strip().upper() == "ORB_RANGE_BOUNDARY"
+            and str(zone.get("direction", "")).strip().upper() == direction
             and zone.get("validated") is True
             and self._number(zone.get("low")) is not None
             and self._number(zone.get("high")) is not None
-            and self._number(zone.get("high")) > self._number(zone.get("low"))
+            and abs(self._number(zone.get("high")) - self._number(zone.get("low"))) <= 1e-10
         ]
         if not matching_zones:
-            return reject("VALIDATED_ORB_OB_OR_FVG_MISSING")
+            return reject("VALIDATED_ORB_RANGE_BOUNDARY_MISSING")
 
         entry = self._number(candidate.get("entry_price"))
         stop = self._number(candidate.get("stop_loss"))
@@ -174,19 +175,19 @@ class CentralAuthorizationEngine:
             return reject("ENTRY_STOP_TARGET_OR_ZONE_PRICE_MISSING")
         if min(entry, stop, target, zone_low, zone_high) <= 0:
             return reject("TRADE_LEVELS_MUST_BE_POSITIVE")
-        if zone_high <= zone_low or not (zone_low <= entry <= zone_high):
-            return reject("ENTRY_PRICE_OUTSIDE_SELECTED_ORB_ZONE")
+        if abs(zone_high - zone_low) > 1e-10:
+            return reject("ORB_RANGE_BOUNDARY_MUST_BE_A_SINGLE_PRICE")
         if not any(
             abs(self._number(zone.get("low")) - zone_low) <= 1e-10
             and abs(self._number(zone.get("high")) - zone_high) <= 1e-10
             for zone in matching_zones
         ):
-            return reject("CANDIDATE_ZONE_DOES_NOT_MATCH_CONFIRMED_ORB_ZONE")
+            return reject("CANDIDATE_ZONE_DOES_NOT_MATCH_CONFIRMED_ORB_BOUNDARY")
         if direction == "BULLISH" and not (stop < entry < target):
             return reject("BULLISH_TRADE_LEVELS_INVALID")
         if direction == "BEARISH" and not (target < entry < stop):
             return reject("BEARISH_TRADE_LEVELS_INVALID")
-        if str(candidate.get("target_type", "")).upper() != "OPPOSING_LIQUIDITY":
+        if str(candidate.get("target_type", "")).strip().upper() != "OPPOSING_LIQUIDITY":
             return reject("TARGET_MUST_BE_OPPOSING_LIQUIDITY")
 
         retest = self._dict(candidate.get("retest_candle"))
@@ -194,22 +195,31 @@ class CentralAuthorizationEngine:
         retest_low = self._number(retest.get("low"))
         if retest_high is None or retest_low is None or retest_high < retest_low:
             return reject("VALID_RETEST_CANDLE_MISSING")
-        if retest_high < zone_low or retest_low > zone_high:
-            return reject("RETEST_CANDLE_DID_NOT_TOUCH_SELECTED_ZONE")
+        boundary = zone_low
+        if retest_high < boundary or retest_low > boundary:
+            return reject("RETEST_CANDLE_DID_NOT_TOUCH_ORB_BOUNDARY")
 
+        # If an opening range is supplied, verify its high/low and ensure the
+        # selected boundary is exactly the breakout side of that fixed range.
         if opening_range:
             range_data = opening_range.get("opening_range", opening_range)
-            range_high = self._number(self._dict(range_data).get("high"))
-            range_low = self._number(self._dict(range_data).get("low"))
+            range_data = self._dict(range_data)
+            range_high = self._number(range_data.get("high"))
+            range_low = self._number(range_data.get("low"))
             if range_high is None or range_low is None or range_high <= range_low:
                 return reject("OPENING_RANGE_INVALID")
+            expected_boundary = range_high if direction == "BULLISH" else range_low
+            if abs(boundary - expected_boundary) > 1e-10:
+                return reject("BOUNDARY_DOES_NOT_MATCH_BREAKOUT_SIDE_OF_OPENING_RANGE")
 
         breakout_time = self._timestamp(breakout.get("detected_at"))
-        confirmed_time = self._timestamp(breakout.get("confirmed_at"))
+        # The completed M1 close itself is the breakout confirmation; there is
+        # deliberately no separate confirmed_at / structure-confirmation event.
         candidate_time = self._timestamp(candidate.get("created_at"))
-        if breakout_time is None or confirmed_time is None or candidate_time is None:
+        retest_time = self._timestamp(retest.get("timestamp"))
+        if breakout_time is None or candidate_time is None or retest_time is None:
             return reject("ORB_EVENT_TIMESTAMPS_MISSING_OR_INVALID")
-        if confirmed_time < breakout_time or candidate_time < confirmed_time:
+        if retest_time <= breakout_time or candidate_time < retest_time:
             return reject("ORB_EVENT_SEQUENCE_INVALID")
 
         key = (session, symbol)
@@ -224,17 +234,18 @@ class CentralAuthorizationEngine:
                 )
             approved = self._result(
                 True,
-                "ORB_INDEPENDENT_STRATEGY_CHECKS_PASSED_PENDING_SHARED_RISK",
+                "ORB_INDEPENDENT_BREAKOUT_RETEST_CHECKS_PASSED_PENDING_SHARED_RISK",
                 session=session,
                 symbol=symbol,
                 direction=direction,
                 entry_model=entry_model,
                 order_type=order_type,
+                execution_order_type=("MARKET" if order_type in {"BUY", "SELL"} else "LIMIT"),
                 entry_price=entry,
                 stop_loss=stop,
                 take_profit=target,
                 zone_type=zone_type,
-                confirmation_source="ORB_INDEPENDENT_M1_ANALYSIS",
+                confirmation_source="COMPLETED_M1_RANGE_BREAKOUT_AND_LATER_M1_RETEST",
                 risk_manager_required=True,
             )
             self._orb_approvals[key] = deepcopy(approved)
