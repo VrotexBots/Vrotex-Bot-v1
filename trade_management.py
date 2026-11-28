@@ -20,6 +20,8 @@ import json
 import os
 import sqlite3
 import time
+from datetime import date, datetime, time as datetime_time, timezone
+from zoneinfo import ZoneInfo
 
 from decimal import Decimal, InvalidOperation
 
@@ -32,7 +34,7 @@ logger = get_logger("trading.trade_management")
 
 class TradeManager:
 
-    VERSION = "1.0"
+    VERSION = "1.1"
 
     MONITOR_INTERVAL = 2
 
@@ -131,6 +133,18 @@ class TradeManager:
                     event TEXT NOT NULL,
                     details TEXT,
                     created_at REAL NOT NULL
+                )
+            """)
+
+            # One immutable opening-equity baseline per Johannesburg trading day.
+            # It must be captured close to midnight; late startup never guesses it.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS
+                vrotex_daily_risk_state (
+                    trading_day TEXT PRIMARY KEY,
+                    start_of_day_equity TEXT NOT NULL,
+                    captured_at REAL NOT NULL,
+                    source TEXT NOT NULL
                 )
             """)
 
@@ -280,6 +294,168 @@ class TradeManager:
                 json.dumps(details or {}, default=str),
                 time.time(),
             ))
+
+    # ==========================================================
+    # PERSISTENT DAILY RISK SNAPSHOTS
+    # ==========================================================
+
+    RISK_TIMEZONE = ZoneInfo("Africa/Johannesburg")
+    DAY_START_CAPTURE_WINDOW_SECONDS = 300
+
+    @classmethod
+    def _johannesburg_day(cls, timestamp=None):
+        """Return the Johannesburg calendar date for an epoch timestamp."""
+        value = time.time() if timestamp is None else float(timestamp)
+        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone(
+            cls.RISK_TIMEZONE
+        ).date()
+
+    def record_day_start_equity(
+        self,
+        equity,
+        *,
+        captured_at=None,
+        source="BROKER_MIDNIGHT_SNAPSHOT",
+    ):
+        """Persist the true day-opening equity; reject late/ambiguous baselines.
+
+        The capture must occur within five minutes after Johannesburg midnight.
+        Existing baselines are immutable to prevent a later balance from
+        silently resetting the daily-loss calculation.
+        """
+        amount = self._decimal(equity)
+        if amount is None or amount <= 0:
+            raise ValueError("Day-start equity must be a positive finite value.")
+
+        stamp = time.time() if captured_at is None else float(captured_at)
+        if not source or not isinstance(source, str):
+            raise ValueError("A verifiable day-start equity source is required.")
+
+        local_dt = datetime.fromtimestamp(
+            stamp, tz=timezone.utc
+        ).astimezone(self.RISK_TIMEZONE)
+        seconds_after_midnight = (
+            local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+        )
+        if seconds_after_midnight > self.DAY_START_CAPTURE_WINDOW_SECONDS:
+            raise ValueError(
+                "Day-start equity was not captured within five minutes of "
+                "Johannesburg midnight; refusing to invent a baseline."
+            )
+
+        trading_day = local_dt.date().isoformat()
+        with self._database() as db:
+            db.execute("""
+                INSERT OR IGNORE INTO vrotex_daily_risk_state (
+                    trading_day, start_of_day_equity, captured_at, source
+                ) VALUES (?, ?, ?, ?)
+            """, (trading_day, str(amount), stamp, source))
+            row = db.execute("""
+                SELECT start_of_day_equity, captured_at, source
+                FROM vrotex_daily_risk_state
+                WHERE trading_day = ?
+            """, (trading_day,)).fetchone()
+
+        return {
+            "trading_day": trading_day,
+            "start_of_day_equity": float(row["start_of_day_equity"]),
+            "captured_at": float(row["captured_at"]),
+            "source": row["source"],
+            "created": abs(float(row["captured_at"]) - stamp) < 0.001,
+        }
+
+    def build_risk_snapshot(
+        self,
+        current_equity,
+        *,
+        pending_instruments=(),
+        as_of=None,
+    ):
+        """Build the shared RiskSnapshot from persistent managed-trade history.
+
+        Fails closed when the true midnight equity baseline is unavailable.
+        `pending_instruments` must come from the live executor/order state.
+        """
+        from risk_management import RiskSnapshot
+
+        equity = self._decimal(current_equity)
+        if equity is None or equity <= 0:
+            raise ValueError("Current broker equity must be positive and finite.")
+
+        stamp = time.time() if as_of is None else float(as_of)
+        day = self._johannesburg_day(stamp)
+        day_start = datetime.combine(
+            day, datetime_time.min, tzinfo=self.RISK_TIMEZONE
+        ).timestamp()
+        day_end = datetime.combine(
+            date.fromordinal(day.toordinal() + 1),
+            datetime_time.min,
+            tzinfo=self.RISK_TIMEZONE,
+        ).timestamp()
+
+        with self._database() as db:
+            baseline = db.execute("""
+                SELECT start_of_day_equity
+                FROM vrotex_daily_risk_state
+                WHERE trading_day = ?
+            """, (day.isoformat(),)).fetchone()
+
+            if baseline is None:
+                raise RuntimeError(
+                    "Daily risk baseline unavailable for "
+                    f"{day.isoformat()} Africa/Johannesburg. "
+                    "Trading must remain blocked until a verified midnight "
+                    "equity snapshot is recorded."
+                )
+
+            rows = db.execute("""
+                SELECT symbol, status, outcome, opened_at, closed_at
+                FROM vrotex_managed_trades
+                WHERE opened_at >= ? AND opened_at < ?
+            """, (day_start, day_end)).fetchall()
+
+            active_rows = db.execute("""
+                SELECT position_id, symbol
+                FROM vrotex_managed_trades
+                WHERE status = 'OPEN'
+            """).fetchall()
+
+            loss_rows = db.execute("""
+                SELECT COUNT(*) AS loss_count
+                FROM vrotex_managed_trades
+                WHERE status = 'CLOSED'
+                  AND outcome = 'LOSS'
+                  AND closed_at >= ? AND closed_at < ?
+            """, (day_start, day_end)).fetchone()
+
+        trades_taken = len(rows)
+        daily_losses = int(loss_rows["loss_count"] or 0)
+        start_equity = float(baseline["start_of_day_equity"])
+        daily_loss_percent = max(
+            0.0, ((start_equity - float(equity)) / start_equity) * 100.0
+        )
+
+        active_symbols = tuple(sorted({
+            str(row["symbol"]).upper()
+            for row in active_rows if row["symbol"]
+        }))
+        pending_symbols = tuple(sorted({
+            str(symbol).strip().upper()
+            for symbol in pending_instruments
+            if isinstance(symbol, str) and symbol.strip()
+        }))
+
+        return RiskSnapshot(
+            equity=float(equity),
+            start_of_day_equity=start_equity,
+            daily_loss_percent=daily_loss_percent,
+            daily_losses_today=daily_losses,
+            open_trade_count=len(active_rows),
+            trades_taken_today=trades_taken,
+            trading_day=day,
+            active_instruments=active_symbols,
+            pending_instruments=pending_symbols,
+        )
 
     # ==========================================================
     # HELPERS
