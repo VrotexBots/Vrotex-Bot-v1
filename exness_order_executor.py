@@ -138,29 +138,26 @@ class ExnessOrderExecutor:
             return False, f"Unsupported strategy: {strategy}"
 
         if strategy == "ORB":
-            # ORB uses its own Central Authorization + shared Risk route.
-            # It must never be forced through Master SMC scoring.
+            # First pass validates central authorization and geometry only.
+            # After _check_risk, the second pass also verifies the generated
+            # risk result and exact volume match before submission.
             if setup.get("strategy_authorized") is not True:
                 return False, "ORB central strategy authorization missing"
-            if setup.get("risk_approved") is not True:
-                return False, "ORB shared Risk Manager approval missing"
-            if setup.get("execution_authorized") is not True:
-                return False, "ORB final execution authorization missing"
-
-            risk_result = setup.get("risk")
-            if not isinstance(risk_result, dict):
-                return False, "ORB shared risk result missing"
-            if risk_result.get("risk_approved") is not True:
-                return False, "ORB shared risk result not approved"
-            if risk_result.get("position_size_required") is True:
-                return False, "ORB broker-based position size still required"
-            risk_volume = self._decimal(risk_result.get("volume_lots"))
-            supplied_volume = self._decimal(setup.get("volume"))
-            if risk_volume is None or supplied_volume is None:
-                return False, "ORB verified position volume missing"
-            if risk_volume != supplied_volume:
-                return False, "ORB volume does not match shared Risk Manager sizing"
-
+            if setup.get("execution_authorized") is True:
+                if setup.get("risk_approved") is not True:
+                    return False, "ORB shared risk approval missing"
+                risk_result = setup.get("risk")
+                if not isinstance(risk_result, dict) or risk_result.get("risk_approved") is not True:
+                    return False, "ORB shared risk result missing or rejected"
+                if risk_result.get("position_size_required") is True:
+                    return False, "ORB broker-based position size still required"
+                approved_volume = self._decimal(risk_result.get("volume_lots"))
+                supplied_volume = self._decimal(setup.get("volume"))
+                if approved_volume is None or supplied_volume is None or approved_volume != supplied_volume:
+                    return False, "ORB volume does not match fresh shared risk sizing"
+            elif setup.get("risk_approved") is True or isinstance(setup.get("risk"), dict):
+                # Do not accept partial or stale upstream risk claims.
+                return False, "ORB upstream risk claims are not accepted before fresh recheck"
         else:
             # Preserve the existing Master SMC authorization and A+ threshold.
             if setup.get("execution_authorized") is not True:
@@ -193,18 +190,27 @@ class ExnessOrderExecutor:
         tp = self._decimal(setup.get("take_profit_price", setup.get("tp")))
         risk_percent = self._decimal(setup.get("risk_percent"))
 
-        if volume is None or volume <= 0:
-            return False, "Invalid volume"
+        if strategy == "SMC":
+            if volume is None or volume <= 0:
+                return False, "Invalid volume"
+            if risk_percent is None or risk_percent <= 0:
+                return False, "Risk percentage missing"
+            if risk_percent > Decimal("1"):
+                return False, "Risk exceeds 1% per trade"
+        else:
+            # ORB volume and risk are deliberately absent until the fresh
+            # broker-based risk calculation completes.
+            if volume is not None and volume <= 0:
+                return False, "Invalid supplied ORB volume"
+            if risk_percent is not None and (risk_percent <= 0 or risk_percent > Decimal("1")):
+                return False, "Invalid supplied ORB risk percentage"
+
         if entry is None or entry <= 0:
             return False, "Invalid entry price"
         if sl is None or sl <= 0:
             return False, "Invalid stop loss"
         if tp is None or tp <= 0:
             return False, "Invalid take profit"
-        if risk_percent is None or risk_percent <= 0:
-            return False, "Risk percentage missing"
-        if risk_percent > Decimal("1"):
-            return False, "Risk exceeds 1% per trade"
 
         if side == "buy":
             if not sl < entry < tp:
@@ -220,12 +226,18 @@ class ExnessOrderExecutor:
             "symbol": instrument,
             "side": side,
             "direction": side,
-            "volume": str(volume),
             "entry_price": str(entry),
             "stop_loss_price": str(sl),
             "take_profit_price": str(tp),
-            "risk_percent": str(risk_percent),
         })
+        if volume is not None:
+            normalized["volume"] = str(volume)
+        else:
+            normalized.pop("volume", None)
+        if risk_percent is not None:
+            normalized["risk_percent"] = str(risk_percent)
+        else:
+            normalized.pop("risk_percent", None)
 
         if strategy == "SMC":
             normalized["score"] = float(score)
@@ -246,120 +258,91 @@ class ExnessOrderExecutor:
             strategy = str(setup.get("strategy", "SMC")).upper()
 
             if strategy == "ORB":
-                # Rebuild the shared snapshot immediately before submission.
-                # ORB does not pass through legacy SMC/A+ risk checks.
+                # Rebuild the persistent snapshot from fresh broker equity,
+                # then run the single shared ORB risk gate and broker sizer.
                 from trade_management import trade_manager
                 from orb_risk_integration import orb_shared_risk_gate
-                from orb_position_sizer import (
-                    ORBPositionSizingError,
-                    calculate_orb_position_size,
-                )
 
-                snapshot_data = await self.connection.get_trading_snapshot()
+                trading_snapshot = await self.connection.get_trading_snapshot()
+                account_info = await self.connection.get_account_info()
                 equity_value = self._extract_value(
-                    snapshot_data,
+                    trading_snapshot,
                     ("equity", "account_equity", "current_equity"),
                 )
                 if equity_value is None:
                     equity_value = self._extract_value(
-                        self.connection.account_info or {},
+                        account_info,
                         ("equity", "account_equity", "current_equity"),
                     )
                 equity = self._decimal(equity_value)
                 if equity is None or equity <= 0:
-                    return False, "ORB execution blocked: live broker equity unavailable"
+                    return False, "ORB execution blocked: fresh broker equity unavailable"
+
+                account_currency = self._extract_value(
+                    account_info,
+                    ("account_currency", "currency", "currency_code", "deposit_currency"),
+                )
+                if not isinstance(account_currency, str) or len(account_currency.strip()) != 3:
+                    return False, "ORB execution blocked: broker account currency unavailable"
+                account_currency = account_currency.strip().upper()
 
                 pending_symbols = set()
                 for pending in self.pending_orders.values():
                     if isinstance(pending, dict):
-                        symbol = pending.get("symbol", pending.get("instrument"))
-                        if symbol:
-                            pending_symbols.add(str(symbol).strip().upper())
-
+                        pending_symbol = pending.get("symbol", pending.get("instrument"))
+                        if pending_symbol:
+                            pending_symbols.add(str(pending_symbol).strip().upper())
+                # Include this candidate's symbol only if an order is already
+                # reserved; the risk gate itself blocks active/pending duplicates.
                 snapshot = trade_manager.build_risk_snapshot(
                     float(equity),
                     pending_instruments=tuple(sorted(pending_symbols)),
                 )
 
-                symbol = self._normalise_symbol(
-                    setup.get("symbol", setup.get("instrument"))
-                )
-                allowed, reason = orb_shared_risk_gate._check_orb_shared_limits(
-                    snapshot, symbol
-                )
-                if not allowed:
-                    return False, f"ORB shared risk recheck rejected: {reason}"
-
-                risk_result = setup.get("risk")
-                if not isinstance(risk_result, dict):
-                    return False, "ORB shared risk result missing"
-                if risk_result.get("risk_approved") is not True:
-                    return False, "ORB shared risk result rejected"
-
-                # Re-fetch broker conditions immediately before execution and
-                # recalculate volume from the current equity and actual SL.
+                symbol = self._normalise_symbol(setup.get("symbol", setup.get("instrument")))
                 conditions = await self.connection.get_instrument_conditions(symbol)
-                account_info = await self.connection.get_account_info()
-                account_currency = self._extract_value(
-                    account_info,
-                    ("account_currency", "currency", "currency_code"),
-                )
-                if not isinstance(account_currency, str) or len(account_currency.strip()) != 3:
-                    return False, "ORB execution blocked: account currency unavailable"
-                account_currency = account_currency.strip().upper()
                 quote_currency = str(conditions.get("quote_currency", "")).strip().upper()
-                conversion_rate = setup.get("quote_to_account_rate")
-                conversion_source = str(
-                    setup.get("quote_to_account_rate_source", "")
-                ).strip().upper()
-                if quote_currency == account_currency:
-                    conversion_rate = "1"
-                elif conversion_rate is None or conversion_source not in {"EXNESS", "EXNESS_LIVE"}:
+                if len(quote_currency) != 3:
+                    return False, "ORB execution blocked: Exness quote currency missing"
+
+                # Only identity conversion is currently verifiable from the
+                # broker data returned by this connection. Never accept a
+                # caller-supplied conversion rate/source as proof.
+                if quote_currency != account_currency:
                     return False, (
-                        "ORB execution blocked: a verified live Exness quote-to-account "
-                        "conversion rate and source are required"
+                        f"ORB execution blocked: verified live {quote_currency}->{account_currency} "
+                        "conversion is not available from the Exness connection"
                     )
+                conversion_rate = Decimal("1")
 
-                try:
-                    sized = calculate_orb_position_size(
-                        symbol=symbol,
-                        direction=setup.get("side", setup.get("direction")),
-                        entry_price=setup.get("entry_price"),
-                        stop_loss=setup.get("stop_loss_price", setup.get("sl")),
-                        equity=equity,
-                        account_currency=account_currency,
-                        instrument_conditions=conditions,
-                        quote_to_account_rate=conversion_rate,
-                        risk_percent=orb_shared_risk_gate.risk_manager.risk_percent,
-                    )
-                except ORBPositionSizingError as exc:
-                    return False, f"ORB broker-based sizing rejected: {exc}"
-
-                # Replace upstream sizing with the fresh broker/equity result.
-                setup["volume"] = str(sized.volume_lots)
-                setup["risk_percent"] = str(
-                    (sized.volume_lots * sized.loss_per_lot_at_stop / sized.equity)
-                    * Decimal("100")
+                direction = "BULLISH" if setup.get("side") == "buy" else "BEARISH"
+                authorization = {
+                    "strategy": "ORB",
+                    "strategy_authorized": setup.get("strategy_authorized") is True,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "entry_price": setup.get("entry_price"),
+                    "stop_loss": setup.get("stop_loss_price"),
+                }
+                risk_result = orb_shared_risk_gate.evaluate_authorized_candidate(
+                    authorization,
+                    snapshot=snapshot,
+                    instrument_conditions=conditions,
+                    account_currency=account_currency,
+                    quote_to_account_rate=conversion_rate,
+                    spread=setup.get("spread"),
+                    maximum_spread=setup.get("maximum_spread"),
+                    spread_valid=(setup.get("spread_valid") is True),
                 )
-                risk_result.update({
-                    "risk_approved": True,
-                    "position_size_required": False,
-                    "volume_lots": float(sized.volume_lots),
-                    "risk_percent": float(Decimal(setup["risk_percent"])),
-                    "risk_amount": float(sized.volume_lots * sized.loss_per_lot_at_stop),
-                    "loss_per_lot_at_stop": float(sized.loss_per_lot_at_stop),
-                    "position_sizing": {
-                        "account_currency": sized.account_currency,
-                        "quote_currency": sized.quote_currency,
-                        "quote_to_account_rate": str(sized.quote_to_account_rate),
-                        "contract_size": str(sized.contract_size),
-                        "volume_min": str(sized.volume_min),
-                        "volume_max": str(sized.volume_max),
-                        "volume_step": str(sized.volume_step),
-                    },
-                    "execution_recalculated": True,
-                })
-                return True, "ORB persistent risk rechecked and broker volume recalculated"
+                if risk_result.get("success") is not True:
+                    return False, str(risk_result.get("reason", "ORB shared risk gate rejected"))
+
+                setup["risk"] = risk_result
+                setup["risk_approved"] = True
+                setup["execution_authorized"] = True
+                setup["volume"] = str(risk_result["volume_lots"])
+                setup["risk_percent"] = str(risk_result["risk_percent"])
+                return True, "ORB shared risk gate passed; fresh broker sizing completed"
 
             from risk_manager import risk_manager
 
@@ -1124,6 +1107,18 @@ class ExnessOrderExecutor:
                     "status": "REJECTED",
                     "reason": risk_reason,
                 }
+
+            # The first ORB validation is structural only. Revalidate after
+            # the shared gate has supplied fresh risk approval and volume.
+            if normalized.get("strategy") == "ORB":
+                final_valid, final_setup = self.validate_setup(normalized)
+                if not final_valid:
+                    return {
+                        "success": False,
+                        "status": "REJECTED",
+                        "reason": f"ORB final validation failed: {final_setup}",
+                    }
+                normalized = final_setup
 
             request_id = self._create_request_id(
                 normalized
